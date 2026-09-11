@@ -19,6 +19,7 @@
 
 mod common;
 mod compositor;
+mod platform;
 mod shell;
 
 /// Unbind the fbcon consoles (the gemwl receipt): a bound console would
@@ -36,18 +37,21 @@ fn unbind_fbcons() {
 }
 
 fn main() {
-    // Nested mode (x86_64 development): run as a client under the host
-    // compositor. Env-driven so the same binary is used everywhere.
+    // Nested mode (x86_64 Linux development): run as a client under the
+    // host Wayland compositor. Env-driven so the same binary is used
+    // everywhere. On macOS the backend is always a native preview window.
     let nested = common::util::env_flag("GEMSHELL_NESTED");
     if !nested {
         unbind_fbcons();
     }
-    let (display, mut comp) = match compositor::Compositor::new(nested) {
-        Ok(c) => c,
+    // The ONE platform fork: `create_backend` picks the Linux or macOS
+    // backend (`src/platform/`). Everything else is trait-selected.
+    let backend = match platform::create_backend(nested) {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("gemshell: {e}");
             std::process::exit(1);
         }
     };
-    std::process::exit(comp.run(display));
+    std::process::exit(backend.run());
 }

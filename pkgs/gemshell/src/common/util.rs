@@ -16,7 +16,10 @@ pub fn now_ms() -> u64 {
 /// alone made `GEMSHELL_OPEN_SETTINGS=0` open the panel.
 pub fn env_flag(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
         Err(_) => false,
     }
 }
@@ -28,7 +31,10 @@ pub fn read_to_string(p: &std::path::Path) -> Option<String> {
 
 /// First existing path in `candidates`.
 pub fn first_existing(candidates: &[&std::path::Path]) -> Option<std::path::PathBuf> {
-    candidates.iter().find(|p| p.exists()).map(|p| p.to_path_buf())
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_path_buf())
 }
 
 /// `which` for one tool over $PATH (the first executable match).
@@ -71,6 +77,20 @@ pub fn find_font() -> Option<std::path::PathBuf> {
             return Some(pb);
         }
     }
+    // macOS ships its fonts as .ttc/.otf in /System/Library/Fonts; the
+    // plain-TTF files live in Supplemental. Prefer a real UI face over
+    // whatever the directory walk hits first (Apple Braille, ...).
+    for file in [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana.ttf",
+        "/System/Library/Fonts/Supplemental/Tahoma.ttf",
+        "/System/Library/Fonts/Geneva.ttf",
+    ] {
+        let pb = std::path::PathBuf::from(file);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
     for dir in [
         "/run/current-system/sw/share/fonts",
         "/home/cjdell/.local/share/fonts",
@@ -79,8 +99,13 @@ pub fn find_font() -> Option<std::path::PathBuf> {
         "/usr/share/fonts/truetype",
         "/usr/share/fonts/TTF",
         "/usr/share/fonts",
+        "/System/Library/Fonts/Supplemental",
+        "/System/Library/Fonts",
+        "/Library/Fonts",
     ] {
-        if let Some(p) = walk(dir, |p| p.extension().and_then(|e| e.to_str()) == Some("ttf")) {
+        if let Some(p) = walk(dir, |p| {
+            p.extension().and_then(|e| e.to_str()) == Some("ttf")
+        }) {
             return Some(p);
         }
     }

@@ -201,23 +201,16 @@ impl Nested {
             }
         }
         self.surface.attach(Some(&self.buffer), 0, 0);
-        self.surface
-            .damage(0, 0, dw as i32, dh as i32);
+        self.surface.damage(0, 0, dw as i32, dh as i32);
         self.surface.commit();
         let _ = self.conn.flush();
     }
 }
 
 fn memfd(size: usize) -> Result<std::fs::File, std::io::Error> {
-    use std::os::fd::FromRawFd;
-    let name = std::ffi::CString::new("gemshell-nested-shm").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.set_len(size as u64)?;
-    Ok(file)
+    // Platform shm helper: memfd_create on Linux, shm_open elsewhere
+    // (keeps this module compiling on the macOS dev host).
+    crate::platform::shm::anonymous_file("gemshell-nested-shm", size)
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +260,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for Nested {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_seat::Event::Capabilities { capabilities } = event {
-            let WEnum::Value(caps) = capabilities else { return };
+            let WEnum::Value(caps) = capabilities else {
+                return;
+            };
             if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
             }
@@ -291,14 +286,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Nested {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
                 state.pointer_pos = (surface_x, surface_y);
                 state.events.push(NestedInput::PointerMotion {
                     x: surface_x,
                     y: surface_y,
                 });
             }
-            wl_pointer::Event::Button { button, state: bs, .. } => {
+            wl_pointer::Event::Button {
+                button, state: bs, ..
+            } => {
                 let WEnum::Value(bs) = bs else { return };
                 // BTN_LEFT = 0x110
                 if button == 0x110 {

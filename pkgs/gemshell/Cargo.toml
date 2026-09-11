@@ -51,15 +51,18 @@ opt-level = "s"
 
 [dependencies]
 # --- Wayland server (compositor) ---
-wayland-server = { version = "0.31", features = ["system", "log"] }
+# NOTE: the `system` (C libwayland) feature is enabled per-target below.
+# macOS has no libwayland, and wayland-rs ships a pure-Rust backend it
+# falls back to when `system` is off — which is what lets the compositor
+# core compile on the Apple dev host (see src/platform/).
+wayland-server = { version = "0.31", features = ["log"] }
 wayland-protocols = { version = "0.32", features = ["client", "server", "unstable"] }
 # (wayland-client is still needed by the nested-mode host connection)
-wayland-client = { version = "0.31", features = ["system", "log"] }
+wayland-client = { version = "0.31", features = ["log"] }
 # --- keyboard ---
-xkbcommon = { version = "0.9", default-features = false }
+# (xkbcommon is linked directly via the hand-rolled FFI in
+# src/compositor/input.rs + build.rs; the `xkbcommon` crate was unused.)
 xkeysym = "0.2"
-# --- GL (compositor rendering) ---
-gl = "0.14"
 # --- misc ---
 png = "0.17"
 # SVG app icons — Adwaita/GNOME/COSMIC ship most app icons as SVG only.
@@ -76,3 +79,22 @@ egui = { version = "0.29", default-features = false, features = ["default_fonts"
 gemdata = { path = "crates/gemdata" }
 gemdata-device = { path = "crates/gemdata-device" }
 gemdata-dummy = { path = "crates/gemdata-dummy" }
+
+# ---------------------------------------------------------------------------
+# Platform-specific dependencies (the only place the OS is selected here;
+# the code itself goes through the `platform` traits).
+# ---------------------------------------------------------------------------
+
+# Linux keeps the system libwayland backend (unchanged device/nested
+# behaviour).
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-server = { version = "0.31", features = ["system", "log"] }
+wayland-client = { version = "0.31", features = ["system", "log"] }
+
+# macOS preview backend: a native Cocoa window + desktop-OpenGL context.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.29"
+glutin = "0.31"
+glutin-winit = "0.4"
+# glutin 0.31's context builder takes a raw-window-handle 0.5 handle.
+raw-window-handle = "0.5"

@@ -37,6 +37,13 @@
 # Host-side iteration: `bash bin/gemshell-host-check.sh` (cargo check on
 # x86_64 in a nix shell; seconds — the fast loop for this crate).
 #
+# Platform backends (2026-09-11): the crate also builds natively on macOS
+# with the host toolchain (`bash bin/gemshell-nested.sh` → `cargo build`),
+# where it runs a Cocoa-window + desktop-GL preview (see
+# src/platform/macos.rs and docs/gemshell.md). This derivation is the
+# Linux/aarch64 product build; the OS-specific half is behind traits, and
+# Cargo.toml only enables libwayland's `system` feature for Linux.
+#
 # Rpath: the gemdemo receipt (2026-09-08) — stdenv's generic rpath fixup
 # only pulled the -dev outputs of wayland, so dlopen("libwayland-*.so.0")
 # failed on glass. Pin the REAL lib dirs on the RUNPATH in postFixup

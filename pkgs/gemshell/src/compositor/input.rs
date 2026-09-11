@@ -12,7 +12,9 @@
 //! compositor (mod.rs) — it needs window/UI state.
 
 use crate::common::util;
+use crate::platform::{InputEvent, InputSource};
 use std::ffi::CString;
+use std::os::fd::RawFd;
 
 // ---- xkbcommon FFI (the xkbcommon crate exposes the same lib; the
 // ---- compositor links libxkbcommon directly, so a local shim keeps
@@ -82,11 +84,11 @@ const SYN_REPORT: u16 = 0;
 const ABS_MT_POSITION_X: u16 = 53; // 0x35
 const ABS_MT_POSITION_Y: u16 = 54; // 0x36
 const ABS_MT_TRACKING_ID: u16 = 57; // 0x39
-// ABS_MT_SLOT = 0x2f = 47 (linux/input-event-codes.h). This was
-// mistakenly 57 (= ABS_MT_TRACKING_ID) — and because the SLOT arm is
-// matched FIRST, every TRACKING_ID event was swallowed as a slot change,
-// so a finger-down was never registered and touch was completely dead
-// (root cause on glass, 2026-09-12). 57 is TRACKING_ID, 47 is SLOT.
+                                    // ABS_MT_SLOT = 0x2f = 47 (linux/input-event-codes.h). This was
+                                    // mistakenly 57 (= ABS_MT_TRACKING_ID) — and because the SLOT arm is
+                                    // matched FIRST, every TRACKING_ID event was swallowed as a slot change,
+                                    // so a finger-down was never registered and touch was completely dead
+                                    // (root cause on glass, 2026-09-12). 57 is TRACKING_ID, 47 is SLOT.
 const ABS_MT_SLOT: u16 = 47; // 0x2f
 
 const MAX_SLOTS: usize = 32;
@@ -143,24 +145,11 @@ const KEY_RIGHTALT: u32 = 100;
 const MOD5: u32 = 1 << 8;
 
 /// An input event the compositor acts on.
-pub enum Event {
-    /// A key press/release (or a repeat tick, `pressed` true).
-    Key {
-        /// the evdev keycode (xkb keycode = this + 8)
-        code: u32,
-        keysym: u32,
-        pressed: bool,
-        /// wl-style depressed mods (bit i = modmap slot i)
-        mods: u32,
-        /// the pressed keysyms (for wl_keyboard.enter)
-        pressed_keysyms: Vec<u32>,
-        /// set on the first event: the compiled keymap string
-        keymap: Option<String>,
-    },
-    TouchDown { id: u32, x: f32, y: f32 },
-    TouchUp { id: u32 },
-    TouchMotion { id: u32, x: f32, y: f32 },
-}
+///
+/// The neutral definition (shared with the macOS backend) lives in
+/// [`crate::platform`]; this module re-exports it so the evdev code reads
+/// naturally.
+pub use crate::platform::InputEvent as Event;
 
 pub struct Input {
     pub kbd_fd: std::os::raw::c_int,
@@ -248,7 +237,12 @@ pub fn find_nodes() -> (Option<String>, Option<String>, String, String) {
         // single words) — OR the words together (they are disjoint
         // 32-bit slices, so order does not matter).
         let hex = |f: &std::path::Path| -> u64 {
-            util::read_to_string(f).map(|s| s.split_whitespace().fold(0u64, |acc, t| acc | u64::from_str_radix(t, 16).unwrap_or(0))).unwrap_or(0)
+            util::read_to_string(f)
+                .map(|s| {
+                    s.split_whitespace()
+                        .fold(0u64, |acc, t| acc | u64::from_str_radix(t, 16).unwrap_or(0))
+                })
+                .unwrap_or(0)
         };
         let ev = hex(&base.join("capabilities/ev"));
         let abs = hex(&base.join("capabilities/abs"));
@@ -313,13 +307,24 @@ fn abs_range(fd: std::os::raw::c_int, cx: u16, cy: u16) -> Option<(AbsRange, Abs
         return None;
     }
     Some((
-        AbsRange { min: ax.min as f32, max: ax.max as f32 },
-        AbsRange { min: ay.min as f32, max: ay.max as f32 },
+        AbsRange {
+            min: ax.min as f32,
+            max: ax.max as f32,
+        },
+        AbsRange {
+            min: ay.min as f32,
+            max: ay.max as f32,
+        },
     ))
 }
 
 impl Input {
-    pub fn open(kbd_path: &str, touch_path: &str, kbd_name: &str, touch_name: &str) -> Result<Self, String> {
+    pub fn open(
+        kbd_path: &str,
+        touch_path: &str,
+        kbd_name: &str,
+        touch_name: &str,
+    ) -> Result<Self, String> {
         let kbd_fd = open_ro(kbd_path)?;
         let touch_fd = open_ro(touch_path)?;
         log::info!("keyboard: {kbd_name} ({kbd_path})");
@@ -341,18 +346,26 @@ impl Input {
             .ok()
             .and_then(|s| CString::new(s).ok());
         let rmlvo = xkb::xkb_rule_names {
-            rules: rules_opt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            rules: rules_opt
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
             model: std::ptr::null(),
             layout: layout_c.as_ptr(),
             variant: std::ptr::null(),
-            options: options_opt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            options: options_opt
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
         };
         // 3rd arg is COMPILE FLAGS (0 = NO_FLAGS), not the format enum
         // (XKB_KEYMAP_FORMAT_TEXT_V1 == 1 → "unrecognized keymap
         // compilation flags: 0x1" from the lib, verified 2026-09-11).
         let keymap = unsafe { xkb::xkb_keymap_new_from_names(ctx, &rmlvo, 0) };
         if keymap.is_null() {
-            return Err(format!("xkb_keymap_new_from_names failed (layout={layout})"));
+            return Err(format!(
+                "xkb_keymap_new_from_names failed (layout={layout})"
+            ));
         }
         let keymap_str = unsafe {
             let s = xkb::xkb_keymap_get_as_string(keymap, xkb::XKB_KEYMAP_FORMAT_TEXT_V1);
@@ -369,25 +382,33 @@ impl Input {
         }
         let mut slot_bits = [0u32; 13];
         let mut slot_idx = [32u8; 13]; // slot -> xkb mod index (255 = absent)
-        for (slot, name) in ["", "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5"]
-            .iter()
-            .enumerate()
+        for (slot, name) in [
+            "", "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
+        ]
+        .iter()
+        .enumerate()
         {
             if slot == 0 {
                 continue;
             }
-            let idx =
-                unsafe { xkb::xkb_keymap_mod_get_index(keymap, CString::new(*name).unwrap().as_ptr()) };
+            let idx = unsafe {
+                xkb::xkb_keymap_mod_get_index(keymap, CString::new(*name).unwrap().as_ptr())
+            };
             if idx < 32 {
                 slot_bits[slot] |= 1 << idx;
                 slot_idx[slot] = idx;
             }
         }
-        let (xr, yr) =
-            abs_range(touch_fd, ABS_MT_POSITION_X, ABS_MT_POSITION_Y).unwrap_or((
-                AbsRange { min: 0.0, max: 1079.0 },
-                AbsRange { min: 0.0, max: 2159.0 },
-            ));
+        let (xr, yr) = abs_range(touch_fd, ABS_MT_POSITION_X, ABS_MT_POSITION_Y).unwrap_or((
+            AbsRange {
+                min: 0.0,
+                max: 1079.0,
+            },
+            AbsRange {
+                min: 0.0,
+                max: 2159.0,
+            },
+        ));
         log::info!(
             "touch ranges x [{:.0}..={:.0}] y [{:.0}..={:.0}]",
             xr.min,
@@ -451,8 +472,14 @@ impl Input {
             slot_new_up: [false; MAX_SLOTS],
             touch_rotate: touch_rotate_env(),
             cur_slot: 0,
-            x_range: AbsRange { min: 0.0, max: 1079.0 },
-            y_range: AbsRange { min: 0.0, max: 2159.0 },
+            x_range: AbsRange {
+                min: 0.0,
+                max: 1079.0,
+            },
+            y_range: AbsRange {
+                min: 0.0,
+                max: 2159.0,
+            },
         })
     }
 
@@ -482,7 +509,9 @@ impl Input {
             keymap = make_keymap(ctx, &layout);
         }
         if keymap.is_null() {
-            return Err(format!("xkb_keymap_new_from_names failed (layout={layout})"));
+            return Err(format!(
+                "xkb_keymap_new_from_names failed (layout={layout})"
+            ));
         }
         let keymap_str = unsafe {
             let s = xkb::xkb_keymap_get_as_string(keymap, xkb::XKB_KEYMAP_FORMAT_TEXT_V1);
@@ -495,9 +524,11 @@ impl Input {
         log::info!("keymap compiled ({layout}): {} bytes", keymap_str.len());
         let mut slot_bits = [0u32; 13];
         let mut slot_idx = [32u8; 13];
-        for (slot, name) in ["", "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5"]
-            .iter()
-            .enumerate()
+        for (slot, name) in [
+            "", "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
+        ]
+        .iter()
+        .enumerate()
         {
             if slot == 0 {
                 continue;
@@ -518,7 +549,11 @@ impl Input {
     /// xkbcommon keycodes are scancode + 8.
     pub fn process_key(&mut self, code: u32, pressed: bool) -> (u32, u32) {
         let xkb_code = code + 8;
-        let dir = if pressed { xkb::XKB_KEY_DOWN } else { xkb::XKB_KEY_UP };
+        let dir = if pressed {
+            xkb::XKB_KEY_DOWN
+        } else {
+            xkb::XKB_KEY_UP
+        };
         if pressed {
             if !self.pressed.contains(&code) {
                 self.pressed.push(code);
@@ -592,7 +627,11 @@ impl Input {
             // bare scancode looked up the wrong key (latent bug, found
             // while adding nested input, 2026-09-11).
             let xkb_code = code + 8;
-            let dir = if ev.value == 0 { xkb::XKB_KEY_UP } else { xkb::XKB_KEY_DOWN };
+            let dir = if ev.value == 0 {
+                xkb::XKB_KEY_UP
+            } else {
+                xkb::XKB_KEY_DOWN
+            };
             unsafe { xkb::xkb_state_update_key(self.state, xkb_code, dir) };
             if ev.value == 0 {
                 self.pressed.retain(|&k| k != code);
@@ -750,9 +789,13 @@ impl Input {
             if self.slot_idx[slot] >= 32 {
                 continue;
             }
-            for (i, mode) in [xkb::XKB_STATE_MODS_DEPRESSED, xkb::XKB_STATE_MODS_LATCHED, xkb::XKB_STATE_MODS_LOCKED]
-                .iter()
-                .enumerate()
+            for (i, mode) in [
+                xkb::XKB_STATE_MODS_DEPRESSED,
+                xkb::XKB_STATE_MODS_LATCHED,
+                xkb::XKB_STATE_MODS_LOCKED,
+            ]
+            .iter()
+            .enumerate()
             {
                 if unsafe {
                     xkb::xkb_state_mod_index_is_active(self.state, self.slot_idx[slot], *mode)
@@ -763,6 +806,30 @@ impl Input {
             }
         }
         (out[0], out[1], out[2])
+    }
+}
+
+/// The evdev input source as the platform sees it — a thin delegation to
+/// the inherent methods above.
+impl InputSource for Input {
+    fn poll(&mut self, scene_w: f32, scene_h: f32) -> Vec<InputEvent> {
+        self.read_events(scene_w, scene_h)
+    }
+
+    fn process_key(&mut self, code: u32, pressed: bool) -> (u32, u32) {
+        Input::process_key(self, code, pressed)
+    }
+
+    fn keymap_string(&self) -> Option<String> {
+        Input::keymap_string(self)
+    }
+
+    fn mods_masks(&self) -> (u32, u32, u32) {
+        Input::mods_masks(self)
+    }
+
+    fn poll_fds(&self) -> (RawFd, RawFd) {
+        (self.kbd_fd as RawFd, self.touch_fd as RawFd)
     }
 }
 
@@ -793,11 +860,17 @@ fn make_keymap(ctx: *mut xkb::xkb_context_t, layout: &str) -> *mut xkb::xkb_keym
         .ok()
         .and_then(|s| CString::new(s).ok());
     let rmlvo = xkb::xkb_rule_names {
-        rules: rules_opt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+        rules: rules_opt
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
         model: std::ptr::null(),
         layout: layout_c.as_ptr(),
         variant: std::ptr::null(),
-        options: options_opt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+        options: options_opt
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
     };
     unsafe { xkb::xkb_keymap_new_from_names(ctx, &rmlvo, 0) }
 }

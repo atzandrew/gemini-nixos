@@ -41,9 +41,9 @@ pub fn find_para() -> Option<PathBuf> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParaState {
-    Twrp,  // "boot-recovery" — LK boots TWRP on next power-on
+    Twrp,   // "boot-recovery" — LK boots TWRP on next power-on
     Debian, // "boot-debian" — initrd boots Debian p29
-    Nixos, // zeros — initrd boots NixOS p32 (default)
+    Nixos,  // zeros — initrd boots NixOS p32 (default)
     Other(String),
 }
 
@@ -65,7 +65,8 @@ pub fn read_cmd() -> Res<(PathBuf, [u8; 32])> {
     };
     let mut f = std::fs::File::open(&p).map_err(|e| cmsg(format!("{}: {e}", p.display())))?;
     let mut buf = [0u8; 32];
-    f.read_exact(&mut buf).map_err(|e| cmsg(format!("{}: read: {e}", p.display())))?;
+    f.read_exact(&mut buf)
+        .map_err(|e| cmsg(format!("{}: read: {e}", p.display())))?;
     Ok((p, buf))
 }
 
@@ -82,7 +83,11 @@ pub fn decode(buf: &[u8; 32]) -> ParaState {
             buf[..n]
                 .iter()
                 .map(|b| {
-                    if b.is_ascii_graphic() || *b == b' ' { (*b as char).to_string() } else { format!("\\x{b:02x}") }
+                    if b.is_ascii_graphic() || *b == b' ' {
+                        (*b as char).to_string()
+                    } else {
+                        format!("\\x{b:02x}")
+                    }
                 })
                 .collect(),
         )
@@ -101,9 +106,12 @@ pub fn write_cmd(p: &PathBuf, cmd: &[u8]) -> Res<()> {
         .write(true)
         .open(p)
         .map_err(|e| cmsg(format!("{}: {e}", p.display())))?;
-    f.seek(SeekFrom::Start(0)).map_err(|e| cmsg(format!("{}: seek: {e}", p.display())))?;
-    f.write_all(&buf).map_err(|e| cmsg(format!("{}: write: {e}", p.display())))?;
-    f.sync_all().map_err(|e| cmsg(format!("{}: fsync: {e}", p.display())))?;
+    f.seek(SeekFrom::Start(0))
+        .map_err(|e| cmsg(format!("{}: seek: {e}", p.display())))?;
+    f.write_all(&buf)
+        .map_err(|e| cmsg(format!("{}: write: {e}", p.display())))?;
+    f.sync_all()
+        .map_err(|e| cmsg(format!("{}: fsync: {e}", p.display())))?;
     Ok(())
 }
 
@@ -112,7 +120,15 @@ pub fn status_text() -> Res<String> {
     let (p, buf) = read_cmd()?;
     let st = decode(&buf);
     let mut s = String::new();
-    s.push_str(&format!("para: {} ({})\n", p.display(), if find_para().is_some() { "present" } else { "missing" }));
+    s.push_str(&format!(
+        "para: {} ({})\n",
+        p.display(),
+        if find_para().is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    ));
     s.push_str(&format!("command: {}\n", st.describe()));
     match st {
         ParaState::Other(txt) => s.push_str(&format!("raw: {txt}\n")),
@@ -136,9 +152,17 @@ pub fn reboot_system() -> Res<()> {
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
     // SAFETY: RB_AUTOBOOT — matches the `reboot` command the scripts exec.
+    // (Linux-only syscall; the crate also compiles on the macOS dev host,
+    // where the boot verbs are unreachable — return an error instead.)
+    #[cfg(target_os = "linux")]
     let rc = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) };
+    #[cfg(not(target_os = "linux"))]
+    let rc = -1;
     if rc != 0 {
-        return Err(cmsg(format!("reboot syscall failed: {}", std::io::Error::last_os_error())));
+        return Err(cmsg(format!(
+            "reboot syscall failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     Ok(())
 }

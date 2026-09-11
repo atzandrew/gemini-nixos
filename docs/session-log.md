@@ -5,6 +5,69 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-11 — macOS support: `bash bin/gemshell-nested.sh` now opens a native preview window
+
+Ask: "i want this repo to also work on macOS. can you make this work:
+`bash bin/gemshell-nested.sh`", clarified to "i just want to test the
+desktop UI, doesn't need to be proper wayland" + "prefer traits over
+compile time cfg blocks".
+
+**The blocker, stated plainly:** macOS has no libwayland, no compositor
+socket and no Wayland session, so the existing nested mode (a Wayland
+*client* under the host compositor) cannot exist there at all. The host
+is an Apple-Silicon Mac (macOS 26.6.2, Nix 2.34.7, host Rust 1.97.1) with
+no Linux builder configured, so `.#packages.x86_64-linux.gemshell` cannot
+run either.
+
+**Design — platform backends behind traits.** The compositor core is now
+platform neutral. New `pkgs/gemshell/src/platform/`:
+
+- `mod.rs` — the `InputSource` / `Presenter` / `Backend` traits, the
+  shared `InputEvent` enum, the shm helper (`memfd_create` on Linux,
+  `shm_open` elsewhere) and `create_backend()` — **the only OS `#[cfg]`
+  in the whole program**;
+- `linux.rs` — the moved device/nested half: EGL/GBM context, the LK-fb
+  dma-buf import + compute-blit `Presenter`, the evdev input wrapper, and
+  the `poll()` loop (was `Compositor::run`);
+- `macos.rs` — a **Cocoa window + desktop OpenGL 3.3 core** context
+  (winit 0.29 / glutin 0.31 / glutin-winit 0.4), a
+  `glBlitFramebuffer` `WindowPresenter`, and a winit event loop that maps
+  mouse/keyboard onto the compositor's gestures/keysyms.
+
+The renderer takes a `Glsl` dialect and now owns a `Box<dyn Presenter>`;
+`Compositor` takes `(Renderer, Box<dyn InputSource>, Font, dummy_data)`
+and exposes a small `pub(crate)` platform interface (`startup`,
+`drain_background`, `advance`, `wants_frame`, `poll_timeout_ms`,
+`render`, `poll_input`, `feed_input`). `mod.rs`/`ui.rs`/`shell.rs` are
+otherwise untouched. The desktop-GL shaders (`*_CORE`) and a core-profile
+VAO were added; `render.rs` no longer carries any EGL/GBM code.
+
+Build wiring: `Cargo.toml` moves `system` (libwayland) into a
+`[target.'cfg(target_os="linux")']` section and adds the macOS deps;
+`build.rs` links `-framework OpenGL` on macOS and the Wayland/EGL/GLES
+set on Linux; unused `xkbcommon`/`gl` crates dropped. `util::find_font()`
+learned the macOS font paths, `gemdata-device`'s `reboot(2)` call is
+`cfg(target_os="linux")`, and `bin/gemshell-nested.sh` branches on
+`uname` (macOS: host `cargo build` + run).
+
+**Verification (host-side only — no device touched):**
+- `cargo check` clean on aarch64-darwin; the full `cargo build` links and
+the binary **boots, creates the GL 3.3 core context and renders** —
+`GEMSHELL_SCREENSHOT` wrote a detailed 2160x1080 scene-FBO PNG (~200 KB,
+settings panel open).
+- The Linux modules were type-checked on the Mac via a
+`--cfg gemshell_check_all` escape hatch (`RUSTFLAGS='--cfg
+ gemshell_check_all' cargo check`, check does not link) — clean. The
+Linux backend was MOVED, not rewritten, so this is the strongest check
+available without the aarch64 builder; a device/nix build is still owed.
+- `bash bin/gemshell-nested.sh` runs end-to-end on macOS (builds + opens
+the window).
+
+**Not done / owed:** no on-glass or nix-Linux rebuild (the Linux `system`
+Wayland backend differs from the rs backend used for the type-check);
+`cargoLock` will re-fetch the new macOS deps on the next nix build.
+Docs: `docs/gemshell.md` gained a "Platform backends" section.
+
 ## 2026-09-11 — Desktop cleanup: LXQt, Phosh, COSMIC, niri removed; light sleep made desktop-aware; device store GC'd
 
 Ask: "remove lxqt, phosh and cosmic from the project, then GC the Nix

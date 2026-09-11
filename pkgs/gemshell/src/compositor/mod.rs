@@ -2,43 +2,43 @@
 //! gestures and input. See docs/gemshell.md for the design.
 
 pub mod data;
-pub mod gbm;
-pub mod input;
-pub mod nested;
 pub mod render;
 pub mod status;
 pub mod ui;
 pub mod wayland;
+// Device/nested-only modules: raw evdev input, the GBM device, and the
+// x86_64 Wayland-client present path. They are compiled by the Linux
+// backend (`crate::platform::linux`).
+#[cfg(any(target_os = "linux", gemshell_check_all))]
+pub mod gbm;
+#[cfg(any(target_os = "linux", gemshell_check_all))]
+pub mod input;
+#[cfg(any(target_os = "linux", gemshell_check_all))]
+pub mod nested;
 
 use std::collections::HashMap;
 use std::os::fd::AsFd;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{mpsc, Arc};
 
-use wayland_server::protocol::wl_compositor::WlCompositor;
-use wayland_server::protocol::wl_keyboard::{KeyState, KeymapFormat, WlKeyboard};
-use wayland_server::protocol::wl_output::WlOutput;
-use wayland_server::protocol::wl_seat::WlSeat;
-use wayland_server::protocol::wl_shm::WlShm;
-use wayland_server::protocol::wl_surface::WlSurface;
-use wayland_server::protocol::wl_touch::WlTouch;
-use wayland_server::{Client, Display, ListeningSocket, Resource};
 use wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup;
 use wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface;
-use wayland_protocols::xdg::shell::server::xdg_toplevel::{
-    State as ToplevelState, XdgToplevel,
-};
-use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
+use wayland_protocols::xdg::shell::server::xdg_toplevel::{State as ToplevelState, XdgToplevel};
+use wayland_server::protocol::wl_keyboard::{KeyState, KeymapFormat, WlKeyboard};
+use wayland_server::protocol::wl_output::WlOutput;
+use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::protocol::wl_touch::WlTouch;
+use wayland_server::{Client, Display, Resource};
 
 use crate::common::{apps, font, icons, util};
+use crate::platform::{InputEvent, InputSource};
 use crate::shell;
 use gemdata::DataProvider;
 use gemdata_device::DeviceData;
 use gemdata_dummy::DummyData;
 
 use wayland::{
-    keymap_fd, BufferData, ClientState, CompositorData, DataDeviceManagerData, DecorationManagerData,
-    OutputData, ShmData, SurfaceData, WmBaseData, XdgPopupData, XdgSurfaceData, XdgToplevelData,
+    keymap_fd, BufferData, ClientState, CompositorData, DataDeviceManagerData,
+    DecorationManagerData, OutputData, ShmData, SurfaceData, WmBaseData,
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::{
     Mode as DecorationMode, ZxdgToplevelDecorationV1,
@@ -189,26 +189,45 @@ struct Finger {
 enum Gesture {
     None,
     /// one finger forwarded to the focused client (click/drag)
-    Forward { win: u32, finger: u32 },
+    Forward {
+        win: u32,
+        finger: u32,
+    },
     /// one finger moving a window (from its titlebar)
-    Move { win: u32, finger: u32, off_dx: f32, off_dy: f32 },
+    Move {
+        win: u32,
+        finger: u32,
+        off_dx: f32,
+        off_dy: f32,
+    },
     /// two fingers swiping workspaces horizontally
-    WorkspaceSwipe { f1: u32, f2: u32, last_x: f32, active: bool },
+    WorkspaceSwipe {
+        f1: u32,
+        f2: u32,
+        last_x: f32,
+        active: bool,
+    },
     /// two fingers swiping up = next app
-    NextApp { f1: u32, f2: u32, last_y: f32, active: bool },
+    NextApp {
+        f1: u32,
+        f2: u32,
+        last_y: f32,
+        active: bool,
+    },
     /// three fingers: home (close overlays)
     Home,
     /// one finger scrolling the launcher
-    LauncherScroll { finger: u32, last_y: f32 },
+    LauncherScroll {
+        finger: u32,
+        last_y: f32,
+    },
 }
 
 pub struct Compositor {
-    /// Device mode only (the panfrost render node); None when nested.
-    gbm_dev: Option<gbm::Gbm>,
-    /// Present target for `GEMSHELL_NESTED=1` (host dev builds).
-    nested: Option<nested::Nested>,
     pub renderer: render::Renderer,
-    input: input::Input,
+    /// Where keyboard/touch events come from — evdev (device/nested) or
+    /// the host window (macOS). See `platform::InputSource`.
+    input: Box<dyn InputSource>,
     pub font: font::Font,
     icons: icons::IconSet,
     windows: Vec<Window>,
@@ -291,58 +310,23 @@ pub struct Compositor {
 }
 
 impl Compositor {
-    /// Builds the compositor state + the (separate) Wayland display.
+    /// Build the compositor on top of the platform's renderer + input
+    /// source. The platform backend owns the GL context/window and the
+    /// event loop; this is the shared half.
+    ///
+    /// `dummy_data` selects the in-memory [`DummyData`] provider (nested
+    /// dev loop / macOS preview) over the real device one.
+    ///
     /// The display lives OUTSIDE the struct: `dispatch_clients(&mut self)`
     /// needs the display borrowed separately from the state.
-    /// `nested = true` runs as a Wayland client under the host
-    /// compositor (x86_64 development: `GEMSHELL_NESTED=1`); the
-    /// renderer is then surfaceless EGL and there is no evdev/GBM.
-    pub fn new(nested_mode: bool) -> Result<(Display<Compositor>, Self), String> {
+    pub fn new(
+        renderer: render::Renderer,
+        input: Box<dyn InputSource>,
+        font: font::Font,
+        dummy_data: bool,
+    ) -> Result<(Display<Compositor>, Self), String> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-        let font_path = util::find_font().ok_or_else(|| "no system TTF font found".to_string())?;
-        log::info!("font: {}", font_path.display());
-        let font = font::Font::load(
-            font_path
-                .to_str()
-                .ok_or_else(|| "non-unicode font path".to_string())?,
-            26.0,
-            2048,
-        )
-        .map_err(|e| format!("font: {e}"))?;
-
-        let glyph_size = font.w;
-        let input;
-        let gbm_dev;
-        let renderer;
-        let nested_client;
-        if nested_mode {
-            // x86_64 dev: no evdev, no /dev/gemfb — headless GL on the
-            // HOST render node and a parent Wayland connection. The child
-            // clients (gemsettings, apps) connect to OUR socket below
-            // (run()).
-            input = input::Input::new_virtual()?;
-            let g = gbm::Gbm::new("/dev/dri/renderD128")?;
-            renderer = render::Renderer::new_host(g.ptr, W, H, &font.pixels, glyph_size)?;
-            gbm_dev = Some(g);
-            nested_client = Some(nested::Nested::new(W, H)?);
-        } else {
-            let (kbd_opt, touch_opt, kbd_name, touch_name) = input::find_nodes();
-            let (kbd_path, touch_path) = match (kbd_opt, touch_opt) {
-                (Some(k), Some(t)) => (k, t),
-                _ => return Err("no keyboard/touch evdev node (need `input` group)".to_string()),
-            };
-            input = input::Input::open(&kbd_path, &touch_path, &kbd_name, &touch_name)?;
-            // GBM device on the PANFROST RENDER NODE (renderD128) — headless
-            // rendering; the LK panel is driven by the compute blit into the
-            // /dev/gemfb LK framebuffer, NOT by KMS on card0 (the gemwl
-            // chain, gemwl.c header + docs/gemshell.md). card0
-            // (geminipda-drm) is left alone.
-            let g = gbm::Gbm::new("/dev/dri/renderD128")?;
-            renderer = render::Renderer::new(g.ptr, W, H, &font.pixels, glyph_size)?;
-            gbm_dev = Some(g);
-            nested_client = None;
-        }
         let keymap_str = input.keymap_string();
         let ui_scale = Self::load_ui_scale();
 
@@ -353,18 +337,18 @@ impl Compositor {
         let _ = handle.create_global::<Compositor, _, _>(11, ()); // wl_seat
         let _ = handle.create_global::<Compositor, _, _>(4, OutputData {}); // wl_output
         let _ = handle.create_global::<Compositor, _, _>(3, WmBaseData {}); // xdg_wm_base
-        // GTK4 REQUIRES wl_data_device_manager to even open the display
-        // (see the import comment in wayland.rs). Version 3 (not 4): we
-        // do not implement wl_data_device_manager.release.
+                                                                            // GTK4 REQUIRES wl_data_device_manager to even open the display
+                                                                            // (see the import comment in wayland.rs). Version 3 (not 4): we
+                                                                            // do not implement wl_data_device_manager.release.
         let _ = handle.create_global::<Compositor, _, _>(3, DataDeviceManagerData {}); // wl_data_device_manager
-        // xdg-decoration: see wayland.rs. Version 2 (mode configure,
-        // set_mode/unset_mode, ToplevelDecorationError).
+                                                                                       // xdg-decoration: see wayland.rs. Version 2 (mode configure,
+                                                                                       // set_mode/unset_mode, ToplevelDecorationError).
         let _ = handle.create_global::<Compositor, _, _>(2, DecorationManagerData {}); // zxdg_decoration_manager_v1
 
         // The system-data provider: the real device one, or the in-memory
-        // dummy for the nested x86_64 dev loop (no nmcli/bluetoothctl on
-        // the workstation). Both back the same `gemdata::DataProvider`.
-        let real: Arc<dyn DataProvider> = if nested_mode {
+        // dummy for the nested x86_64 dev loop / macOS preview (no
+        // nmcli/bluetoothctl there). Both back the same `gemdata::DataProvider`.
+        let real: Arc<dyn DataProvider> = if dummy_data {
             Arc::new(DummyData::new())
         } else {
             Arc::new(DeviceData::new())
@@ -382,59 +366,61 @@ impl Compositor {
         let apps = apps::scan(&home);
         log::info!("{} apps from .desktop files", apps.len());
         let icons = icons::load(&home);
-        log::info!("{} PNG + {} SVG icons indexed", icons.map.len(), icons.svg.len());
+        log::info!(
+            "{} PNG + {} SVG icons indexed",
+            icons.map.len(),
+            icons.svg.len()
+        );
 
         let compositor = Compositor {
-            gbm_dev,
-                nested: nested_client,
-                renderer,
-                input,
-                font,
-                icons,
-                windows: Vec::new(),
-                focus: None,
-                ws_pos: 0.0,
-                ws_target: 0.0,
-                fingers: HashMap::new(),
-                gesture: Gesture::None,
-                pending_tap: None,
-                touch_focus: None,
-                launcher_open: false,
-                launcher_scroll: 0.0,
-                switcher_open: false,
-                switcher_index: 0,
-                apps,
-                app_icons: HashMap::new(),
-                settings_open: false,
-                configure_serial: 0,
-                status,
-                status_rx: rx,
-                dirty: true,
-                in_flight: false,
-                start_ms: util::now_ms(),
-                serial: 1,
-                keymap_str,
-                lw: W as f32 / ui_scale,
-                lh: H as f32 / ui_scale,
-                ui_scale,
-                outputs: Vec::new(),
-                client_move: None,
-                snap_preview: Snap::None,
-                snap_win: None,
-                present_time_ms: util::now_ms(),
-                tracked_clients: Vec::new(),
-                pressed_keysyms: Vec::new(),
-                last_titlebar_tap_ms: 0,
-                last_titlebar_win: None,
-                data,
-                data_rx,
-                shell: shell::ShellUi::new(),
-                egui_events: Vec::new(),
-                egui_pointer: None,
-                settings_snapshot_ms: 0,
-                touch_trail: util::env_flag("GEMSHELL_TOUCH_TRAIL"),
-                trail: Vec::new(),
-            };
+            renderer,
+            input,
+            font,
+            icons,
+            windows: Vec::new(),
+            focus: None,
+            ws_pos: 0.0,
+            ws_target: 0.0,
+            fingers: HashMap::new(),
+            gesture: Gesture::None,
+            pending_tap: None,
+            touch_focus: None,
+            launcher_open: false,
+            launcher_scroll: 0.0,
+            switcher_open: false,
+            switcher_index: 0,
+            apps,
+            app_icons: HashMap::new(),
+            settings_open: false,
+            configure_serial: 0,
+            status,
+            status_rx: rx,
+            dirty: true,
+            in_flight: false,
+            start_ms: util::now_ms(),
+            serial: 1,
+            keymap_str,
+            lw: W as f32 / ui_scale,
+            lh: H as f32 / ui_scale,
+            ui_scale,
+            outputs: Vec::new(),
+            client_move: None,
+            snap_preview: Snap::None,
+            snap_win: None,
+            present_time_ms: util::now_ms(),
+            tracked_clients: Vec::new(),
+            pressed_keysyms: Vec::new(),
+            last_titlebar_tap_ms: 0,
+            last_titlebar_win: None,
+            data,
+            data_rx,
+            shell: shell::ShellUi::new(),
+            egui_events: Vec::new(),
+            egui_pointer: None,
+            settings_snapshot_ms: 0,
+            touch_trail: util::env_flag("GEMSHELL_TOUCH_TRAIL"),
+            trail: Vec::new(),
+        };
         Ok((display, compositor))
     }
 
@@ -479,252 +465,179 @@ impl Compositor {
         self.app_icons.get(&app).copied()
     }
 
-    pub fn run(mut self, mut display: Display<Compositor>) -> i32 {
-        // Nested: the host compositor already owns `wayland-0`, so the
-        // sockets must not collide — our clients use wayland-gemshell.
-        let socket_name = if self.nested.is_some() { "wayland-gemshell" } else { "wayland-0" };
-        let socket = match ListeningSocket::bind(socket_name) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("wayland socket bind: {e}");
-                return 1;
-            }
-        };
-        let sock_name = socket
-            .socket_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| socket_name.into());
-        log::info!("wayland socket: {sock_name}");
-        // Children spawned from the launcher (gemsettings, apps) inherit
-        // this and therefore connect to US, not the host compositor.
-        std::env::set_var("WAYLAND_DISPLAY", &sock_name);
+    // -----------------------------------------------------------------
+    // Platform-facing interface (the `platform::Backend` implementations
+    // drive the compositor through these; nothing else should reach into
+    // the private state).
+    // -----------------------------------------------------------------
+
+    /// Shared startup: upload app icons and apply the dev env knobs
+    /// (`GEMSHELL_OPEN_SETTINGS` / `_OPEN_LAUNCHER` / `_AUTOSTART`).
+    pub fn startup(&mut self) {
         self.upload_app_icons();
-        // Dev convenience: open the in-process settings panel / launcher
-        // immediately (bin/gemshell-nested.sh / bin/gemshell-dev.sh
-        // screenshots). An env var set to 0/empty/false counts as OFF.
         if util::env_flag("GEMSHELL_OPEN_SETTINGS") {
             self.open_settings();
         }
         if util::env_flag("GEMSHELL_OPEN_LAUNCHER") {
             self.launcher_open = true;
         }
-        // Dev convenience: GEMSHELL_AUTOSTART=<client> launches a
-        // client right away (bin/gemshell-nested.sh).
         if let Ok(app) = std::env::var("GEMSHELL_AUTOSTART") {
             if !app.is_empty() {
                 log::info!("autostart: {app}");
                 spawn_cmd(app, Vec::<String>::new());
             }
         }
+    }
 
-        let wl_fd = display.as_fd().as_raw_fd();
-        let sock_fd = socket.as_raw_fd();
-        let mut pfd: Vec<libc::pollfd> = vec![pollfd(wl_fd, libc::POLLIN)];
-        let parent_idx = self.nested.as_ref().map(|n| {
-            pfd.push(pollfd(n.fd(), libc::POLLIN));
-            pfd.len() - 1
-        });
-        let gbm_idx = self.gbm_dev.as_ref().map(|g| {
-            pfd.push(pollfd(g.fd, libc::POLLIN));
-            pfd.len() - 1
-        });
-        let (kbd_idx, touch_idx) = if self.nested.is_none() {
-            pfd.push(pollfd(self.input.kbd_fd, libc::POLLIN));
-            let k = pfd.len() - 1;
-            pfd.push(pollfd(self.input.touch_fd, libc::POLLIN));
-            (Some(k), Some(pfd.len() - 1))
-        } else {
-            (None, None)
-        };
-        pfd.push(pollfd(sock_fd, libc::POLLIN));
-        let sock_idx = pfd.len() - 1;
-
-        loop {
-            // Frame pacing: 0 when a frame is due, else the remainder of
-            // the ~60 Hz interval, else a 1 s idle tick so status/clock
-            // updates (delivered over a channel, which does NOT wake
-            // poll) are still picked up. The old code re-rendered every
-            // 16 ms forever even when nothing changed — ~60 % of a core
-            // (fixed 2026-09-12).
-            let timeout = if self.in_flight {
-                let elapsed = util::now_ms().saturating_sub(self.present_time_ms);
-                if elapsed >= 16 {
-                    0
-                } else {
-                    (16 - elapsed) as i32
-                }
-            } else if self.dirty || self.animating() {
-                0
-            } else {
-                1000
-            };
-            let rc =
-                unsafe { libc::poll(pfd.as_mut_ptr(), pfd.len() as libc::nfds_t, timeout as libc::c_int) };
-            if rc < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                log::error!("poll: {}", std::io::Error::last_os_error());
-                return 1;
-            }
-
-            while let Ok(s) = self.status_rx.try_recv() {
-                if s != self.status {
-                    self.status = s;
-                    self.dirty = true;
-                }
-                // While the settings panel is open, keep a slow repaint
-                // alive: the frame clock is dirty-driven, and the panel's
-                // 3 s data-refresh request lives in `run_egui` (which only
-                // runs when a frame is drawn). The status poller ticks
-                // every 2 s, so this yields a ~0.5 Hz panel repaint that
-                // services the refresh without any extra polling.
-                if self.settings_open {
-                    self.dirty = true;
-                }
-            }
-            // A fresh data snapshot (settings panel: Wi-Fi/BT/audio):
-            // ask the shell to re-read the cache on the next frame.
-            while self.data_rx.try_recv().is_ok() {
-                self.shell.state.need_refresh = true;
+    /// Drain the background channels (status poller + data worker). They
+    /// do not wake a poll()/event loop, so the backend calls this every
+    /// tick — and sets a 1 s ceiling when idle.
+    pub(crate) fn drain_background(&mut self) {
+        while let Ok(s) = self.status_rx.try_recv() {
+            if s != self.status {
+                self.status = s;
                 self.dirty = true;
             }
-
-            if pfd[0].revents & libc::POLLIN != 0 {
-                if let Err(e) = display.dispatch_clients(&mut self) {
-                    log::error!("dispatch: {e}");
-                }
-                let _ = display.flush_clients();
+            // While the settings panel is open, keep a slow repaint alive:
+            // the frame clock is dirty-driven, and the panel's data-refresh
+            // request lives in `run_egui` (which only runs when a frame is
+            // drawn). The status poller ticks every 2 s, so this yields a
+            // ~0.5 Hz panel repaint that services the refresh.
+            if self.settings_open {
+                self.dirty = true;
             }
+        }
+        while self.data_rx.try_recv().is_ok() {
+            self.shell.state.need_refresh = true;
+            self.dirty = true;
+        }
+    }
 
-            // Nested: drain host input and forward it into our seat.
-            if let Some(pi) = parent_idx {
-                if pfd[pi].revents & libc::POLLIN != 0 {
-                    let (ww, wh) = self.nested.as_ref().map(|n| n.size()).unwrap_or((W, H));
-                    let events = if let Some(n) = self.nested.as_mut() {
-                        n.pump();
-                        n.take_input()
-                    } else {
-                        Vec::new()
-                    };
-                    for ev in events {
-                        match ev {
-                            nested::NestedInput::Key { code, pressed } => {
-                                let (keysym, mods) = self.input.process_key(code, pressed);
-                                self.serial += 1;
-                                self.handle_key(code, keysym, pressed, mods);
-                            }
-                            nested::NestedInput::PointerDown { x, y } => {
-                                let (sx, sy) = scale_pt(x, y, ww, wh);
-                                self.serial += 1;
-                                self.touch_down(0, sx, sy);
-                            }
-                            nested::NestedInput::PointerMotion { x, y } => {
-                                let (sx, sy) = scale_pt(x, y, ww, wh);
-                                self.serial += 1;
-                                self.touch_motion(0, sx, sy);
-                            }
-                            nested::NestedInput::PointerUp => {
-                                self.serial += 1;
-                                self.touch_up(0);
-                            }
-                        }
-                    }
-                }
+    /// Animation + frame-pacing bookkeeping (once per tick, before
+    /// deciding whether to render).
+    pub(crate) fn advance(&mut self) {
+        self.step_animation();
+        if self.in_flight && util::now_ms().saturating_sub(self.present_time_ms) >= 16 {
+            self.in_flight = false;
+        }
+    }
+
+    /// A frame is due and none is in flight.
+    pub(crate) fn wants_frame(&self) -> bool {
+        self.dirty && !self.in_flight
+    }
+
+    /// The backend's poll timeout (ms): 0 when a frame is due, else the
+    /// remainder of the ~60 Hz interval, else a 1 s idle tick so the
+    /// status/clock channel is drained.
+    pub(crate) fn poll_timeout_ms(&self) -> i32 {
+        if self.in_flight {
+            let elapsed = util::now_ms().saturating_sub(self.present_time_ms);
+            if elapsed >= 16 {
+                0
+            } else {
+                (16 - elapsed) as i32
             }
+        } else if self.dirty || self.animating() {
+            0
+        } else {
+            1000
+        }
+    }
 
-            if pfd[sock_idx].revents & libc::POLLIN != 0 {
-                while let Ok(Some(stream)) = socket.accept() {
-                    match display.handle().insert_client(stream, Arc::new(ClientState::default())) {
-                        Ok(client) => {
-                            log::info!("client connected");
-                            self.note_client(client);
-                            self.dirty = true;
-                        }
-                        Err(e) => {
-                            log::error!("client insert: {e}");
-                            break;
-                        }
-                    }
-                }
-            }
+    /// Render one frame into the scene FBO and run the platform presenter.
+    pub(crate) fn render(&mut self) {
+        self.render_frame();
+        // Keep rendering while egui asks for another frame (animations/
+        // hover). Cheap under the modal: the hidden scene is skipped.
+        self.dirty = self.settings_open && self.shell.wants_repaint();
+        self.in_flight = true;
+        self.present_time_ms = util::now_ms();
+    }
 
-            if let Some(gi) = gbm_idx {
-                if pfd[gi].revents & libc::POLLIN != 0 {
-                    if let Some(g) = self.gbm_dev.as_mut() {
-                        g.consume_flip();
-                    }
-                    self.in_flight = false;
-                    self.present_time_ms = util::now_ms();
-                    self.dirty = true;
-                }
-            }
+    /// A device page-flip/GBM event completed the present.
+    #[allow(dead_code)] // Linux backend only
+    pub(crate) fn flip_done(&mut self) {
+        self.in_flight = false;
+        self.present_time_ms = util::now_ms();
+        self.dirty = true;
+    }
 
-            if kbd_idx.is_some()
-                && (pfd[kbd_idx.unwrap()].revents & libc::POLLIN != 0
-                    || pfd[touch_idx.unwrap()].revents & libc::POLLIN != 0)
-            {
-                // NOTE: `read_events` maps touch into the full-resolution
-                // scene. The layout (chrome/windows/gestures) is LOGICAL
-                // (`lw`×`lh`), so convert on the way in; the renderer scales
-                // logical back up to physical (2026-09-11).
-                let iscale = self.ui_scale;
-                for ev in self.input.read_events(W as f32, H as f32) {
-                    match ev {
-                        input::Event::Key {
-                            code,
-                            keysym,
-                            pressed,
-                            mods,
-                            ..
-                        } => {
-                            self.serial += 1;
-                            self.handle_key(code, keysym, pressed, mods);
-                        }
-                        input::Event::TouchDown { id, x, y } => {
-                            self.serial += 1;
-                            self.touch_down(id, x / iscale, y / iscale);
-                        }
-                        input::Event::TouchMotion { id, x, y } => {
-                            self.serial += 1;
-                            self.touch_motion(id, x / iscale, y / iscale);
-                        }
-                        input::Event::TouchUp { id } => {
-                            self.serial += 1;
-                            self.touch_up(id);
-                        }
-                    }
-                }
-            }
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 
-            self.step_animation();
+    /// Drain the platform input source into the compositor's gestures.
+    #[allow(dead_code)] // evdev-backed backends only
+    pub(crate) fn poll_input(&mut self) {
+        let iscale = if self.ui_scale > 0.01 {
+            self.ui_scale
+        } else {
+            1.0
+        };
+        for ev in self.input.poll(W as f32, H as f32) {
+            self.feed_input(ev, iscale);
+        }
+    }
 
-            // A frame is "done" 16 ms after it was presented (present()
-            // already ended with glFinish, so it is on glass). Do NOT set
-            // `dirty` here: only render again if something actually
-            // changed (input/status/animation).
-            if self.in_flight && util::now_ms().saturating_sub(self.present_time_ms) >= 16 {
-                self.in_flight = false;
-            }
+    /// Feed one input event (window coords already mapped to the scene's
+    /// full-resolution space; `iscale` converts to the logical layout).
+    pub(crate) fn feed_input(&mut self, ev: InputEvent, iscale: f32) {
+        self.serial += 1;
+        match ev {
+            InputEvent::Key {
+                code,
+                keysym,
+                pressed,
+                mods,
+                ..
+            } => self.handle_key(code, keysym, pressed, mods),
+            InputEvent::TouchDown { id, x, y } => self.touch_down(id, x / iscale, y / iscale),
+            InputEvent::TouchMotion { id, x, y } => self.touch_motion(id, x / iscale, y / iscale),
+            InputEvent::TouchUp { id } => self.touch_up(id),
+        }
+    }
 
-            if self.dirty && !self.in_flight {
-                self.render_frame();
-                // Nested: publish the scene FBO to the host window (the
-                // device path already presented in render_frame via the
-                // compute blit into the LK fb).
-                if self.nested.is_some() {
-                    let rgba = self.renderer.read_scene_rgba();
-                    let (sw, sh) = (self.renderer.width, self.renderer.height);
-                    if let Some(n) = self.nested.as_mut() {
-                        n.submit(&rgba, sw, sh);
-                    }
-                }
-                // Keep rendering while egui asks for another frame
-                // (animations/hover). Cheap under the modal: the hidden
-                // scene is skipped. Note this runs AFTER render_frame, so
-                // it is not clobbered by the frame's own dirty handling.
-                self.dirty = self.settings_open && self.shell.wants_repaint();
-                self.in_flight = true;
-                self.present_time_ms = util::now_ms();
-                let _ = display.flush_clients();
-            }
+    /// Feed a synthesised key (macOS maps its window events to keysyms
+    /// without xkbcommon).
+    pub(crate) fn feed_key(&mut self, code: u32, keysym: u32, pressed: bool, mods: u32) {
+        self.serial += 1;
+        self.handle_key(code, keysym, pressed, mods);
+    }
+
+    /// Feed one raw evdev scancode through the input source's xkb state
+    /// (the nested Wayland-client path forwards host key events this way).
+    #[allow(dead_code)] // Linux backend only
+    pub(crate) fn feed_evdev_key(&mut self, code: u32, pressed: bool) {
+        let (keysym, mods) = self.input.process_key(code, pressed);
+        self.serial += 1;
+        self.handle_key(code, keysym, pressed, mods);
+    }
+
+    /// The input source's poll fds (evdev); (-1, -1) for event-loop
+    /// backends. The Linux backend polls these.
+    #[allow(dead_code)] // Linux backend only
+    pub(crate) fn input_fds(&self) -> (std::os::fd::RawFd, std::os::fd::RawFd) {
+        self.input.poll_fds()
+    }
+
+    /// Pointer hover (macOS): only the egui settings panel cares.
+    pub(crate) fn pointer_hover(&mut self, x: f32, y: f32) {
+        if self.settings_open {
+            self.egui_move_pointer(x, y);
+            self.dirty = true;
+        }
+    }
+
+    /// Scroll the egui settings panel (macOS mouse wheel).
+    pub(crate) fn scroll_panel(&mut self, dy: f32) {
+        if self.settings_open {
+            self.egui_events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                modifiers: self.egui_mods_now(),
+            });
+            self.dirty = true;
         }
     }
 
@@ -759,7 +672,8 @@ impl Compositor {
         // clock at 60 Hz forever.) [2026-09-12]
     }
 
-    fn note_client(&mut self, client: Client) {
+    #[allow(dead_code)] // Linux backend only
+    pub(crate) fn note_client(&mut self, client: Client) {
         self.tracked_clients.push(client);
         if self.tracked_clients.len() > 32 {
             self.tracked_clients.remove(0);
@@ -890,17 +804,24 @@ impl Compositor {
     /// Forward a key event to the focused client's wl_keyboard.
     fn forward_key(&mut self, code: u32, _keysym: u32, pressed: bool) {
         let Some(focus) = self.focus else { return };
-        let Some(win) = self.windows.iter().find(|w| w.id == focus) else { return };
-        let Some(kbd) = self.kbd_res_for(win) else { return };
+        let Some(win) = self.windows.iter().find(|w| w.id == focus) else {
+            return;
+        };
+        let Some(kbd) = self.kbd_res_for(win) else {
+            return;
+        };
         // wl_keyboard.key carries the raw evdev scancode; CLIENTS add 8
         // for xkbcommon (wayland.xml). The old +8 here double-offset the
         // key for every client (fixed 2026-09-11, nested-mode bring-up).
-        let state = if pressed { KeyState::Pressed } else { KeyState::Released };
+        let state = if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
         let _ = kbd.key(self.serial, self.present_time_ms as u32, code, state);
         let (d, l, k) = self.input.mods_masks();
         let _ = kbd.modifiers(self.serial, d, l, k, 0);
     }
-
 
     fn volume_step(&mut self, delta: i32) {
         let target = (self.status.volume + delta).clamp(0, 100);
@@ -923,11 +844,7 @@ impl Compositor {
             vec![
                 "set-mute".to_string(),
                 "@DEFAULT_AUDIO_SINK@".to_string(),
-                if m {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                },
+                if m { "1".to_string() } else { "0".to_string() },
             ],
         );
         self.status.muted = m;
@@ -1068,7 +985,14 @@ impl Compositor {
             }
             self.fingers.insert(
                 id,
-                Finger { x, y, start_x: x, start_y: y, moved: false, down_ms: util::now_ms() },
+                Finger {
+                    x,
+                    y,
+                    start_x: x,
+                    start_y: y,
+                    moved: false,
+                    down_ms: util::now_ms(),
+                },
             );
             log::info!("touch-trail: down id={id} scene=({x:.0},{y:.0})");
             self.trail.push((id, x, y));
@@ -1117,7 +1041,10 @@ impl Compositor {
 
     fn gesture_begin_single(&mut self, id: u32, x: f32, y: f32) {
         if self.launcher_open {
-            self.gesture = Gesture::LauncherScroll { finger: id, last_y: y };
+            self.gesture = Gesture::LauncherScroll {
+                finger: id,
+                last_y: y,
+            };
             return;
         }
         if self.switcher_open {
@@ -1156,26 +1083,44 @@ impl Compositor {
             }
             // double-tap = toggle maximize
             let now = util::now_ms();
-            let double = self.last_titlebar_win == Some(wid) && now - self.last_titlebar_tap_ms < 320;
+            let double =
+                self.last_titlebar_win == Some(wid) && now - self.last_titlebar_tap_ms < 320;
             self.last_titlebar_tap_ms = now;
             self.last_titlebar_win = Some(wid);
             if double {
-                let was_max = self.windows.iter().find(|w| w.id == wid).map(|w| w.maximized).unwrap_or(false);
+                let was_max = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == wid)
+                    .map(|w| w.maximized)
+                    .unwrap_or(false);
                 self.set_maximized(wid, !was_max);
                 self.gesture = Gesture::None;
                 return;
             }
-            self.gesture = Gesture::Move { win: wid, finger: id, off_dx: x - wx, off_dy: y - wy };
+            self.gesture = Gesture::Move {
+                win: wid,
+                finger: id,
+                off_dx: x - wx,
+                off_dy: y - wy,
+            };
             self.snap_preview = Snap::None;
             self.snap_win = Some(wid);
         } else {
             self.begin_forward(wid, id);
-            self.gesture = Gesture::Forward { win: wid, finger: id };
+            self.gesture = Gesture::Forward {
+                win: wid,
+                finger: id,
+            };
         }
     }
 
     fn gesture_begin_double(&mut self, id: u32) {
-        let first = self.fingers.iter().find(|(k, _)| **k != id).map(|(k, _)| *k);
+        let first = self
+            .fingers
+            .iter()
+            .find(|(k, _)| **k != id)
+            .map(|(k, _)| *k);
         self.cancel_forwarded();
         self.snap_preview = Snap::None;
         self.snap_win = None;
@@ -1252,7 +1197,12 @@ impl Compositor {
 
         // clone the gesture: the arms below mutably borrow self
         match self.gesture.clone() {
-            Gesture::Move { win, finger, off_dx, off_dy } if finger == id => {
+            Gesture::Move {
+                win,
+                finger,
+                off_dx,
+                off_dy,
+            } if finger == id => {
                 let needs_unsnap = self
                     .windows
                     .iter()
@@ -1269,7 +1219,12 @@ impl Compositor {
                 self.snap_preview = self.snap_zone(x, y);
                 self.dirty = true;
             }
-            Gesture::WorkspaceSwipe { f1, f2, last_x, active } if f2 == id || f1 == id => {
+            Gesture::WorkspaceSwipe {
+                f1,
+                f2,
+                last_x,
+                active,
+            } if f2 == id || f1 == id => {
                 let Some(cx) = self.pair_center_x(f1, f2) else {
                     return;
                 };
@@ -1287,7 +1242,12 @@ impl Compositor {
                     return;
                 };
                 let mut should_next = false;
-                if let Gesture::NextApp { active: a, last_y: ly, .. } = &mut self.gesture {
+                if let Gesture::NextApp {
+                    active: a,
+                    last_y: ly,
+                    ..
+                } = &mut self.gesture
+                {
                     if *a && cy - *ly < -80.0 {
                         should_next = true;
                         *a = false;
@@ -1509,8 +1469,11 @@ impl Compositor {
                 self.dirty = true;
                 return;
             }
-            let tiles: Vec<(u32, u32)> =
-                self.visible_windows().iter().map(|w| (w.id, w.workspace)).collect();
+            let tiles: Vec<(u32, u32)> = self
+                .visible_windows()
+                .iter()
+                .map(|w| (w.id, w.workspace))
+                .collect();
             let mut tx = ui::TILE_X0;
             for (wid, ws) in tiles {
                 if tx + ui::TILE_S > self.lw {
@@ -1559,7 +1522,14 @@ impl Compositor {
         self.touch_focus = Some(win);
         let (x, y) = self.finger_pos(finger).unwrap_or((0.0, 0.0));
         let (lx, ly) = self.local_coords(w, x, y);
-        let _ = touch.down(self.serial, self.present_time_ms as u32, &w.surface, finger as i32, lx as f64, ly as f64);
+        let _ = touch.down(
+            self.serial,
+            self.present_time_ms as u32,
+            &w.surface,
+            finger as i32,
+            lx as f64,
+            ly as f64,
+        );
         let _ = touch.frame();
         self.dirty = true;
     }
@@ -1687,7 +1657,10 @@ impl Compositor {
     }
 
     pub fn switcher_windows(&self) -> Vec<&Window> {
-        self.windows.iter().filter(|w| !w.minimized && !w.is_popup).collect()
+        self.windows
+            .iter()
+            .filter(|w| !w.minimized && !w.is_popup)
+            .collect()
     }
 
     fn raise(&mut self, id: u32) {
@@ -1883,7 +1856,12 @@ impl Compositor {
 
     /// The usable area (below the status bar, above the taskbar), logical.
     pub fn work_area(&self) -> (f32, f32, f32, f32) {
-        (0.0, STATUS_H, self.lw, (self.lh - STATUS_H - TASKBAR_H).max(1.0))
+        (
+            0.0,
+            STATUS_H,
+            self.lw,
+            (self.lh - STATUS_H - TASKBAR_H).max(1.0),
+        )
     }
 
     /// `xdg_toplevel.set_parent`: a toplevel with a parent is a transient
@@ -1989,8 +1967,20 @@ impl Compositor {
         self.dirty = true;
     }
 
-    pub fn new_popup(&mut self, surface: WlSurface, parent: Option<u32>, w: f32, h: f32, x: f32, y: f32) -> Option<u32> {
-        if self.windows.iter().any(|w2| w2.surface.id() == surface.id()) {
+    pub fn new_popup(
+        &mut self,
+        surface: WlSurface,
+        parent: Option<u32>,
+        w: f32,
+        h: f32,
+        x: f32,
+        y: f32,
+    ) -> Option<u32> {
+        if self
+            .windows
+            .iter()
+            .any(|w2| w2.surface.id() == surface.id())
+        {
             return None;
         }
         let id = self.next_id();
@@ -2070,7 +2060,12 @@ impl Compositor {
         let w = self.windows.remove(idx);
         drop(w.toplevel);
         if self.focus == Some(win) {
-            self.focus = self.windows.iter().rev().find(|w| !w.minimized && !w.is_popup).map(|w| w.id);
+            self.focus = self
+                .windows
+                .iter()
+                .rev()
+                .find(|w| !w.minimized && !w.is_popup)
+                .map(|w| w.id);
             self.send_focus_change();
         }
         self.renderer.drop_window_texture(win);
@@ -2104,7 +2099,12 @@ impl Compositor {
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
             w.minimized = true;
             if self.focus == Some(win) {
-                self.focus = self.windows.iter().rev().find(|w| !w.minimized && !w.is_popup).map(|w| w.id);
+                self.focus = self
+                    .windows
+                    .iter()
+                    .rev()
+                    .find(|w| !w.minimized && !w.is_popup)
+                    .map(|w| w.id);
                 self.send_focus_change();
             }
             self.dirty = true;
@@ -2139,9 +2139,7 @@ impl Compositor {
                 let nw = (ww * 0.78).clamp(360.0, ww);
                 let nh = (wh * 0.82).clamp(280.0, wh);
                 w.x = w.x.clamp(0.0, (lw - nw).max(0.0));
-                w.y = w
-                    .y
-                    .clamp(STATUS_H, (lh - TASKBAR_H - nh).max(STATUS_H));
+                w.y = w.y.clamp(STATUS_H, (lh - TASKBAR_H - nh).max(STATUS_H));
                 w.w = nw;
                 w.h = nh;
             }
@@ -2154,7 +2152,12 @@ impl Compositor {
 
     fn toggle_maximize_focused(&mut self) {
         let Some(f) = self.focus else { return };
-        let Some(m) = self.windows.iter().find(|w| w.id == f).map(|w| !w.maximized) else {
+        let Some(m) = self
+            .windows
+            .iter()
+            .find(|w| w.id == f)
+            .map(|w| !w.maximized)
+        else {
             return;
         };
         self.set_maximized(f, m);
@@ -2299,8 +2302,12 @@ impl Compositor {
             if old == new_focus {
                 continue;
             }
-            let old_surf = old.and_then(|id| self.windows.iter().find(|w| w.id == id)).map(|w| w.surface.clone());
-            let new_surf = new_focus.and_then(|id| self.windows.iter().find(|w| w.id == id)).map(|w| w.surface.clone());
+            let old_surf = old
+                .and_then(|id| self.windows.iter().find(|w| w.id == id))
+                .map(|w| w.surface.clone());
+            let new_surf = new_focus
+                .and_then(|id| self.windows.iter().find(|w| w.id == id))
+                .map(|w| w.surface.clone());
             if let Some(ow) = old_surf {
                 let _ = kbd.leave(self.serial, &ow);
             }
@@ -2401,7 +2408,11 @@ impl Compositor {
     }
 
     pub fn surface_detached(&mut self, surface: &WlSurface) {
-        if let Some(w) = self.windows.iter_mut().find(|w| w.surface.id() == surface.id()) {
+        if let Some(w) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.surface.id() == surface.id())
+        {
             w.buffer = None;
             self.renderer.drop_window_texture(w.id);
         }
@@ -2409,7 +2420,11 @@ impl Compositor {
     }
 
     pub fn xdg_surface_detached(&mut self, surface: WlSurface) {
-        if let Some(w) = self.windows.iter_mut().find(|w| w.surface.id() == surface.id()) {
+        if let Some(w) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.surface.id() == surface.id())
+        {
             w.buffer = None;
             self.renderer.drop_window_texture(w.id);
         }
@@ -2461,7 +2476,11 @@ impl Compositor {
                 if off < -(self.lw) || off > self.lw {
                     continue;
                 }
-                for win in self.windows.iter().filter(|w| w.workspace == ws && !w.minimized) {
+                for win in self
+                    .windows
+                    .iter()
+                    .filter(|w| w.workspace == ws && !w.minimized)
+                {
                     ui::draw_window(&mut ops, self, win, off);
                 }
             }
@@ -2596,17 +2615,8 @@ fn keysym_text(keysym: u32) -> Option<String> {
     Some(c.to_string())
 }
 
-/// Map a point in nested-window pixels to scene coordinates.
-fn scale_pt(x: f64, y: f64, win_w: u32, win_h: u32) -> (f32, f32) {
-    (
-        (x * W as f64 / win_w.max(1) as f64) as f32,
-        (y * H as f64 / win_h.max(1) as f64) as f32,
-    )
-}
-
-fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    libc::pollfd { fd, events, revents: 0 }
-}
+// `scale_pt`/`pollfd` moved to the Linux backend (`platform::linux`),
+// the only place that polls fds.
 
 // find_font/walk now live in crate::common::util (shared with
 // gemsettings).
@@ -2616,8 +2626,10 @@ fn spawn_cmd<P: AsRef<std::ffi::OsStr>, A: AsRef<std::ffi::OsStr>, I: IntoIterat
     args: I,
 ) {
     let prog = prog.as_ref().to_os_string();
-    let args: Vec<std::ffi::OsString> =
-        args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
     let name = prog.to_string_lossy().into_owned();
     std::thread::Builder::new()
         .name("spawn".into())

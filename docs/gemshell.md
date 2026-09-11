@@ -15,7 +15,9 @@ the 2026-09-12 rework replaced the separate `gemsettings` wl_shm client
 with a GPU-tessellated egui overlay and moved all system-data access
 behind the `gemdata::DataProvider` trait (see below). Nested x86_64 dev
 loop: `bash bin/gemshell-nested.sh` (host EGL/GBM + wl_shm, seconds per
-iteration; it opens the settings panel by default). Host check:
+iteration; it opens the settings panel by default). On macOS the same
+script opens a native preview window instead (no Wayland on macOS — see
+"Platform backends" below). Host check:
 `bash bin/gemshell-host-check.sh`. **Owed: a human look at the glass to
 confirm the orientation/rotation direction + touch calibration** (the
 2026-09-12 present() fix corrected a left-right mirror; see Orientation).
@@ -258,7 +260,25 @@ remove the env from `services/gemshell.nix` to restore normal gestures.
 For scripted strokes use the repo injector's new multi-point mode:
 `tapxy X Y [X2 Y2 …]` (built from `bin/touch-inject.c`).
 
-## Nested mode on x86_64 (development)
+## Platform backends — device, x86_64 nested, macOS preview
+
+The compositor core is platform neutral; the OS-specific half lives behind
+traits in `pkgs/gemshell/src/platform/`. Two backend implementations ship,
+selected in exactly ONE place (`platform::create_backend`) — everything
+else is dispatched through the traits at runtime:
+
+| Backend | Where | Display | Present | Input | Event loop |
+|---|---|---|---|---|---|
+| Linux (device) | `platform/linux.rs` | EGL/GBM (Mesa, panfrost render node) | compute blit into the LK framebuffer (`/dev/gemfb`) | raw evdev + xkbcommon | `poll()` over display/socket/GBM/evdev fds |
+| Linux (nested) | `platform/linux.rs` + `compositor/nested.rs` | EGL/GBM (host render node) | scene FBO readback -> `wl_shm` on the host compositor | host `wl_seat` forwarded into our seat | same `poll()` loop |
+| macOS | `platform/macos.rs` | native Cocoa window + desktop OpenGL 3.3 core (glutin/CGL) | `glBlitFramebuffer` scene FBO -> window | Cocoa mouse/keyboard mapped to gestures | winit event loop |
+
+The seams: the renderer takes a `Glsl` dialect (GLES 3.00 vs desktop 3.30
+core), input is an `InputSource`, presentation a `Presenter`, and the loop
+a `Backend`. The Linux backend keeps the EGL/LK-fb/evdev code the device
+always used; it moved out of the compositor, it did not change.
+
+### Nested mode on x86_64 (development)
 
 `GEMSHELL_NESTED=1` (via `bin/gemshell-nested.sh`) runs gemshell as a
 **Wayland client** under the host compositor: headless EGL/GBM on
@@ -272,6 +292,30 @@ panel is visible immediately (any other client via `GEMSHELL_AUTOSTART`).
 Nested mode selects `gemdata-dummy` as its `DataProvider`, so the UI is
 exercised against in-memory Wi-Fi/BT/audio state without touching the
 workstation's network. Build: `nix build .#packages.x86_64-linux.gemshell`.
+
+### macOS preview window (2026-09-11)
+
+On macOS `bash bin/gemshell-nested.sh` builds with the host Rust toolchain
+(`cargo build` in `pkgs/gemshell`) and runs the same binary with the macOS
+backend — a native window, no Wayland anywhere. It is a **UI test harness**
+for the shell chrome, the egui settings panel and input; there are no
+Wayland clients to host, and `gemdata-dummy` supplies the Wi-Fi/BT/audio
+state. Window size from `GEMSHELL_NESTED_SCALE` (0.5); the panel opens
+with `GEMSHELL_OPEN_SETTINGS=1`; `GEMSHELL_SCREENSHOT`/`_DELAY_MS` write
+the scene FBO to a PNG. `GEMSHELL_PROFILE=release` builds optimised
+(default is debug — much faster to compile).
+
+Why it is not "nested Wayland": macOS has **no libwayland, no compositor
+socket and no Wayland session**, so the constraint is the platform, not
+the code. The renderer's desktop-GL shader set (`*_CORE` in render.rs),
+the core-profile VAO and the `blit_to_default_fb` present exist for this
+path; the Wayland Rust crates build via their pure-Rust backend (the
+`system`/libwayland feature is Linux-only in `Cargo.toml`).
+
+Keyboard mapping in the preview is deliberately small (there is no
+xkbcommon on macOS): Escape/arrows/Home/End/Page/Delete, and **F1-F8
+stand in for the Gemini's Fn layer** (launcher, app switcher, brightness,
+volume, sleep) so those shortcuts can be exercised from a Mac.
 
 **egui host-side validation (2026-09-12):** the nested binary also works
 headless-ish for verification — run it with `GEMSHELL_SCREENSHOT=/tmp/
@@ -317,6 +361,7 @@ bottom.
 | Piece | Where | Notes |
 |---|---|---|
 | `gemshell` (compositor + shell) | `pkgs/gemshell/` (bin `gemshell`) | single process: wayland server + GL renderer + input + chrome + egui settings panel |
+| `platform` (backends) | `pkgs/gemshell/src/platform/{mod,linux,macos}.rs` | the OS-specific half behind traits: `InputSource`, `Presenter`, `Backend`; the one `#[cfg]` fork (`create_backend`) picks Linux or macOS |
 | `shell` (egui UI) | `pkgs/gemshell/src/shell.rs` | the settings panel: layout, fonts, widgets; emits GPU triangle meshes |
 | `gemdata` | `pkgs/gemshell/crates/gemdata/` | the `DataProvider` trait + data types (Wi-Fi/BT/audio/battery/status) |
 | `gemdata-device` | `pkgs/gemshell/crates/gemdata-device/` | real impl + all gemcli device functions (nmcli/bluetoothctl/wpctl/sysfs/i2c/devmem); unit-tested parsers |
@@ -328,14 +373,14 @@ bottom.
 
 ## Architecture (compositor)
 
-Single thread, one `poll()` loop over: the wayland display fd, the
-gbm device fd (flip events), the two evdev nodes (keyboard, touch).
-No async runtime, no threads in the hot path (one background thread
-polls status: battery/wifi/bt/volume). Frame pacing is dirty-driven:
-0 while a frame is due, the remainder of the 16 ms/60 Hz interval
-while one is in flight, and a 1 s idle tick so the status channel is
-still drained (there is no eventfd for it). It does NOT re-render
-when nothing changed (2026-09-11).
+Single thread, one event loop (the Linux backend's `poll()` over the
+wayland display fd, the gbm device fd and the two evdev nodes; the macOS
+backend's winit loop). No async runtime, no threads in the hot path (one
+background thread polls status: battery/wifi/bt/volume). Frame pacing is
+dirty-driven: 0 while a frame is due, the remainder of the 16 ms/60 Hz
+interval while one is in flight, and a 1 s idle tick so the status channel
+is still drained (there is no eventfd for it). It does NOT re-render when
+nothing changed (2026-09-11).
 
 - **Display path** — `/dev/dri/card0` (geminipda-drm, the LK
   framebuffer as DRM/KMS; single fixed mode 1080×2160 portrait, XRGB8888

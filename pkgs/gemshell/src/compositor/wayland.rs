@@ -23,6 +23,11 @@ use wayland_server::protocol::wl_compositor::WlCompositor;
 // ("The Wayland compositor does not provide one or more of the required
 // interfaces, not using Wayland display"). Without it every GTK app
 // launched from the launcher exited immediately (2026-09-11).
+use wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup;
+use wayland_protocols::xdg::shell::server::xdg_positioner::{Anchor, XdgPositioner};
+use wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface;
+use wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
+use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_data_device::WlDataDevice;
 use wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_server::protocol::wl_data_source::WlDataSource;
@@ -38,11 +43,6 @@ use wayland_server::protocol::wl_touch::WlTouch;
 use wayland_server::{
     backend::ClientData, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, Resource,
 };
-use wayland_protocols::xdg::shell::server::xdg_positioner::{Anchor, XdgPositioner};
-use wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup;
-use wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface;
-use wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
-use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 // xdg-decoration: without this GTK4 assumes CSD and draws its own title
 // bar while we draw the compositor titlebar too ("2 close buttons per
 // window", reported on glass 2026-09-11). We expose the global and
@@ -55,6 +55,11 @@ use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1
     Mode as DecorationMode, Request as ZxdgToplevelDecorationV1Request, ZxdgToplevelDecorationV1,
 };
 
+use wayland_protocols::xdg::shell::server::xdg_popup::Request as XdgPopupRequest;
+use wayland_protocols::xdg::shell::server::xdg_positioner::Request as XdgPositionerRequest;
+use wayland_protocols::xdg::shell::server::xdg_surface::Request as XdgSurfaceRequest;
+use wayland_protocols::xdg::shell::server::xdg_toplevel::Request as XdgToplevelRequest;
+use wayland_protocols::xdg::shell::server::xdg_wm_base::Request as XdgWmBaseRequest;
 use wayland_server::protocol::wl_buffer::Request as WlBufferRequest;
 use wayland_server::protocol::wl_callback::Request as WlCallbackRequest;
 use wayland_server::protocol::wl_compositor::Request as WlCompositorRequest;
@@ -71,11 +76,6 @@ use wayland_server::protocol::wl_shm::Request as WlShmRequest;
 use wayland_server::protocol::wl_shm_pool::Request as WlShmPoolRequest;
 use wayland_server::protocol::wl_surface::Request as WlSurfaceRequest;
 use wayland_server::protocol::wl_touch::Request as WlTouchRequest;
-use wayland_protocols::xdg::shell::server::xdg_positioner::Request as XdgPositionerRequest;
-use wayland_protocols::xdg::shell::server::xdg_popup::Request as XdgPopupRequest;
-use wayland_protocols::xdg::shell::server::xdg_surface::Request as XdgSurfaceRequest;
-use wayland_protocols::xdg::shell::server::xdg_toplevel::Request as XdgToplevelRequest;
-use wayland_protocols::xdg::shell::server::xdg_wm_base::Request as XdgWmBaseRequest;
 
 use super::Compositor;
 
@@ -140,7 +140,10 @@ pub struct XdgSurfaceData {
 
 impl XdgSurfaceData {
     pub fn new(surface: WlSurface) -> Self {
-        XdgSurfaceData { surface, window: Mutex::new(None) }
+        XdgSurfaceData {
+            surface,
+            window: Mutex::new(None),
+        }
     }
 }
 
@@ -254,8 +257,12 @@ impl GlobalDispatch<WlShm, ShmData, Compositor> for Compositor {
     ) {
         let res = data_init.init(resource, ShmData {});
         use wayland_server::protocol::wl_shm::{Format, WlShm};
-        let _ = res.send_event(WlShmEvent::Format { format: wayland_server::WEnum::Value(Format::Xrgb8888) });
-        let _ = res.send_event(WlShmEvent::Format { format: wayland_server::WEnum::Value(Format::Argb8888) });
+        let _ = res.send_event(WlShmEvent::Format {
+            format: wayland_server::WEnum::Value(Format::Xrgb8888),
+        });
+        let _ = res.send_event(WlShmEvent::Format {
+            format: wayland_server::WEnum::Value(Format::Argb8888),
+        });
     }
 }
 
@@ -269,9 +276,7 @@ impl GlobalDispatch<WlSeat, (), Compositor> for Compositor {
         data_init: &mut DataInit<'_, Compositor>,
     ) {
         let res = data_init.init(resource, ());
-        let _ = res.capabilities(
-            Capability::Keyboard | Capability::Pointer | Capability::Touch,
-        );
+        let _ = res.capabilities(Capability::Keyboard | Capability::Pointer | Capability::Touch);
     }
 }
 
@@ -291,7 +296,16 @@ impl GlobalDispatch<WlOutput, OutputData, Compositor> for Compositor {
         // `geometry` takes millimetres (a 5.7" 1080x2160 panel ≈ 61x122 mm),
         // not pixels; the pixel mode is advertised below. The logical size
         // clients should lay out in is mode / scale.
-        let _ = res.geometry(0, 0, 61, 122, Subpixel::Unknown, "gemini".into(), "geminipda".into(), Transform::Normal);
+        let _ = res.geometry(
+            0,
+            0,
+            61,
+            122,
+            Subpixel::Unknown,
+            "gemini".into(),
+            "geminipda".into(),
+            Transform::Normal,
+        );
         // Output scale = ceil(UI scale), so APP content is rendered at >=1x
         // the physical panel resolution and is never upscaled by gemshell
         // (2026-09-11). `wl_output.scale` is an integer, so at 150% we
@@ -558,7 +572,10 @@ impl Dispatch<XdgSurface, XdgSurfaceData, Compositor> for Compositor {
             XdgSurfaceRequest::Destroy => {
                 if data.window.lock().unwrap().is_some() {
                     // protocol: the toplevel/popup must die first
-                    resource.post_error(1u32, "xdg_surface destroyed while a toplevel/popup is alive");
+                    resource.post_error(
+                        1u32,
+                        "xdg_surface destroyed while a toplevel/popup is alive",
+                    );
                     return;
                 }
                 state.xdg_surface_detached(data.surface.clone());
@@ -576,7 +593,11 @@ impl Dispatch<XdgSurface, XdgSurfaceData, Compositor> for Compositor {
                 let t = data_init.init(id_toplevel, XdgToplevelData { window: win });
                 state.adopt_toplevel(win, t, resource.clone());
             }
-            XdgSurfaceRequest::GetPopup { parent, positioner, id: id_popup } => {
+            XdgSurfaceRequest::GetPopup {
+                parent,
+                positioner,
+                id: id_popup,
+            } => {
                 let surface = data.surface.clone();
                 let ppos = *positioner
                     .data::<PositionerData>()
@@ -612,7 +633,13 @@ impl Dispatch<XdgSurface, XdgSurfaceData, Compositor> for Compositor {
                 if let Some(sd) = surface.data::<SurfaceData>() {
                     sd.inner.lock().unwrap().window = Some(win);
                 }
-                let p = data_init.init(id_popup, XdgPopupData { window: win, parent: parent_win });
+                let p = data_init.init(
+                    id_popup,
+                    XdgPopupData {
+                        window: win,
+                        parent: parent_win,
+                    },
+                );
                 state.adopt_popup(win, p, resource.clone());
             }
             XdgSurfaceRequest::SetWindowGeometry { .. }
@@ -956,25 +983,16 @@ impl Dispatch<ZxdgToplevelDecorationV1, ToplevelDecorationData, Compositor> for 
 // ---------------------------------------------------------------------------
 // helpers for mod.rs
 
-/// Build a keymap fd (memfd) for the wl_keyboard.keymap event.
+/// Build a keymap fd for the wl_keyboard.keymap event.
+///
+/// The scratch file comes from the platform shm helper (memfd_create on
+/// Linux, shm_open elsewhere) so the compositor core stays portable.
 pub fn keymap_fd(keymap_str: &str) -> Option<(OwnedFd, u32)> {
+    use std::io::{Seek, SeekFrom, Write};
     let data = keymap_str.as_bytes();
-    let name = std::ffi::CString::new("gemshell-keymap").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
-    if fd < 0 {
-        return None;
-    }
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut w = 0usize;
-    while w < data.len() {
-        let n = unsafe { libc::write(fd, data[w..].as_ptr() as *const _, data.len() - w) };
-        if n <= 0 {
-            return None;
-        }
-        w += n as usize;
-    }
-    unsafe {
-        libc::lseek(fd, 0, libc::SEEK_SET);
-    }
-    Some((owned, data.len() as u32))
+    let mut file = crate::platform::shm::anonymous_file("gemshell-keymap", data.len()).ok()?;
+    file.write_all(data).ok()?;
+    // Rewind so a reader/mmap sees the keymap from offset 0.
+    file.seek(SeekFrom::Start(0)).ok()?;
+    Some((OwnedFd::from(file), data.len() as u32))
 }
