@@ -183,6 +183,27 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
    subtree (the systemd/ffmpeg/openblas/libfm overrides pruned with the
    2026-09-08 repin cost 137+ builds; receipts in config/gemini.nix +
    docs/session-log.md).
+10. **Builds go through `bash bin/build.sh` — never a hand-rolled `nix
+   build` for this repo's aarch64 outputs (CORE RULE, added 2026-09-17).**
+   It detects the platform and runs the model that works there:
+   - **Linux** → `bin/build-linux.sh`: the native aarch64 model, unchanged
+     (`sudo nix build --store local … --option builders @/etc/nix/machines
+     --fallback`, Pi compiles + cache substitutes); `toplevel` routes to
+     `bin/deploy.sh build` because that also pins the GC roots.
+   - **macOS** → `bin/macos/build.sh`: the same drvs built inside an Apple
+     `container` aarch64 NixOS VM. Nix-on-darwin can *evaluate* and
+     *substitute* aarch64-linux drvs but can never *run* their builders,
+     so `nix build .#packages.aarch64-linux.<x>` on a Mac substitutes what
+     it can and then fails on the custom drvs — never do it. Nix-on-darwin
+     IS used for the mac-native parts (the darwin devshell in
+     `flake-macos.nix`, the CA bundle the VM mounts).
+   Same verbs both sides: `start [TARGET]` (detached, rule 8) → poll
+   `wait [TARGET]` (rc 0 done-ok / 1 failed / 2 still running / 3 no job —
+   rule 8b) → `log`/`status`; `shell` = the platform devshell (`nix
+   develop`); `vm` = a shell in the mac build VM. Mac-only code lives in
+   `bin/macos/`; darwin-only flake outputs in `flake-macos.nix` (merged by
+   `mergeOutputs` — `//` is shallow); the map, target list and artifact
+   locations are **`docs/building.md`**. Flashing is NOT part of this yet.
 
 ## Where things live
 
@@ -241,6 +262,8 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 | **Full NixOS flash orchestration** (converge-to-TWRP from any state, boot + stream rootfs → p27 `linux`) | `bin/flash-nixos.sh` (verbs incl. `grow-rootfs` — offline p27 fs growth from TWRP, R13) |
 | **One-way repartition to TWRP + NixOS only** (2026-09-10; plan/backup/apply/verify/boot; byte-verified GPT + streamed rootfs) | `bin/repartition-nixos.sh` |
 | **Build/switch/rollback generations like a workstation** (native-aarch64 distributed build → delta `nix copy` → device profile switch + activate; NO reflash) | `bin/deploy.sh` (status/build/deploy/rollback) |
+| **Build entry point — platform-dispatched** (2026-09-17, rule 10): `bash bin/build.sh <verb> [TARGET]` is the ONE way to build this repo's aarch64 outputs; it detects the platform and runs the model that works there, with the same verbs + rc protocol on both (`start`/`wait`/`log`/`status`/`shell`, `vm` on a Mac). Artifacts, targets and the never-do-this list: **`docs/building.md`** | `bin/build.sh` (dispatcher), `bin/build-linux.sh` (Linux: the unchanged native model — `nix build --store local` + Pi builder; `toplevel` → `bin/deploy.sh build`) |
+| **Build images from a macOS host** (2026-09-17: a real `bootimg` built on the M5 Mac — 9.5 MiB, sha256 `b2404b13…`, header + appended DTB verified against the boot contract; **nothing flashed**): nix on darwin can only *evaluate/substitute* foreign drvs, so Apple `container` + the aarch64 NixOS VM `rzmapp/nixos-vm:26.05` supplies the missing aarch64-linux builder (repo staged read-only at `/build/src`, persisted `/nix`, artifacts + manifest/sha256 in `~/.cache/gemini-macos/out`). Nix-on-darwin is used for what it *can* do, in its own flake file: `flake-macos.nix` adds `devShells.aarch64-darwin.default` (python3/rsync/cacert/adb) + `packages.aarch64-darwin.caBundle`, merged via a one-level-deep `mergeOutputs` (a bare `//` is shallow — it broke `packages.aarch64-linux` once, 2026-09-17). **Egress gotcha:** with a Tailscale exit node owning the Mac's default route, container vmnet NAT gives the VM no internet (measured 2026-09-17; a runtime restart does not fix it) — `net` auto-detects and lends the VM the Mac's egress via `bin/macos/proxy.py` (proxy env only, **the VPN is untouched**) | `bin/macos/{build.sh,vm-build.sh,proxy.py}`, `flake-macos.nix`, **`docs/macos-build.md`** |
 | **Same loop, run ON the PDA** (2026-09-08, gen30): build straight into the device store (cache substitutes; custom drvs compile locally when changed) + profile switch/activate, from a repo clone at `/root/gemini-nixos`; `channels` pins the `nix-shell -p` nixpkgs to the flake rev. **2026-09-09: the flake's `nixosConfigurations.gemini` makes the stock `nixos-rebuild switch --flake .` work from the clone — the script is now the convenience wrapper (dirty gate, status/rollback, channels)** | `bin/device-rebuild.sh` (status/build/switch/rollback/channels/gc); clone sync: `bin/device-repo.sh` (seed/push/pull over g_ether as a git bundle) |
 | **GC-pin builds** (host `nix-collect-garbage` protection — every deploy pins itself; list/unpin) | `bin/gc-pin.sh` |
 | **Detached job runner** (rule 8) | `bin/run-job.sh`; state `logs/jobs/` |
@@ -356,6 +379,14 @@ Since 2026-09-08 the kernel is compiled in-nix (lean config: ~6 min
 on the aarch64 builder; the full #329 config takes much longer — the
 lean config drops 61 % of enabled symbols). Mesa is the other heavy
 build (cached in the local store once built).
+
+**On a Mac (no Linux host involved at all):** `bash bin/build.sh
+start bootimg` (the same dispatcher — rule 10) runs this native aarch64
+build inside an Apple
+`container` VM — nix on darwin can evaluate/substitute foreign drvs but
+can never *run* an aarch64-linux builder, so the VM is the builder
+(first real `boot.img` 2026-09-17, 9.5 MiB, verified; **docs/macos-build.md**
+— includes the egress-proxy gotcha for a VPN/exit-node host).
 
 aarch64 note (historical): under the OLD npins rev,
 `ffmpeg`/`ffmpeg-headless` defaulted to `withCudaLLVM = true` and failed

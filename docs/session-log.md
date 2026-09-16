@@ -5,6 +5,269 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-17 (b) — build system reorganised: one platform-dispatched entry point, mac half isolated
+
+Ask: "organise the build system such that the mac specific stuff is
+cleanly separate from linux native… agents must know automatically when to
+invoke which build system… nix-on-darwin is assumed to be available,
+utilise this but keep the mac specific parts of the flake cleanly
+separate… must not break what was already working linux native… commit".
+
+**Shape now (rule 10 + `docs/building.md`):** `bash bin/build.sh <verb>
+[TARGET]` is the ONE entry point; it detects the platform and dispatches,
+with the same verbs and rc protocol on both sides:
+
+| Piece | Scope |
+|---|---|
+| `bin/build.sh` | cross-platform dispatcher (`start`/`wait`/`log`/`status`/`shell`/`vm`) |
+| `bin/build-linux.sh` | Linux: the untouched native model — `sudo nix build --store local` + `#packages.aarch64-linux.<T>` + `--option builders @/etc/nix/machines --fallback` under `bin/run-job.sh`; `toplevel` → `bin/deploy.sh build` (GC pins kept) |
+| `bin/macos/{build.sh,vm-build.sh,proxy.py}` | everything macOS-specific (was `bin/build-macos*.{sh,py}`) |
+| `flake-macos.nix` | darwin-only flake outputs, merged by `mergeOutputs` |
+| `docs/building.md` | the decision map (targets, artifacts, gotchas) |
+
+**Nix-on-darwin now carries the mac-native work** (`flake-macos.nix`,
+imported by `flake.nix` and merged — the Linux outputs are otherwise
+untouched):
+
+- `devShells.aarch64-darwin.default` — plain `nix develop` on a Mac lands
+  here (the current-system default, symmetric with
+  `devShells.x86_64-linux.default`); python3 / rsync / cacert / adb / git /
+  curl, so nothing needs Homebrew or the Xcode CLT. Verified on the M5:
+  python3 3.14.7, **rsync 3.5.0** (real rsync, not openrsync), adb 37.0.0,
+  all substituted. `bin/macos/build.sh` re-execs into the devshell
+  (`GEMINI_MACOS_REEXEC` guard) when the host lacks python3/rsync.
+- `packages.aarch64-darwin.caBundle` — the CA bundle the VM mounts;
+  preferred over the old keychain scrape, which stays as the fallback.
+
+**Two bugs/gotchas caught while wiring it (kept as receipts):**
+
+1. **`//` is a SHALLOW merge.** Merging the mac outputs at the flake's top
+   level swapped the *whole* `packages` attrset for the mac one and broke
+   `packages.aarch64-linux` — the first dispatch run died with
+   `error: attribute 'aarch64-linux' missing` at
+   `f.packages.aarch64-linux.bootimg`. Fixed with the `mergeOutputs`
+   helper (devShells/packages merged one level in). This is exactly why
+   the merge is explicit + commented in flake.nix.
+2. **Nix only sees *tracked* files.** `nix develop`/`nix eval` from the
+   repo evaluate the committed tree, so the new `flake-macos.nix` was
+   invisible until `git add`ed (`Path 'flake-macos.nix' … is not tracked
+   by Git`). The Mac *build* path is immune — the wrapper rsyncs the
+   working tree into the VM — but anything nix-side on the Mac is not.
+
+**Verified the Linux side did not move (the ask was "must not break what
+was already working"):**
+
+- `nix eval .#packages.aarch64-linux.bootimg.outPath` →
+  `/nix/store/gman244d9xaikqw2gzrc2nr90fw103gp-mobile-nixos_planet-geminipda_boot.img`
+  — the *same* path as before the reorganisation;
+- end-to-end through the new dispatcher,
+  `bash bin/build.sh start bootimg` → `wait bootimg` rc 0 → identical
+  sha256 `b2404b13b8dbc861dbe9e0de43cd3bdb08f1b99ab2de6477b844256610eef997`;
+- `devShells.x86_64-linux.default` still evaluates on Linux.
+
+**Files touched:** new `bin/build.sh`, `bin/build-linux.sh`,
+`flake-macos.nix`, `docs/building.md`; moved `bin/macos/*`; updated
+`flake.nix` (merge helper + header), `AGENTS.md` (new **rule 10**, the two
+rows), `README.md` (build section + doc table), `docs/macos-build.md`
+(dispatcher/devshell sections, gotchas, owed list).
+
+**Not done (explicitly out of scope):** the flash workflow — building is
+platform-independent now, flashing still is not (`docs/macos-build.md`
+"Owed / next"). Nothing was flashed in this session either.
+
+## 2026-09-17 — REAL macOS build: a flash-ready `boot.img` built from the Mac (nothing flashed)
+
+Ask: "try to make a firmware build (but dont flash) using only this mac
+just to see if its possible".
+
+**Answer: yes — done.** `packages.aarch64-linux.bootimg` built end-to-end
+on the M5 Mac (macOS 26.6.2, 10 CPU / 32 GiB) inside the aarch64 NixOS VM
+(the 2026-09-12 pi5-technique probe is now an implemented, scripted path —
+`docs/macos-build.md`).
+
+| | |
+|---|---|
+| Artifact | `gman244d9xaikqw2gzrc2nr90fw103gp-mobile-nixos_planet-geminipda_boot.img` |
+| Size | 9,988,096 B (9.5 MiB — 16 MiB partition, ~6.5 MiB headroom) |
+| sha256 | `b2404b13b8dbc861dbe9e0de43cd3bdb08f1b99ab2de6477b844256610eef997` |
+| Source rev | `ad4eb9d33eb9e7dfef58bbaaa5b31f5061f0bd38-dirty` (this tree) |
+| Cost | ≈6.5 min: 380 paths substituted (486 MiB), 17 drvs compiled on 10 cores — **exactly the 2026-09-12 dry-run prediction** (17 local / 380 substituted) |
+| Host VM | `docker.io/rzmapp/nixos-vm:26.05` — aarch64, Nix 2.34.8, kernel 6.18.15, `/nix/store` 7.1 GiB after the build (persisted) |
+
+**Verified, not assumed** (`bin/dump-bootimg-header.sh`, now macOS-clean;
++ an FDT scan of the appended DTB): magic `ANDROID!`; kernel
+0x40200000 (8,037,167 B = 7.66 MiB); ramdisk 0x45000000 (1,947,027 B);
+second 0x40f00000 size 0; tags 0x44000000; page 2048; cmdline carries
+both **`bootopt=64S3,32N2,64N2`** (the LK requirement — AGENTS.md,
+phase-2 §2a) and **`fbcon=rotate:3`** (this is the fbcon/exclude-display
+build of rule 5, no display-landmine driver merged). The appended DTB
+sits 25,264 B from the end of the (gzip) kernel payload — inside LK's
+last-2 MiB FDT scan — and carries `planet,gemini-pda` + `mediatek,mt6797`
+plus this repo's delta nodes (`planet,geminipda-drm`, `geminipda-fb`).
+**Nothing was flashed**; the glass/panel rule was never in play.
+
+**The blocker hit first, and its receipts (worth keeping):** the initial
+run died in eval — `unable to download '…/mobile-nixos/…tar.gz': Timeout
+was reached (28)`. Cause: this Mac's default route belongs to a
+**Tailscale exit node** (`netstat -rn` → `default … utun4`;
+`tailscale status` → `grafton-router … active; exit node`), and Apple's
+`container` vmnet NAT does not survive that. Measured: VM →
+192.168.64.1 OK (ping 0.4 ms), VM → the Mac 192.168.1.136:22 OK, VM →
+github:443 / 1.1.1.1:443 / cache.nixos.org **all timeout**, while the
+Mac's own curl gets 200 from both. A container restart *and* a full
+`container system stop/start` (incl. `container-network-vmnet.default`)
+did **not** fix it → host routing, not stale container state.
+
+**Fix (no VPN was touched):** one committed script lends the VM the
+Mac's egress — `bin/macos/proxy.py` (stdlib, `/usr/bin/python3`),
+a CONNECT/HTTP proxy bound to the container bridge gateway only
+(`192.168.64.1:3128`, clients limited to `192.168.64.0/24`), with the
+build run under `http_proxy`/`https_proxy`/`all_proxy`. Nix honours
+those for substituters and, via `proxyImpureEnvVars`, for fixed-output
+fetchers (the two `fetchTree` inputs + the kernel tarball) under the
+sandbox. Verified through it: github 200, cache.nixos.org 200,
+cdn.kernel.org 200. `bin/build.sh net` auto-detects and only
+engages this when the VM genuinely has no egress.
+
+**Committed this session (rule 6 — the probe was a throwaway
+`logs/gemini-macos-probe.sh`, now superseded):** `bin/build.sh`
+(stage/start/wait/log/status/net/sh/stop; the run-job rc protocol:
+0 done-ok / 1 failed / 2 running — rule 8b), `bin/macos/vm-build.sh`
+(the in-VM native build + artifact/identity collection to `/out`),
+`bin/macos/proxy.py`, `docs/macos-build.md`.
+`bin/dump-bootimg-header.sh` gained a BSD-`stat` fallback so it runs on
+macOS. Staging is `~/.cache/gemini-macos/src` (38 MiB, rsync minus
+`.git`/`logs`/`cargo target`), artifacts in `~/.cache/gemini-macos/out/`
+with `<target>.manifest` + `.sha256` identity files (rule 0) — the
+Mac-side re-hash matches the in-VM one.
+
+**Not done / next:** nothing flashed from the Mac (a flash still wants
+the TWRP/para safety cycle); `rootfs`/`toplevel` from the Mac (552 local
+drvs, 2.9 GiB download — feasible, long, and the Mac's free disk is the
+constraint); darwin branches for `bin/device-ssh.sh` /
+`bin/boot-switch.sh` / `bin/flash-nixos.sh` + a darwin devshell, so the
+Mac can drive the adb/LAN-ssh half too (the 2026-09-12 analysis still
+stands: adb yes, RNDIS no, BROM no). Left running: the
+`gemini-macos-builder` VM and the egress proxy (`bash bin/build.sh
+stop` stops both).
+
+## 2026-09-12 — macOS aarch64 build path: pi5 `container`-VM technique PROBED green (no implementation yet)
+
+Ask: "are we able to build images/kernels using the same technique used
+here: `~/Projects/gc-business/gc-rust-node/pi5`?"
+
+**What the pi5 technique actually is** (two separable things):
+
+1. **Build environment** — on Apple Silicon, build `aarch64-linux`
+   derivations inside Apple's `container` runtime running the
+   persisted aarch64 NixOS VM `rzmapp/nixos-vm:26.05`; the VM's
+   `/nix` store survives runs, so iteration only rebuilds changes.
+   (a staging copy of the repo is bind-mounted read-only at `/build/src`,
+   the macOS CA bundle at `/etc/ssl/certs`, output dir at `/out`;
+   build via `nix build --impure --expr 'builtins.getFlake "path:…"'`.)
+2. **Image shape** — NixOS's `system.build.sdImage` (FAT firmware +
+   ext4 root holding the whole store), i.e. an SD-card image for a
+   standard bootloader/eeprom chain.
+
+**Probe (host: M5 Mac, macOS 26.6.2, 10 CPU / 32 GiB, Nix 2.34.7;
+`/usr/local/bin/container` present, image + `gc-pi5-builder` already
+pulled/stopped).** Created `gemini-macos-builder` (10 CPU, 12 GiB) with
+this repo staged read-only, and DRY-RAN the flake's real aarch64 outputs
+inside the VM (aarch64, Nix 2.34.8, 15 GiB RAM, 443 GiB free disk on
+`/dev/vdb`):
+
+| Output | derivations to build locally | paths substituted |
+|---|---|---|
+| `packages.aarch64-linux.kernel` | 6 | 290 (292 MiB dl / 999 MiB unpacked) |
+| `packages.aarch64-linux.bootimg` | 17 | 380 (486 MiB / 1.6 GiB) |
+| `packages.aarch64-linux.rootfs` | 552 | 1538 (2.9 GiB / 9.2 GiB) |
+| `nixosConfigurations.gemini` toplevel | 549 | 1532 (2.9 GiB / 9.2 GiB) |
+
+All four evaluated and printed derivations with **rc 0** — eval, the
+flake's two `builtins.fetchTree` inputs (MNX `2c132754` + nixpkgs
+`dc5d91f84032`), TLS, and the binary-cache split all work in the VM.
+The 552 "build locally" set is the expected mix: NixOS config glue
+(unit/dconf/udev/etc derivations, never cached) plus exactly the
+repo's custom/patched drvs — `linux-6`, `mesa`, `wlroots`, `gemshell`,
+`gemcli`, `gemdemo`, `gemini-exodus`, `gemini-firmware`,
+`power-profiles-daemon`, `glibc-locales`, `rustc`/`cargo` crates. The
+heavy GNOME closure substitutes. So a macOS build is feasible and the
+M5 (10 cores) should beat the 192.168.49.191 Pi builder.
+
+**Image shape does NOT transfer.** The Gemini boots via MediaTek LK —
+MTK-header `boot.img` (kernel+initrd+`bootopt=64S3,32N2,64N2`) on p22,
+rootfs on p27 `linux` — with no FAT firmware partition, no eeprom, no
+extlinux/U-Boot, so `system.build.sdImage` is inapplicable. The repo
+already produces the analogous self-contained artifacts
+(`outputs.android.android-bootimg` + `outputs.generatedFilesystems.rootfs`,
+Mobile NixOS's Android image generator), and those stay as-is. Only
+axis (1), the build environment, is worth adopting here.
+
+**Device cycles from the Mac (flash/reboot/RNDIS/adb/preloader) —
+analysis only; device not attached, nothing flashed/tested (2026-09-12).**
+
+- **adb: YES.** This Mac already has `adb` (Homebrew,
+  `1.0.41 / 37.0.1`) — macOS adb drives the TWRP/Google gadget
+  (`18d1:4ee2`) natively, so the adb half of the flash cycle is viable.
+  The flake has **no darwin devshell** (`devShells.x86_64-linux` cannot
+  run here) — but brew covers adb, so a darwin branch is enough.
+- **g_ether USB link: NO (platform block).** The device enumerates as
+  `0525:a4a2`, the Linux **RNDIS** gadget (repo VID map `bin/usb-watch.sh`
+  + session-log 2026-09-10e; `docs/mobile-nixos-port-feasibility.md §3.7`
+  loosely calls it CDC-ECM — the receipt says RNDIS). macOS ships **no
+  RNDIS driver** (CDC-ECM/NCM only), so `10.15.19.82` will not come up;
+  HoRNDIS is an unmaintained kext and not an option on Apple
+  Silicon/macOS 26. Workarounds: reach the device on the **LAN/Wi-Fi**
+  (`bin/device-ssh.sh` already honours `GEMINI_DEV_IP`; the container VM
+  reaches the LAN via vmnet NAT), or **switch the gadget to CDC-ECM**
+  (kernel config + boot.img reflash — rule 5 applies).
+- **Preloader/BROM recovery: NO path today (the real loss).**
+  `bin/run-mtk.sh` needs the linux devshell's store `mtkclient`
+  (`/nix/store` glob), `/usr/local/lib/mtkclient-patched` and store
+  python3.13 — none exist on macOS, and Apple's `container` has **no USB
+  passthrough**, so the *verified* MTK toolchain cannot be reused from
+  this host. A native aarch64-darwin mtkclient is theoretically possible
+  (libusb) but unproven; BROM is the last-resort recovery for a hung
+  boot.img, so it stays a Linux-host/device capability.
+- **Reboot cycles: YES** (mechanism is just ssh — `bin/device-reboot.sh`
+  arms WDT EXRST via `busybox devmem` — or `adb reboot`); only its
+  gadget-drop *detection* greps `lsusb` and must be swapped for
+  ping/ssh or `ioreg`/`system_profiler` on macOS.
+- Host scripts are otherwise Linux-only: `ip` + iface names
+  (`net-up.sh`, `device-ssh.sh`), `lsusb` (`usb-watch.sh`,
+  `device-reboot.sh`, `boot-switch.sh`), and the `nix develop` re-exec
+  (`boot-switch.sh`, `flash-nixos.sh`). A darwin branch + darwin
+  devshell is the port (rules 6/7).
+
+**USB passthrough (2026-09-12 follow-up):** Apple's `container` (what
+runs `rzmapp/nixos-vm`) has **no USB passthrough** — CLI 0.12.3 exposes
+only `--virtualization` (nested virt), ports, mounts and sockets; no
+`--device`/`--usb`. So the aarch64 VM used for builds can never see the
+device. **QEMU can**: this Mac has QEMU 11.1.0 built with libusb
+(`usb-host`, `qemu-xhci` present — `vendorid`/`productid`/`hostbus`/
+`hostport` options), so a NixOS aarch64 guest under QEMU could receive
+USB via `-device qemu-xhci -device usb-host,…`. Caveat: macOS libusb
+cannot `detach_kernel_driver`, so a device a kext has claimed can't be
+taken. By device: `0525:a4a2` RNDIS and `18d1:4ee2` adb have no in-box
+macOS driver (likely claimable — a QEMU guest would get `usb0`/adb);
+`0e8d:2000` preloader is CDC-ACM (`AppleUSBCDCACMData` may claim it →
+risky for mtkclient); `0e8d:0003` BROM (bulk) likely claimable. Only one
+claimant at a time. Also the Apple container image is not QEMU-bootable
+(Apple's own kernel/boot) — a real NixOS aarch64 qcow2 is needed.
+
+**Verdict:** build (VM) + flash (adb) + reboot (ssh over LAN / adb) is
+achievable from this Mac once the scripts get darwin branches; USB
+ethernet (RNDIS) and BROM recovery are not, today.
+
+**Artifacts / state:** scratch staged at `~/.cache/gemini-macos/src`
+(1.5 GiB), probe script `logs/gemini-macos-probe.sh` (gitignored),
+container `gemini-macos-builder` created + stopped; `gc-pi5-builder`
+left as found (stopped). **Not done:** no real build was run (dry-run
+only), so no `.img`/kernel hash exists yet; no `bin/` script committed
+(rule 6) and nothing in `flake.nix` parameterised (rule 5 not touched —
+no build, no flash). Next action if wanted: promote the probe into a
+committed `bin/build.sh` + a doc, then a real kernel/bootimg build.
+
 ## 2026-09-11 — macOS support: `bash bin/gemshell-nested.sh` now opens a native preview window
 
 Ask: "i want this repo to also work on macOS. can you make this work:

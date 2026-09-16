@@ -35,4 +35,7 @@ printf 'tags_addr:      %s\n' "$(hex "$tags_addr")"
 printf 'page_size:      %d\n' "$page_size"
 printf 'header_size:    %s\n' "$(hex "$header_size")"
 printf 'cmdline:        %s\n' "$(dd if="$img" bs=1 skip=$((0x34)) count=512 2>/dev/null | tr -d '\0' | sed 's/[[:space:]]*$//')"
-printf 'total size:     %d bytes\n' "$(stat -c%s "$img")"
+# `stat -c%s` is GNU; macOS/BSD needs `-f%z` (verified on a build made
+# entirely from a Mac, 2026-09-17 — see docs/macos-build.md).
+size=$(stat -c%s "$img" 2>/dev/null || stat -f%z "$img")
+printf 'total size:     %d bytes\n' "$size"

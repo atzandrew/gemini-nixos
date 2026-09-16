@@ -26,6 +26,14 @@
 #   nix build .#packages.aarch64-linux.rootfs   # rootfs.img only
 #   nix build .#packages.aarch64-linux.initrd   # stage-1 initrd (size measurement, docs R1)
 #
+# PREFER THE PLATFORM-DISPATCHED ENTRY POINT (rule 10): it runs this same
+# native path on Linux and the Apple-`container` VM path on a Mac, with one
+# verb surface (docs/building.md):
+#   bash bin/build.sh start <TARGET>   # detached; poll with `wait <TARGET>`
+# The darwin-only outputs (the devshell a Mac uses, the CA bundle it mounts)
+# live in flake-macos.nix and are merged in at the bottom of `outputs` —
+# the Linux outputs above are untouched by them.
+#
 # Flashing is manual (no fastboot on this device): dd the images to the
 # `boot` and `linux` partitions via the patched TWRP, or via adb. See
 # README.md and docs/mobile-nixos-port-feasibility.md §3.5.
@@ -172,7 +180,33 @@
       # upgraded (docs/gemini-exodus.md; in the rootfs via
       # services/gemini-pda.nix).
       gemini-exodus = eval.pkgs.callPackage ./pkgs/gemini-exodus.nix { };
+
+      # The macOS half of the flake (darwin-only outputs: the devshell a
+      # Mac uses, the CA bundle its build VM mounts). Kept in its own file
+      # so the Linux model below is untouched by it — see the merge at the
+      # bottom of `outputs` and docs/building.md.
+      macos = import ./flake-macos.nix { inherit nixpkgs; };
+
+      # Merge helper for the two halves. `//` alone is SHALLOW, so merging
+      # the mac outputs straight in would REPLACE whole shared attrsets:
+      # the first attempt swapped `packages` wholesale for the mac one and
+      # broke packages.aarch64-linux ("attribute 'aarch64-linux' missing",
+      # caught by the 2026-09-17 dispatch test). devShells/packages are
+      # merged one level in; the Linux outputs win any other name clash.
+      mergeOutputs = linuxOut: macOut:
+        linuxOut // macOut // {
+          devShells = (linuxOut.devShells or {}) // (macOut.devShells or { });
+          packages = (linuxOut.packages or { }) // (macOut.packages or { });
+        };
     in
+    # The macOS half lives in its own file (flake-macos.nix, via the
+    # `macos` binding above): darwin-only outputs — the devshell a Mac
+    # uses plus the CA bundle its build VM mounts. It adds no Linux
+    # output and changes none; this merge is the whole coupling.
+    # mergeOutputs (not `//`, which is SHALLOW and would replace whole
+    # shared attrsets — it clobbered packages.aarch64-linux the first
+    # time, caught by the 2026-09-17 dispatch test).
+    mergeOutputs
     {
       # nixosConfiguration for the device hostname (`networking.hostName`
       # = "gemini", config/gemini.nix) — the flake output that makes the
@@ -269,5 +303,6 @@
             mtkclient # preloader/BROM recovery tooling (store pkg + Loader DAs for bin/run-mtk.sh; the CDC-ACM patched copy shadows it — docs/disaster-recovery/)
           ];
         };
-    };
+    }
+    macos;
 }

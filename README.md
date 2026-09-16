@@ -170,6 +170,8 @@ the operational cheat sheet is in `AGENTS.md`.
 | [docs/gemdemo.md](docs/gemdemo.md), [docs/gemini-exodus.md](docs/gemini-exodus.md) | GLES templates and the EXODUS GPU stress test |
 | [docs/wine-d3d.md](docs/wine-d3d.md) | Windows (wine-wow64/box64) on the PDA |
 | [docs/library-deltas.md](docs/library-deltas.md) | The "published base + in-repo delta" pattern |
+| [docs/building.md](docs/building.md) | Which build system, when — the platform-dispatched build map |
+| [docs/macos-build.md](docs/macos-build.md) | Building the images from a Mac (container VM): receipts, gotchas, limits |
 | [docs/handover-*.md](docs/) | Point-in-time handover notes (historical) |
 
 ## Versions
@@ -192,29 +194,53 @@ and graphics pins after every flash.
 
 ## Building and flashing
 
-Builds are **native aarch64** (the x86_64 cross toplevel is abandoned).
-From the host:
+Builds are **native aarch64** (the x86_64 cross toplevel is abandoned) and
+go through **one platform-dispatched entry point** — `bash bin/build.sh`
+(rule 10); the map is [docs/building.md](docs/building.md):
+
+| Machine | Implementation | Model |
+|---|---|---|
+| Linux (the workstation) | `bin/build-linux.sh` | native aarch64 drvs on the local store, Pi remote builder compiling, cache.nixos.org substituting — unchanged |
+| macOS | `bin/macos/build.sh` | the same drvs built inside an Apple `container` aarch64 NixOS VM (nix-on-darwin can substitute those drvs, never build them) — [docs/macos-build.md](docs/macos-build.md) |
 
 ```sh
-nix develop                                   # project devshell (python/adb/… live only here)
-bash bin/deploy.sh build                      # native aarch64 toplevel (Pi remote builder)
-bash bin/deploy.sh deploy                     # copy the delta + switch the device generation
+bash bin/build.sh shell             # that platform's devshell (nix develop)
+bash bin/build.sh start [TARGET]    # detached build, default TARGET = bootimg
+bash bin/build.sh wait  [TARGET]    # rc 0 ok / 1 failed / 2 still running
+bash bin/build.sh status            # jobs/container, egress, artifacts, hashes
 ```
 
-Flash images are built with
-`sudo nix build --store local .#packages.aarch64-linux.default`
-(`boot.img` + rootfs image). Flashing is manual (no fastboot) and is
-orchestrated by `bin/flash-nixos.sh`, which converges the device to TWRP
-from any state and then streams the rootfs to p27. A repartition is a
-one-way operation via `bin/repartition-nixos.sh`.
+The Linux workstation keeps its deployment loop on top of the same build:
+
+```sh
+bash bin/deploy.sh build            # native aarch64 toplevel (Pi builder; gc-pinned)
+bash bin/deploy.sh deploy           # copy the delta + switch the device generation
+```
+
+Flash images: `TARGET=default` gives `boot.img` + the rootfs image.
+Flashing is manual (no fastboot) and is orchestrated by
+`bin/flash-nixos.sh`, which converges the device to TWRP from any state
+and then streams the rootfs to p27. A repartition is a one-way operation
+via `bin/repartition-nixos.sh`. **Building is platform-independent now;
+flashing is not** — the flash workflow still assumes the Linux host, and a
+macOS flash path is future work ([docs/macos-build.md](docs/macos-build.md)
+"Owed / next").
+
+Measured boot image (**Mac build 2026-09-17**, the self-built lean
+kernel): 9,988,096 B = **9.5 MiB** — kernel payload 7.66 MiB + appended
+DTB, minimal initrd 1.86 MiB — `bootopt=64S3,32N2,64N2` and
+`fbcon=rotate:3` present, both verified. The same refactor rebuilt the
+identical sha256 on both sides (`b2404b13…`).
 
 The operational details — build commands, the kernel base+delta model,
 the step-by-step flash procedure and its safety model, and the on-device
 `nixos-rebuild` loop — are in **`AGENTS.md`**.
 
-Measured boot image (build 2026-09-05): 15,431,680 B = **14.7 MiB** in
+Measured boot image (build 2026-09-05, the borrowed `#329` kernel):
+15,431,680 B = **14.7 MiB** in
 the 16 MiB partition (kernel payload 13.45 MiB + DTB, initrd 1.26 MiB
-gzip, ~1.3 MiB headroom).
+gzip, ~1.3 MiB headroom). The 2026-09-17 in-repo lean-kernel build above
+is 9.5 MiB — see `docs/macos-build.md` for the field-by-field receipt.
 
 ## Known constraints
 
