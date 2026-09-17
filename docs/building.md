@@ -58,10 +58,14 @@ mesa, wlroots, the Rust workspace and the whole NixOS glue.
 
 **Nothing here flashes.** The flash cycle is `bin/flash-nixos.sh` /
 `bin/boot-switch.sh` (docs/disaster-recovery/, AGENTS.md cheat sheet) and
-still assumes the Linux host. Flashing from a Mac is future work — the
-building blocks are `adb` (works from macOS; in the darwin devshell) and
-a LAN/Wi-Fi ssh path, since macOS has no driver for the device's USB
-RNDIS gadget (`0525:a4a2`) — see docs/macos-build.md.
+**works from either host** since 2026-09-17: the device's USB NIC is
+CDC-ECM now, so macOS can reach `10.15.19.82` over the same cable the
+Linux host uses, and the host scripts take a darwin branch through
+`bin/lib/host.sh`. From a Mac the pipeline is `bash bin/build.sh` →
+`bash bin/flash-nixos.sh` (it picks up the mac artifact cache) — see
+**`docs/usb-network.md`** and `docs/macos-build.md`. Still Linux-only from
+a Mac: preloader/BROM recovery (`bin/run-mtk.sh` — no USB passthrough
+into Apple's container) and `bin/repartition-nixos.sh`.
 
 ## How the separation is organised
 

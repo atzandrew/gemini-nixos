@@ -5,6 +5,124 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-17 (c) — USB NIC: RNDIS → CDC-ECM, so the Mac can drive the reboot/flash cycle
+
+Ask: *"move from RNDIS USB NIC to a more cross-platform USB NIC driver to
+enable the full mac auto reboot/flash cycle of the PDA. implement this"* —
+i.e. do the thing the 2026-09-12 analysis recommended.
+
+**Why (the receipt).** `drivers/usb/gadget/legacy/ether.c` (v6.6, the base
+this repo builds from): when `CONFIG_USB_ETH_RNDIS=y`, the gadget registers
+**two** configurations and RNDIS goes **first** — *"register our
+configuration(s); RNDIS first, if it's used"* — so every host picks it and
+the device descriptor is overridden to `0525:a4a2`. macOS has no RNDIS
+driver (only CDC-ECM/NCM; HoRNDIS is dead on Apple Silicon), which made
+`10.15.19.82` unreachable over USB from this Mac. With RNDIS off, ether.c
+registers **one** configuration: CDC-ECM, NetChip ids `0525:a4a1`
+(`CDC_PRODUCT_NUM`), `bDeviceClass = USB_CLASS_COMM`.
+
+**Device change (2 symbols + generator).** `# CONFIG_USB_ETH_RNDIS is not
+set`, plus `CONFIG_USB_CONFIGFS_RNDIS` and the promptless
+`CONFIG_USB_F_RNDIS` (only those two select it; olddefconfig resolves it).
+`bin/prune-kernel-config.sh` gained **section 9c** so a config regeneration
+cannot silently bring RNDIS back, and the generated banner records the
+policy. Everything else is unchanged on purpose: still the precomposed
+`g_ether` (`CONFIG_USB_ETH=y`), still auto-instantiated by the kernel when
+the mtu3 UDC appears, still MACs from the `g_ether.*` kernel params, still
+`usb0`.
+
+**Why not configfs/NCM.** configfs (`ecm.usb0`/`ncm.usb0`) would allow a
+runtime choice and is the modern idiom, but it needs a userspace binder
+service to wait for the UDC and bind — and `usb0` is this unit's ONLY
+debug link, so a mis-ordered service costs ssh access, which is a strictly
+worse failure than "the Mac can't see the NIC". Legacy-ECM also fails
+safe: if `can_support_ecm()` were false the driver falls back to CDC
+Subset (`049f:505a`, Linux-only) instead of losing the link. NCM (the
+Windows-11-friendly function) stays compiled in (`CONFIG_USB_CONFIGFS_NCM=y`)
+for a future configfs step; RNDIS is deliberately gone.
+
+**macOS side (evidence, not assumption).** On this Mac (macOS 26.6.2):
+`com.apple.driver.usb.cdc.ecm` (`AppleUSBECM.kext`) is loaded, and its
+personalities match `IOUSBHostInterface` **class 2/subclass 6**
+(`AppleUSBECMControl`) and **class 10** (`AppleUSBECMData`) — exactly the
+control/data descriptor pair `f_ecm` emits. `AppleUSBDeviceNCM.kext`
+exists too but its personalities key on an `IOPropertyMatch`
+(`USBDeviceFunction`) rather than the CDC descriptors, and `lsusb` does
+not exist on darwin. Linux's `cdc_ether` binds class 2/6 generically.
+
+**Host scripts (Linux behaviour kept, darwin branch added).** New
+**`bin/lib/host.sh`** — the platform differences in ONE place: platform
+detection, **MAC-based interface discovery** (`42:00:15:19:82:*`; the host
+end `…:00` arrives in the ECM functional descriptor and both host drivers
+adopt it), `ip` vs `ifconfig` net-up, `ping -W seconds` vs `-W ms`,
+`lsusb` vs `system_profiler SPUSBDataType`, and the devshell re-exec
+(`gemini_need_devshell`: adb + `lsusb` on Linux, adb + GNU `timeout` on
+macOS). Then: `net-up.sh`, `device-ssh.sh` (the `GEMINI_DEV_IP`
+Wi-Fi/LAN override is preserved), `device-reboot.sh` (**`lsusb` removed**
+entirely — the reset is proved by link/ssh drop + boot_id change, and the
+host address is re-applied from the lib after re-enumeration),
+`boot-switch.sh` and `flash-nixos.sh` (USB probes via the lib; the
+post-WDT "TWRP appeared" wait is now adb-based instead of
+`lsusb | grep 18d1:4ee2`; artifact defaults fall back to
+`~/.cache/gemini-macos/out`), `usb-watch.sh` (VID map + lib).
+`flake-macos.nix`'s darwin devshell comment now states its second job
+(adb + GNU coreutils for the device scripts; it already carried
+them).
+
+**Built, not flashed.** The kernel config change was built through the
+prescribed path — `bash bin/build.sh start bootimg` (macOS → the aarch64 VM)
+— **rc 0**: boot.img `0h3hkydixy98r6vchianjib1nmrg8m59-…`, 9,984,000 B,
+sha256 `2e8f43adccc3738eef36927bf9fe2618b4755d559efe09c7c94d9eca7f06d26e`,
+kernel payload 8,032,557 B (**4,610 B smaller** than the RNDIS build) and
+`bin/dump-bootimg-header.sh` still shows `bootopt=64S3,32N2,64N2` +
+`fbcon=rotate:3` + the g_ether MAC params. Proof in the built kernel's own
+output: `find $out -name '*rndis*'` → nothing (no `usb_f_rndis.ko` in the
+gadget function dir), no `usb_f_ecm.ko` (ECM is built-in), `usb_f_ncm.ko`
+kept. Also caught by the build: the mac artifact dir was publishing ONLY
+hash-prefixed store names, so `bin/macos/vm-build.sh`'s collector now also
+writes the conventional `boot.img`/`system.img` alias the flash scripts
+default to.
+
+**Reflash owed** (`bin/flash-nixos.sh boot`), then the on-glass
+verification list — new doc **`docs/usb-network.md`**: the enumeration id
+to expect (`0525:a4a1` good / `a4a2` stale image / `049f:505a` ECM
+rejected), net-up + ssh on both hosts, the reboot cycle, and the rollback.
+No display code touched (rule 5 not involved), but the usual para-sticky
+safety applies.
+
+**Flash readiness (made verifiable).** Added a read-only **`preflight`**
+verb to `bin/flash-nixos.sh` (rule 6: the "could a flash run from THIS
+host?" question is now one command, not an ad-hoc chain). It touches
+nothing on the device and checks: the artifact set **and verifies every
+artifact against the build's `.sha256` ledger** (mapping the ledger's
+in-VM `/out/<name>` paths onto this host's artifact dir — the Rule-0 "the
+copy we flash is the bytes the build produced" check), `bootopt=64S3,32N2,64N2`
++ `fbcon=rotate:3` inside the boot.img (LK hang trap + the rule-5 build),
+the toolchain (adb + GNU coreutils), the SSH key, passwordless sudo, and
+the device state if one is attached; exit non-zero only for a REQUIRED
+miss. First run (M5, CDC-ECM boot.img built, device not attached):
+**flash possible** — `boot.img` ✅ 9,984,000 B sha256 `2e8f43ad…` and
+matches the ledger, both cmdline fields ✅, toolchain ✅ (adb 37.0.0 +
+coreutils 9.11 from the darwin devshell — so the flash path's
+`timeout`/`stat`/`sha256sum` assumptions hold on macOS), with two warnings:
+no `~/.ssh/id_ed25519_gemini` on this Mac and no cached sudo. Both are
+user actions, not blockers for a TWRP-adb flash (the key is only needed to
+converge a device sitting at the NixOS desktop); `system.img` is missing
+too but only a full reflash needs it. Recorded in `docs/usb-network.md`
+§"Readiness on 2026-09-17".
+
+**Docs:** new `docs/usb-network.md`; corrected the stale claims in
+`docs/mobile-nixos-port-feasibility.md` §3.7 (it said "CDC ECM" while the
+receipt was RNDIS), `docs/building.md` and `docs/macos-build.md` ("flashing
+from a Mac is future work" → now done bar BROM recovery), README,
+AGENTS.md (status + tables + cheat sheet), and bracketed `[resolved
+2026-09-17]` notes on the 2026-09-12 analysis rather than editing it.
+
+**Side effect worth knowing:** now that macOS HAS a driver for the NIC, the
+QEMU-USB-passthrough idea from 2026-09-12 is closed *for the NIC
+specifically* — macOS libusb cannot detach a kernel driver, so a guest
+could not take it (noted in the log at that entry).
+
 ## 2026-09-17 (b) — build system reorganised: one platform-dispatched entry point, mac half isolated
 
 Ask: "organise the build system such that the mac specific stuff is
@@ -221,6 +339,9 @@ analysis only; device not attached, nothing flashed/tested (2026-09-12).**
   (`bin/device-ssh.sh` already honours `GEMINI_DEV_IP`; the container VM
   reaches the LAN via vmnet NAT), or **switch the gadget to CDC-ECM**
   (kernel config + boot.img reflash — rule 5 applies).
+  **[resolved 2026-09-17: the gadget IS switched to CDC-ECM
+  (`0525:a4a1`) — session-log 2026-09-17 (c) + `docs/usb-network.md`;
+  the LAN/Wi-Fi workaround is now the fallback, not the only path.]**
 - **Preloader/BROM recovery: NO path today (the real loss).**
   `bin/run-mtk.sh` needs the linux devshell's store `mtkclient`
   (`/nix/store` glob), `/usr/local/lib/mtkclient-patched` and store
@@ -254,10 +375,20 @@ macOS driver (likely claimable — a QEMU guest would get `usb0`/adb);
 risky for mtkclient); `0e8d:0003` BROM (bulk) likely claimable. Only one
 claimant at a time. Also the Apple container image is not QEMU-bootable
 (Apple's own kernel/boot) — a real NixOS aarch64 qcow2 is needed.
+**[2026-09-17: the gadget is CDC-ECM now (`0525:a4a1`), so this
+particular trade has flipped — macOS DOES have an in-box driver for it
+(`com.apple.driver.usb.cdc.ecm`, which claims the interface), so a QEMU
+guest could no longer take that device via libusb. Irrelevant to the
+normal path (the host uses the NICs directly), but it closes the
+QEMU-as-USB-shim idea for the NIC specifically — see docs/usb-network.md.]**
 
 **Verdict:** build (VM) + flash (adb) + reboot (ssh over LAN / adb) is
 achievable from this Mac once the scripts get darwin branches; USB
 ethernet (RNDIS) and BROM recovery are not, today.
+**[2026-09-17: USB ethernet IS achievable now — the gadget is CDC-ECM
+(`0525:a4a1`) and the scripts have the darwin branches via
+`bin/lib/host.sh`; only BROM/preloader recovery stays Linux-only.
+`docs/usb-network.md` has the receipts + the owed on-glass verification.]**
 
 **Artifacts / state:** scratch staged at `~/.cache/gemini-macos/src`
 (1.5 GiB), probe script `logs/gemini-macos-probe.sh` (gitignored),

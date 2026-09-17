@@ -14,9 +14,14 @@
 #     bin/boot-switch.sh.
 #
 # Usage (repo root; adb-only steps re-exec inside the devshell):
+#   bash bin/flash-nixos.sh preflight
+#       READ-ONLY readiness check for a flash from THIS host: artifacts
+#       (+ sha256 cross-check against the build's ledger), the LK cmdline
+#       requirement in boot.img, the toolchain, the SSH key, sudo, and the
+#       device state if one is on USB. Touches nothing on the device.
+#       Exit non-zero when a REQUIRED prerequisite is missing.
 #   bash bin/flash-nixos.sh status
-#       Device state + which local artifacts exist (result/ = the
-#       `nix build .#packages.x86_64-linux.default` symlink).
+#       Device state + which local artifacts exist.
 #   bash bin/flash-nixos.sh boot [boot.img]
 #       Converge to TWRP → back up current `boot` → flash the image into
 #       `boot`. STAYS in TWRP (para untouched): the unverified image is
@@ -41,9 +46,20 @@
 #       it IS a TWRP cycle: reboots the device. Follow with `boot-nixos`
 #       to boot the grown rootfs.
 #
-# Default images: result/boot.img + result/system.img (the `default`
-# flake output's android-fastboot-images layout). Built with:
-#   nix build .#packages.aarch64-linux.default
+# [2026-09-17] macOS is a supported host (this is the whole point of the
+# RNDIS → CDC-ECM gadget change): the Linux-rootfs hop over the USB NIC,
+# the adb half and the artifact paths all work from a Mac — see
+# docs/usb-network.md + docs/macos-build.md. USB-state detection
+# (poc/preloader/brom) is best-effort on macOS (no usbutils; the shared
+# helpers in bin/lib/host.sh use system_profiler), while the states this
+# pipeline actually needs (linux / twrp / offline) are exact everywhere.
+# NOT available on macOS: preloader/BROM recovery (no USB passthrough into
+# Apple's container, docs/disaster-recovery/) — that stays a Linux host job.
+#
+# Default images: the Linux build model publishes result/boot.img +
+# result/system.img (`bash bin/build.sh`), the macOS model collects the
+# same two into ~/.cache/gemini-macos/out (bin/macos/build.sh). Override
+# with GEMINI_BOOT_IMG / GEMINI_ROOTFS_IMG.
 #
 # LONG OPERATION: the rootfs push+dd can take 5-20 min over USB. Run it
 # under the detached job runner so a session never stalls:
@@ -64,24 +80,30 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Shared host helpers: platform detection, the USB NIC + its ping, the
+# USB-id probe (lsusb ⇄ system_profiler) and the devshell re-exec.
+. "$ROOT/bin/lib/host.sh"
+
 # adb lives in the flake devshell (bare host PATH has no adb — AGENTS.md
-# rule 7). Re-exec once inside `nix develop` when missing; the flag
-# prevents an infinite re-exec if the devshell lacks the tool.
-if ! command -v adb >/dev/null 2>&1; then
-  if [ -z "${GEMINI_DEVSH_REEXEC:-}" ]; then
-    export GEMINI_DEVSH_REEXEC=1
-    cd "$ROOT"
-    exec nix develop --command bash "bin/flash-nixos.sh" "$@"
-  fi
-  echo "!! adb not found even inside the devshell — does the flake devShell" >&2
-  echo "   carry android-tools? (flake.nix, devShells.x86_64-linux.default)" >&2
-  exit 1
+# rule 7); on macOS the same devshell supplies the GNU coreutils whose
+# `timeout` this script's adb wrappers use. Re-exec once inside it; the
+# GEMINI_DEVSH_REEXEC guard inside the helper prevents a loop.
+if gemini_need_devshell; then
+  gemini_devshell_reexec "$ROOT/bin/flash-nixos.sh" "$@" || exit 1
 fi
 
-DEV=10.15.19.82
+DEV="$GEMINI_DEV_IP"
 KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
-BOOT_IMG_DEFAULT="$ROOT/result/boot.img"
-ROOTFS_IMG_DEFAULT="$ROOT/result/system.img"
+# Artifacts: Linux publishes result/ in the repo; the macOS build model
+# collects into ~/.cache/gemini-macos/out. Prefer result/, fall back to
+# the mac cache on darwin (never silently — `status` shows the path used).
+if [ -f "$ROOT/result/boot.img" ] || ! gemini_is_macos; then
+  ART_DIR="$ROOT/result"
+else
+  ART_DIR="${GEMINI_MACOS_CACHE:-$HOME/.cache/gemini-macos}/out"
+fi
+BOOT_IMG_DEFAULT="${GEMINI_BOOT_IMG:-$ART_DIR/boot.img}"
+ROOTFS_IMG_DEFAULT="${GEMINI_ROOTFS_IMG:-$ART_DIR/system.img}"
 # TWRP by-name partition directory (verified path on this unit)
 P=/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name
 # The single NixOS rootfs partition (2026-09-10 repartition): the old
@@ -129,8 +151,8 @@ state() {
     if echo "$line" | grep -q 'unauthorized'; then echo unauthorized; return; fi
     echo adb-offline; return
   fi
-  # no adb device — is a Linux rootfs up over g_ether instead?
-  if timeout 2 bash -c "ping -c 1 -W 1 $DEV >/dev/null 2>&1"; then
+  # no adb device — is a Linux rootfs up over the USB NIC instead?
+  if gemini_ping; then
     if timeout 8 ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 root@"$DEV" true >/dev/null 2>&1; then
@@ -138,9 +160,9 @@ state() {
     fi
     echo linux-nossh; return
   fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2008'; then echo poc; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2000'; then echo preloader; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:0003'; then echo brom; return; fi
+  if gemini_usb_present 0e8d:2008; then echo poc; return; fi
+  if gemini_usb_present 0e8d:2000; then echo preloader; return; fi
+  if gemini_usb_present 0e8d:0003; then echo brom; return; fi
   echo offline
 }
 
@@ -169,14 +191,16 @@ converge_twrp() {
         || die "para write over ssh failed"
       say "arming WDT for EXRST self-boot (MODE=0x2200005D restore + 0x10007004=0x48)"
       wdt_exrst
-      say "device resetting — waiting for TWRP (USB 18d1:4ee2)..."
-      local i
+      say "device resetting — waiting for TWRP (adb recovery)..."
+      # TWRP's adbd is the authority (platform-neutral: no lsusb here any
+      # more — it was the last thing keeping this Linux-only).
+      local i s
       for ((i=1; i<=36; i++)); do
         sleep 5
-        if lsusb 2>/dev/null | grep -q '18d1:4ee2'; then
+        s=$(state)
+        if [ "$s" = twrp ]; then
           say "TWRP up after ~$((i*5))s (adbd settling)"
-          sleep 10
-          wait_for twrp 12
+          sleep 5
           return 0
         fi
       done
@@ -212,7 +236,7 @@ converge_twrp() {
 
 # ---- artifact checks ------------------------------------------------------
 need_img() { # path what
-  [ -f "$1" ] || die "$2 not found: $1 — build it: nix build .#packages.x86_64-linux.default"
+  [ -f "$1" ] || die "$2 not found: $1 — build it: bash bin/build.sh start bootimg (see docs/building.md)"
 }
 
 # ---- TWRP-side helpers ----------------------------------------------------
@@ -221,6 +245,114 @@ twrp_dd_part() { # devnode src-dest-label  (image already pushed to /tmp on devi
 }
 
 # ---- commands --------------------------------------------------------------
+cmd_preflight() { # read-only: is a flash actually possible from this host?
+  local fail=0 warn=0 checked=0 f hash path s
+  say "flash preflight — host: $(gemini_platform), artifacts: $ART_DIR"
+
+  # 1. The artifact set. A `boot` flash needs boot.img; only a full
+  #    reflash (rootfs verb) needs system.img.
+  for f in "$BOOT_IMG_DEFAULT" "$ROOTFS_IMG_DEFAULT"; do
+    if [ -f "$f" ]; then
+      printf '  ok    artifact %s (%s, sha256 %s…)\n' "$f" \
+        "$(du -h "$f" | cut -f1)" "$(sha256sum "$f" | cut -c1-16)"
+    elif [ "$f" = "$ROOTFS_IMG_DEFAULT" ]; then
+      printf '  warn  artifact %s MISSING — only a ROOTFS reflash needs it (bash bin/build.sh start rootfs)\n' "$f"
+      warn=1
+    else
+      printf '  FAIL  artifact %s MISSING — a boot flash needs it\n' "$f"
+      fail=1
+    fi
+  done
+
+  # 2. Integrity: cross-check the artifacts against the build's ledger
+  #    (<target>.sha256 next to the artifacts — the mac build writes it,
+  #    and it records the IN-VM path `/out/<name>`, mapped here to this
+  #    host's artifact dir, which is what makes the copy we would flash
+  #    the same bytes the build produced — rule 0).
+  for f in "$ART_DIR"/*.sha256; do
+    [ -f "$f" ] || continue
+    while read -r hash path; do
+      case "$path" in /out/*) path="$ART_DIR/${path#/out/}" ;; esac
+      [ -f "$path" ] || continue
+      checked=$((checked + 1))
+      if [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$hash" ]; then
+        printf '  FAIL  sha256 mismatch vs %s: %s\n' "$(basename "$f")" "$path"
+        fail=1
+      fi
+    done < "$f"
+  done
+  [ "$checked" -gt 0 ] &&
+    printf '  ok    integrity %s artifact file(s) match the build ledger\n' "$checked"
+
+  # 3. The one boot.img field that bricks the boot when absent (LK's
+  #    platform_parse_bootopt) + the rule-5 fbcon build marker. Both live
+  #    in the 512-byte cmdline field of the header page.
+  if [ -f "$BOOT_IMG_DEFAULT" ]; then
+    if head -c 4096 "$BOOT_IMG_DEFAULT" | grep -q 'bootopt=64S3,32N2,64N2'; then
+      printf '  ok    cmdline  bootopt=64S3,32N2,64N2 present (LK requirement)\n'
+    else
+      printf '  FAIL  cmdline  bootopt=64S3,32N2,64N2 MISSING — the boot will hang on the LK logo\n'
+      fail=1
+    fi
+    if head -c 4096 "$BOOT_IMG_DEFAULT" | grep -q 'fbcon=rotate:3'; then
+      printf '  ok    cmdline  fbcon=rotate:3 present (the rule-5 fbcon/exclude-display build)\n'
+    else
+      printf '  warn  cmdline  fbcon=rotate:3 not found — is this the fbcon/exclude-display build?\n'
+      warn=1
+    fi
+  fi
+
+  # 4. Toolchain: adb + GNU coreutils. On both platforms these come from
+  #    the flake devshell, which this script already re-execs into — so
+  #    reaching here means they exist; check anyway (it is the point).
+  if gemini_ensure_tools adb timeout sha256sum; then
+    printf '  ok    toolchain adb + GNU coreutils (timeout/stat/sha256sum) on PATH\n'
+  else
+    printf '  FAIL  toolchain adb/timeout/sha256sum missing on PATH\n'
+    fail=1
+  fi
+
+  # 5. SSH key: only needed to converge a RUNNING LINUX device to TWRP
+  #    (para write + WDT EXRST over ssh). From TWRP the flash is adb-only.
+  if [ -f "$KEY" ]; then
+    printf '  ok    ssh key  %s\n' "$KEY"
+  else
+    printf '  warn  ssh key  %s MISSING — needed only if the device is at the NixOS desktop\n' "$KEY"
+    printf '        (from TWRP the flash is adb-only; or point GEMINI_SSH_KEY at the key)\n'
+    warn=1
+  fi
+
+  # 6. sudo: needed to (re-)apply the host address on the USB NIC when the
+  #    device has to be converged from Linux (or rebooted).
+  if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then
+    printf '  ok    sudo     available without a password prompt\n'
+  else
+    printf '  warn  sudo     needs a password — run `sudo -v` (macOS caches per-tty)\n'
+    warn=1
+  fi
+
+  # 7. Device (read-only: iface lookup + ping + adb devices).
+  s=$(state)
+  printf '  info  device   %s\n' "$s"
+  case "$s" in
+    twrp)    say "        -> a flash can run NOW (adb only; TWRP is up)" ;;
+    linux)   say "        -> a flash will converge to TWRP over the USB NIC ssh hop (needs 5 + 6)" ;;
+    android) say "        -> a flash will hop to TWRP via adb reboot recovery" ;;
+    offline) say "        -> no device on USB: connect it and power on (para sticky = TWRP)" ;;
+    *)       say "        -> see bin/boot-switch.sh for this state" ;;
+  esac
+
+  echo
+  if [ "$fail" = 1 ]; then
+    die "preflight: a REQUIRED prerequisite is missing (the FAIL lines above)"
+  fi
+  if [ "$warn" = 1 ]; then
+    say "preflight: flash POSSIBLE, with the warnings above"
+  else
+    say "preflight: all checks pass — flash possible"
+  fi
+}
+
 cmd_status() {
   echo "device state : $(state)"
   for f in "$BOOT_IMG_DEFAULT" "$ROOTFS_IMG_DEFAULT"; do
@@ -228,7 +360,7 @@ cmd_status() {
       printf 'artifact      : %s  (%s, %s)\n' "$f" "$(du -h "$f" | cut -f1)" \
         "$(stat -c%y "$f" | cut -d. -f1)"
     else
-      printf 'artifact      : %s  (MISSING — build with nix build .#packages.x86_64-linux.default)\n' "$f"
+      printf 'artifact      : %s  (MISSING — build with: bash bin/build.sh start bootimg)\n' "$f"
     fi
   done
   echo "hint: adb-side boot-target control = bash bin/boot-switch.sh status"
@@ -335,6 +467,7 @@ done
 set -- "${args[@]}"
 
 case "${1:-}" in
+  preflight)   cmd_preflight ;;
   status)      cmd_status ;;
   boot)        cmd_boot "${2:-$BOOT_IMG_DEFAULT}" ;;
   rootfs)      cmd_rootfs "${2:-$ROOTFS_IMG_DEFAULT}" ;;

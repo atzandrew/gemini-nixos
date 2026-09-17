@@ -172,6 +172,10 @@ in
   # console ever appears — observed + bisected 2026-09-07 (a boot.img
   # identical except for the field booted fine). Value copied from the
   # verified GeminiPDA image: bootopt=64S3,32N2,64N2 log_buf_len=4M.
+  #
+  # g_ether.dev_addr/host_addr stay (they are the NIC's link addresses,
+  # not RNDIS): the host-side scripts find the interface by the MAC pair
+  # and the device keeps 10.15.19.82 on usb0 — see bin/lib/host.sh.
   boot.kernelParams = [
     "bootopt=64S3,32N2,64N2"
     "log_buf_len=4M"
@@ -424,11 +428,23 @@ in
     })
   ];
 
-  # ---- Networking: g_ether (CDC-ECM) ------------------------------------
-  # The kernel auto-instantiates g_ether (CONFIG_USB_GADGET=y,
-  # g_ether.dev_addr above); no userspace configfs setup is needed.
+  # ---- Networking: the USB gadget NIC (CDC-ECM) ----------------------
+  # The kernel auto-instantiates the legacy g_ether gadget (CONFIG_USB_ETH=y;
+  # the MACs come from the g_ether.dev_addr/host_addr params above). No
+  # userspace configfs setup is needed, and the driver binds the UDC by
+  # itself whenever the cable/role switch presents it — which is exactly why
+  # the precomposed gadget is kept instead of a configfs service (a
+  # userspace gadget can lose the link if its ordering is wrong, and usb0 is
+  # the only debug path into this unit).
+  # [2026-09-17] It now enumerates as **CDC-ECM** (0525:a4a1), not RNDIS:
+  # RNDIS support is gone from the kernel config (bin/prune-kernel-config.sh
+  # section 9c) because only Linux/Windows drive it in-box and macOS — the
+  # host this change is for — has no RNDIS driver at all. Linux (cdc_ether)
+  # and macOS (com.apple.driver.usb.cdc.ecm) both bind the ECM config
+  # natively, and the host scripts find the interface by MAC. Receipts +
+  # the Mac-side workflow: docs/usb-network.md.
   # The interface is usb0, on the fixed 10.15.19.0/24 link with the
-  # host side at 10.15.19.1 (GeminiPDA build/net-up.sh).
+  # host side at 10.15.19.1 (bin/net-up.sh).
   networking.interfaces.usb0.ipv4.addresses = [
     { address = "10.15.19.82"; prefixLength = 24; }
   ];

@@ -72,6 +72,27 @@ gemcli device function — `gemcli` is a thin frontend over it (ONE
 implementation). Builds green (x86_64 checked + built; aarch64
 on-device build/glass owed).**
 
+**2026-09-17 (c): the USB gadget NIC moved from RNDIS to CDC-ECM**, so
+macOS — which ships no RNDIS driver at all — can use the same
+`10.15.19.82` link as the Linux workstation, which is what unblocks the
+**full Mac reboot/flash cycle over the USB cable**. `CONFIG_USB_ETH_RNDIS`
+is off (`bin/prune-kernel-config.sh` §9c), so the precomposed `g_ether`
+gadget registers ONE configuration — CDC-ECM, `0525:a4a1` — instead of
+RNDIS-first-`0525:a4a2` (receipt: `drivers/usb/gadget/legacy/ether.c`,
+"register our configuration(s); RNDIS first, if it's used"). Linux
+(`cdc_ether`) and macOS (`com.apple.driver.usb.cdc.ecm`, whose
+personalities match exactly the descriptors `f_ecm` emits) both bind it
+natively. The host scripts gained a darwin branch through the new
+**`bin/lib/host.sh`** (MAC-based interface discovery, `ifconfig` vs `ip`,
+platform ping, `lsusb` ⇄ `system_profiler`, devshell re-exec) —
+`net-up`/`device-ssh`/`device-reboot`/`boot-switch`/`flash-nixos`/
+`usb-watch` no longer need `lsusb`, and `flash-nixos`/`boot-switch`
+re-exec into the darwin devshell for `adb` + GNU coreutils. Only
+preloader/BROM recovery stays Linux-only (no USB passthrough into Apple's
+container). **Kernel config + host scripts are built-but-not-flashed
+(boot.img reflash owed).** Receipts + verification + rollback:
+**`docs/usb-network.md`**.
+
 ⚠️ **Boot.img cmdline field: KEEP `bootopt=64S3,32N2,64N2` in it** — LK
 consumes it via `platform_parse_bootopt`; without it the boot hangs on
 the LK logo (~15 s WDT loop) before any kernel output (discovered
@@ -133,6 +154,11 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
    `bin/device-ssh.sh` / the devshell helpers; fail loudly on missing
    tools). Long inline `ssh '...'` chains and host for-loops are
    throwaway EXPLORATION only — promote them before the session ends.
+   The host side is **Linux + macOS** since 2026-09-17: never hardcode
+   `enp*`/`ip`/`lsusb` in a new script — source **`bin/lib/host.sh`**
+   (platform detection, MAC-based USB-NIC discovery, net-up, ping,
+   `lsusb` ⇄ `system_profiler`, devshell re-exec); receipts in
+   `docs/usb-network.md`.
 7. **Devshell-only CLIs — NEVER bare (CORE RULE).** The bare host PATH
    carries only git/nix/coreutils/ssh/usbutils-ish basics — verified
    NO python3/adb/make there (2026-09-07). Every project CLI (python3,
@@ -220,7 +246,7 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 | **Disaster recovery** — full-flash-erase → TWRP playbook (levels 0–2), image ledger + sha256, gather checklist, drills | `docs/disaster-recovery/` (README · inventory · gather · drills) |
 | Flake entry; Mobile NixOS pin (`2c132754`); **nixpkgs pinned in-flake** (`26.11pre1068949` — see README Versions + this file's "Pins (maintenance)"); devShell (host x86_64, MNX npins) | `flake.nix` |
 | Out-of-tree device definition (boot.img geometry, borrowed kernel, minimal initrd wiring) | `devices/planet-geminipda/` |
-| Stage-2 system config (headless + g_ether SSH, services, mesa fork, systemd-BPF/cudaLLVM overlays) | `config/gemini.nix` |
+| Stage-2 system config (headless + USB-NIC (CDC-ECM) SSH, services, mesa fork, systemd-BPF/cudaLLVM overlays) | `config/gemini.nix` |
 | SoC fragment (out-of-tree MT6797) | `modules/hardware-soc-mediatek-mt6797.nix` |
 | Device services: GPU poweron / A72-up / battery-guard / WDT reboot | `services/gemini-pda.nix`, `services/scripts/` |
 | **Silver-button clamshell sleep/wake** — light sleep (backlight/A53 cpus/inputs/services off, **A72 cluster down when up** [added 2026-09-10q]) + KEY_SLEEP daemon; deep-sleep (s2idle) follow-up. **systemd `suspend` is DISABLED (2026-09-11, deployed gen 22):** it is a different mechanism (kernel s2idle, no wake source) and locks the system up; `systemd.suppressedSystemUnits` removes the sleep targets/services and GNOME's power dconf keys are locked to `nothing`, so `gemcli sleep`/`gemini-sleepd` is the ONLY sleep path | `services/gemini-pda.nix` (`gemini-sleepd`) + `pkgs/gemshell/crates/gemdata-device/src/sleep.rs` + **`docs/power-sleep.md`** (see the `systemctl suspend` vs `gemcli sleep` section) |
@@ -253,17 +279,18 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 | Borrowed kernel #329 reference (kept until the self-built kernel is glass-verified; NOT wired into any build since 2026-09-08) | `kernel/borrowed/` (payload, DTB, module tree, sramldo-smc.ko, config) + `devices/planet-geminipda/kernel-borrowed.nix` |
 | Kernel source: published v6.6 base (fetch-pinned) + tracked delta + lean config | `devices/planet-geminipda/kernel/` (`default.nix`, `delta/`, `config`, `config.full-329`) + `kernel/base` submodule pointer |
 | **DRM/KMS driver for the LK framebuffer** (the standard-device enabler; GNOME prerequisite) | `devices/planet-geminipda/kernel/delta/drivers/gpu/drm/tiny/geminipda-drm.c` |
-| Kernel config pruning + delta sync tools | `bin/prune-kernel-config.sh`, `bin/sync-kernel-delta.sh` (replaces the retired `bin/snapshot-kernel.sh`) |
+| Kernel config pruning + delta sync tools (**§9c = the RNDIS-off / CDC-ECM gadget rule — re-run after any regeneration**) | `bin/prune-kernel-config.sh`, `bin/sync-kernel-delta.sh` (replaces the retired `bin/snapshot-kernel.sh`) |
 | **Rootfs ext4 image builder shim** (R13: growable mke2fs geometry; **2026-09-10: re-execs under fakeroot + `chown -R 0:0` so the image gets root-owned inodes — without it a fresh install has NO WiFi (NM rejects non-root plugin files) and logrotate fails**) | `pkgs/make-ext4fs-shim.nix` (wired via `config/gemini.nix` nixpkgs overlay) |
 | boot.img header inspection | `bin/dump-bootimg-header.sh` |
 | **Recovery tooling** — patched-mtkclient launcher (preloader/BROM), USB-state watcher | `bin/run-mtk.sh`, `bin/usb-watch.sh` (+ devshell `mtkclient` = store pkg + DAs) |
-| **g_ether net-up / SSH / WDT-EXRST reboot** (host side) | `bin/net-up.sh`, `bin/device-ssh.sh`, `bin/device-reboot.sh` |
+| **USB gadget NIC: RNDIS → CDC-ECM** (2026-09-17, 🟡 config built / not reflashed): the precomposed `g_ether` gadget registers ONE CDC-ECM configuration (`0525:a4a1`) instead of RNDIS-first (`0525:a4a2`), so **macOS** (no RNDIS driver) uses the same `10.15.19.82` link Linux does — the enabler for the full Mac reboot/flash cycle. `bin/prune-kernel-config.sh` §9c holds the config rule (RNDIS symbols off); `bin/lib/host.sh` holds the host-side Linux/macOS differences (MAC discovery, `ip`/`ifconfig`, ping, `lsusb`/`system_profiler`, devshell re-exec). Not switched to configfs/legacy-gadget semantics on purpose (fail-safe: usb0 is the only debug link) | **`docs/usb-network.md`** + `bin/lib/host.sh` |
+| **g_ether net-up / SSH / WDT-EXRST reboot** (host side; **Linux + macOS** since 2026-09-17 — no `lsusb`, NIC found by MAC; mac cycle: `bin/build.sh` → `bin/flash-nixos.sh`) | `bin/net-up.sh`, `bin/device-ssh.sh`, `bin/device-reboot.sh`, `bin/lib/host.sh` |
 | **Boot-target switching + boot-partition flash** (adb/TWRP; twrp/android/flash/restore; the `debian` verb was removed 2026-09-10) | `bin/boot-switch.sh` |
-| **Full NixOS flash orchestration** (converge-to-TWRP from any state, boot + stream rootfs → p27 `linux`) | `bin/flash-nixos.sh` (verbs incl. `grow-rootfs` — offline p27 fs growth from TWRP, R13) |
+| **Full NixOS flash orchestration** (converge-to-TWRP from any state, boot + stream rootfs → p27 `linux`; **`preflight` = the read-only readiness check** — artifacts + sha256 ledger, bootopt/fbcon in the boot.img, toolchain, ssh key, sudo, device state — and it works on Linux **and macOS** since 2026-09-17) | `bin/flash-nixos.sh` (verbs incl. `grow-rootfs` — offline p27 fs growth from TWRP, R13) |
 | **One-way repartition to TWRP + NixOS only** (2026-09-10; plan/backup/apply/verify/boot; byte-verified GPT + streamed rootfs) | `bin/repartition-nixos.sh` |
 | **Build/switch/rollback generations like a workstation** (native-aarch64 distributed build → delta `nix copy` → device profile switch + activate; NO reflash) | `bin/deploy.sh` (status/build/deploy/rollback) |
 | **Build entry point — platform-dispatched** (2026-09-17, rule 10): `bash bin/build.sh <verb> [TARGET]` is the ONE way to build this repo's aarch64 outputs; it detects the platform and runs the model that works there, with the same verbs + rc protocol on both (`start`/`wait`/`log`/`status`/`shell`, `vm` on a Mac). Artifacts, targets and the never-do-this list: **`docs/building.md`** | `bin/build.sh` (dispatcher), `bin/build-linux.sh` (Linux: the unchanged native model — `nix build --store local` + Pi builder; `toplevel` → `bin/deploy.sh build`) |
-| **Build images from a macOS host** (2026-09-17: a real `bootimg` built on the M5 Mac — 9.5 MiB, sha256 `b2404b13…`, header + appended DTB verified against the boot contract; **nothing flashed**): nix on darwin can only *evaluate/substitute* foreign drvs, so Apple `container` + the aarch64 NixOS VM `rzmapp/nixos-vm:26.05` supplies the missing aarch64-linux builder (repo staged read-only at `/build/src`, persisted `/nix`, artifacts + manifest/sha256 in `~/.cache/gemini-macos/out`). Nix-on-darwin is used for what it *can* do, in its own flake file: `flake-macos.nix` adds `devShells.aarch64-darwin.default` (python3/rsync/cacert/adb) + `packages.aarch64-darwin.caBundle`, merged via a one-level-deep `mergeOutputs` (a bare `//` is shallow — it broke `packages.aarch64-linux` once, 2026-09-17). **Egress gotcha:** with a Tailscale exit node owning the Mac's default route, container vmnet NAT gives the VM no internet (measured 2026-09-17; a runtime restart does not fix it) — `net` auto-detects and lends the VM the Mac's egress via `bin/macos/proxy.py` (proxy env only, **the VPN is untouched**) | `bin/macos/{build.sh,vm-build.sh,proxy.py}`, `flake-macos.nix`, **`docs/macos-build.md`** |
+| **Build images from a macOS host** (2026-09-17: a real `bootimg` built on the M5 Mac — 9.5 MiB, sha256 `b2404b13…`, header + appended DTB verified against the boot contract; **nothing flashed**): nix on darwin can only *evaluate/substitute* foreign drvs, so Apple `container` + the aarch64 NixOS VM `rzmapp/nixos-vm:26.05` supplies the missing aarch64-linux builder (repo staged read-only at `/build/src`, persisted `/nix`, artifacts + manifest/sha256 in `~/.cache/gemini-macos/out`). Nix-on-darwin is used for what it *can* do, in its own flake file: `flake-macos.nix` adds `devShells.aarch64-darwin.default` (python3/rsync/cacert/adb/coreutils/findutils — adb + GNU coreutils are the DEVICE-script tooling too, since 2026-09-17 the Mac drives the flash cycle over the CDC-ECM NIC) + `packages.aarch64-darwin.caBundle`, merged via a one-level-deep `mergeOutputs` (a bare `//` is shallow — it broke `packages.aarch64-linux` once, 2026-09-17). **Egress gotcha:** with a Tailscale exit node owning the Mac's default route, container vmnet NAT gives the VM no internet (measured 2026-09-17; a runtime restart does not fix it) — `net` auto-detects and lends the VM the Mac's egress via `bin/macos/proxy.py` (proxy env only, **the VPN is untouched**) | `bin/macos/{build.sh,vm-build.sh,proxy.py}`, `flake-macos.nix`, **`docs/macos-build.md`**, `docs/usb-network.md` |
 | **Same loop, run ON the PDA** (2026-09-08, gen30): build straight into the device store (cache substitutes; custom drvs compile locally when changed) + profile switch/activate, from a repo clone at `/root/gemini-nixos`; `channels` pins the `nix-shell -p` nixpkgs to the flake rev. **2026-09-09: the flake's `nixosConfigurations.gemini` makes the stock `nixos-rebuild switch --flake .` work from the clone — the script is now the convenience wrapper (dirty gate, status/rollback, channels)** | `bin/device-rebuild.sh` (status/build/switch/rollback/channels/gc); clone sync: `bin/device-repo.sh` (seed/push/pull over g_ether as a git bundle) |
 | **GC-pin builds** (host `nix-collect-garbage` protection — every deploy pins itself; list/unpin) | `bin/gc-pin.sh` |
 | **Detached job runner** (rule 8) | `bin/run-job.sh`; state `logs/jobs/` |
@@ -297,11 +324,16 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 the legacy project; receipts still in GeminiPDA docs until M1 ports them)
 
 **AFTER ANY DEVICE POWER-ON/POWER-CYCLE (GOLDEN RULE):** the host side
-of the g_ether link is DOWN (the gadget iface disappears on power-off).
-`bash bin/device-ssh.sh '<cmd>'` auto-runs `bin/net-up.sh` (passwordless
-sudo) — root shell @ **10.15.19.82** (host 10.15.19.1/24 on
-`enp10s0f4u1u2`, renamed per USB port; the device auto-configures its
-side at boot). Hand-rolled ssh needs `sudo bash bin/net-up.sh` first.
+of the USB NIC link is DOWN (the gadget iface disappears on power-off).
+`bash bin/device-ssh.sh '<cmd>'` auto-runs the net-up path (passwordless
+sudo) — root shell @ **10.15.19.82** (host 10.15.19.1/24). The interface
+is found by its **MAC** (`42:00:15:19:82:*`, the g_ether host/dev pair),
+so USB-port renumbering no longer matters; the device auto-configures its
+side at boot. Hand-rolled ssh needs `sudo bash bin/net-up.sh` first.
+[2026-09-17: this is **Linux + macOS** now, and the gadget is **CDC-ECM**
+(`0525:a4a1`) — `bin/lib/host.sh`, `docs/usb-network.md`. On a Mac, copy
+`~/.ssh/id_ed25519_gemini` over and run `sudo -v` once per shell (macOS
+sudo timestamps are per-tty) before a cycle.]
 
 **Remote reboot of a running Linux:** software resets POWER THE UNIT OFF
 (verified 2026-08-31) — only the LK-configured WDT EXRST path
@@ -342,8 +374,9 @@ NixOS rootfs → p27 `linux` (58.0 GiB, ext4 label `NIXOS_SYSTEM` — the
 single system partition since 2026-09-10). Boot image → p22 `boot`
 (16 MiB).
 Orchestrated by `bin/flash-nixos.sh
-status|boot|rootfs|all|boot-nixos|grow-rootfs` (see its header for the safety
-model + run-job usage).
+status|preflight|boot|rootfs|all|boot-nixos|grow-rootfs` (see its header for the safety
+model + run-job usage; `preflight` is read-only and answers "could a flash
+run from THIS host?" — it is the one to run before touching the device).
 
 **Battery/charger truth** (OS-dependent; verified live on the legacy
 project): TWRP sysfs is STALE — read dmesg `[PE+]Ibat=..`; Linux:

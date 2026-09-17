@@ -10,7 +10,8 @@
 #   0e8d:2008  POC charging gadget (charger kernel running, screen dark)
 #   0e8d:201c  Android (adb available)
 #   18d1:4ee2  TWRP (adb available)
-#   0525:a4a2  g_ether (Debian/NixOS: SSH 10.15.19.82)
+#   0525:a4a1  USB gadget NIC, CDC-ECM — SSH 10.15.19.82 (since 2026-09-17)
+#   0525:a4a2  the same gadget while it was RNDIS (pre-2026-09-17 images)
 #   0525:a4a7  g_serial console
 #   0e8d:0003  BROM mode
 #
@@ -18,16 +19,33 @@
 # hang, LK WDT reset); a single 2000 then silence = battery-gated boot
 # (preloader runs on USB power but refuses LK handoff — flat battery).
 #
+# [2026-09-17] Works on Linux AND macOS: the bus is read through
+# bin/lib/host.sh (lsusb on Linux, system_profiler on macOS — there is no
+# usbutils on darwin). On macOS the preloader/BROM ids are best-effort
+# (system_profiler is slower and may not report unclaimed devices), while
+# 0525:a4a1 (the gadget NIC) and 18d1:4ee2 (TWRP adb) — the two the flash
+# cycle needs — are the ones that matter.
+#
 # Usage: bash bin/usb-watch.sh [seconds]   (default: forever, Ctrl-C)
-# (needs lsusb — run inside the devshell, or as root on the bare host)
+set -u
+
+cd "$(dirname "$0")/.."
+. bin/lib/host.sh
+
+# Linux needs lsusb (usbutils) — it lives in the flake devshell (rule 7).
+# macOS needs nothing extra (system_profiler is part of the OS).
+if gemini_is_linux && ! gemini_ensure_tools lsusb; then
+  gemini_devshell_reexec "$(cd "$(dirname "$0")" && pwd)/usb-watch.sh" "$@" || exit 1
+fi
+
 SECS="${1:-0}"
 i=0
 while true; do
   if [ "$SECS" -gt 0 ] && [ "$i" -ge "$SECS" ]; then break; fi
-  line=$(lsusb 2>/dev/null | grep -E "0e8d:|18d1:4ee2|0525:a4a|18d1:" | head -3)
+  line=$(gemini_usb_ids 2>/dev/null | grep -E '^(0e8d|18d1|0525):' | tr '\n' ' ')
   ts=$(date +%H:%M:%S)
   if [ -n "$line" ]; then
-    echo "[$ts] $line" | tr '\n' ' '; echo
+    echo "[$ts] $line"
   else
     echo "[$ts] (nothing — device offline)"
   fi

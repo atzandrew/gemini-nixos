@@ -31,6 +31,13 @@ substituted**; the real build did exactly that.
 | Wall clock | ≈6.5 min (380 paths substituted, 486 MiB download; 17 drvs compiled on 10 cores) |
 | Host | macOS 26.6.2 (25G83), 10 CPU, 32 GiB — Apple `container` 0.12.3 + `docker.io/rzmapp/nixos-vm:26.05` (aarch64, Nix 2.34.8, kernel 6.18.15) |
 
+A second build on the same day picked up the **RNDIS → CDC-ECM USB gadget
+change** (`docs/usb-network.md`) — same tree + `CONFIG_USB_ETH_RNDIS` off:
+9,984,000 B, sha256 `2e8f43adccc3738eef36927bf9fe2618b4755d559efe09c7c94d9eca7f06d26e`,
+kernel payload 4,610 B smaller (the RNDIS gadget function dropped out of
+the image; the gadget function dir has no `usb_f_rndis.ko`). Nothing was
+flashed in either build.
+
 Verified with `bash bin/dump-bootimg-header.sh <img>` (now macOS-clean)
 and an FDT scan of the appended DTB:
 
@@ -130,7 +137,10 @@ Git`). The build path is immune — the wrapper rsyncs the working tree
 into the VM.
 
 Artifacts + identity land in `~/.cache/gemini-macos/out/` (mounted at
-`/out` in the VM): the image itself plus `<target>.paths`,
+`/out` in the VM): the image itself (as its immutable hash-prefixed store
+name **and** under the conventional name the flash scripts expect —
+`boot.img` / `system.img`; `bin/macos/vm-build.sh` writes the alias, since
+a Linux-style `result/` has no hash in its path), plus `<target>.paths`,
 `<target>.log`, `<target>.sha256` and `<target>.manifest` (target,
 attribute, host rev, egress, build time, VM/nix versions, store paths) —
 rule 0: never flash something you cannot identify. The Mac-side copy is
@@ -191,19 +201,39 @@ Alternatives if you would rather not use the proxy: pause the exit node
 the LAN router. The proxy is preferred here because it changes nothing
 about the host's VPN state.
 
-## What a Mac still cannot do (2026-09-12 analysis, unchanged)
+## What a Mac can and cannot do (device cycles)
 
-Flashing/device cycles are analysed in `docs/session-log.md`
-2026-09-12 — summary: **adb works** (this Mac already has it, and macOS
-drives the TWRP/Google gadget `18d1:4ee2`), **reboot works** (ssh over
-the LAN; only the gadget-drop *detection* is Linux-specific), the
-**g.usb RNDIS `0525:a4a2` link does not** (macOS has no RNDIS driver) so
-reach the device over Wi-Fi/LAN instead, and **preloader/BROM recovery
-has no Mac path** (Apple's container has no USB passthrough). Host
-scripts that assume `ip`/`lsusb`/`nix develop` need darwin branches —
-still owed (the darwin devshell now exists, so it is the `ip`/`lsusb`
-assumptions in `bin/device-ssh.sh`, `bin/boot-switch.sh`,
-`bin/flash-nixos.sh` that remain).
+[rewritten 2026-09-17 — the device-side blocker is gone; the rest of the
+2026-09-12 analysis stands.] The 2026-09-12 analysis found the USB link was
+RNDIS (`0525:a4a2`) and macOS has no RNDIS driver. **That is fixed:** the
+gadget is **CDC-ECM** since 2026-09-17 (`0525:a4a1`), which macOS drives
+in-box (`com.apple.driver.usb.cdc.ecm`) — so `10.15.19.82` now comes up on
+the same USB cable, and `bin/net-up.sh` / `bin/device-ssh.sh` /
+`bin/device-reboot.sh` / `bin/boot-switch.sh` / `bin/flash-nixos.sh` all
+take a darwin branch through **`bin/lib/host.sh`**. Full receipts, the
+verification list and the rollback: **`docs/usb-network.md`**.
+
+So, from a Mac now:
+
+- ✅ **build** the images in the aarch64 VM (`bash bin/build.sh`) — above;
+- ✅ **USB link + ssh** — `bash bin/device-ssh.sh '<cmd>'` (run `sudo -v`
+  once per shell: macOS sudo timestamps are per-tty, and the first
+  gadget-drop of a cycle has to re-apply `10.15.19.1`);
+- ✅ **reboot** — `bash bin/device-reboot.sh` (WDT EXRST; link drop and
+  boot_id change are judged by ping/ssh now, not `lsusb`);
+- ✅ **flash** — `bash bin/flash-nixos.sh status|boot|rootfs|boot-nixos`
+  (converges to TWRP over the USB-NIC ssh hop, then adb; the default
+  artifact paths resolve to `~/.cache/gemini-macos/out`, the mac build's
+  output dir, when `result/` is absent);
+- ❌ **preloader/BROM recovery** — `bin/run-mtk.sh` needs the Linux
+  devshell's patched `mtkclient`, and Apple's `container` has **no USB
+  passthrough** (2026-09-12, unchanged). This remains the last-resort
+  Linux-host capability — worth knowing before a risky flash.
+- ❌ **repartition** (`bin/repartition-nixos.sh`) stays Linux-host/device.
+- ⚠️ **USB-mode detection** (`poc`/`preloader`/`brom`) is best-effort on
+  macOS: no `usbutils`, so the shared helper reads the bus with
+  `system_profiler`. The states the pipeline needs — `linux`, `twrp`,
+  `offline` — come from ping/ssh/adb and are exact on both platforms.
 
 ## Cost of the other targets
 
@@ -224,13 +254,14 @@ watch, since the VM's disk image lives on it.
 
 ## Owed / next
 
-- **Nothing has been flashed from the Mac** — deliberately. The image
-  above is built and verified, not deployed (rule 5: a flash needs the
-  TWRP/para safety cycle).
+- **Nothing has been flashed from the Mac** — deliberately (rule 5: a
+  flash needs the TWRP/para safety cycle). Both boot images built here
+  (2026-09-17) are verified but undeployed; the CDC-ECM one is the image
+  `bin/flash-nixos.sh boot` would write once the flash cycle is exercised.
 - A `rootfs`/`toplevel` build from the Mac (`bash bin/build.sh start rootfs`).
-- **The mac flash workflow** (later, explicitly out of scope on
-  2026-09-17): darwin branches for `bin/device-ssh.sh`,
-  `bin/boot-switch.sh`, `bin/flash-nixos.sh` so the Mac can drive the
-  adb + LAN-ssh half, with the adb/reboot mechanism from the 2026-09-12
-  analysis. `bin/macos/` is the natural home for the mac-only pieces;
-  the darwin devshell already carries adb.
+- **Exercise the mac flash workflow on glass** — the scripts now support
+  it (`bin/lib/host.sh`, docs/usb-network.md); what is untested is the
+  real cycle: `bin/build.sh` → `bin/flash-nixos.sh boot` → `boot-nixos`
+  → `bin/device-reboot.sh`.
+- **Owed verification on the device side:** the CDC-ECM enumeration
+  (`0525:a4a1`) — the list in docs/usb-network.md.

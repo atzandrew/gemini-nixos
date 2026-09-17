@@ -76,6 +76,15 @@ collect() {
     p=$1
     if [ -f "$p" ]; then
         cp -f "$p" "$out/$(basename "$p")"
+        # Conventional alias: the flash scripts default to <out>/boot.img
+        # (bin/flash-nixos.sh, bin/boot-switch.sh), mirroring the Linux
+        # result/ layout — a hash-prefixed store name is not a usable
+        # default. build.sh re-runs overwrite it; the hash-named copy
+        # stays as the immutable receipt (rule 0).
+        case $(basename "$p") in
+            *boot.img)   cp -f "$p" "$out/boot.img" ;;
+            *system.img) cp -f "$p" "$out/system.img" ;;
+        esac
         return
     fi
     for f in "$p"/*.img "$p"/Image.gz "$p"/Image "$p"/initrd "$p"/*.dtb; do

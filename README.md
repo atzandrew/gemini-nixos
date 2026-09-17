@@ -28,8 +28,9 @@ layout were reclaimed into it — see
   round-trip both closed. Updates are generation switches, not
   reflashes: from the host with `bin/deploy.sh`, or entirely on the
   device with `nixos-rebuild switch --flake .` from a repo clone at
-  `/root/gemini-nixos`. (`g_ether` SSH from the host, or the device on
-  the LAN, both work.)
+  `/root/gemini-nixos`. (SSH over the **USB gadget NIC** — CDC-ECM
+  since 2026-09-17, so Linux *and* macOS hosts can use it — or the device
+  on the LAN; both work.)
 - **Vanilla GNOME is the default desktop** (since 2026-09-10) and is
   **GPU-accelerated**: the LK framebuffer is exposed as a normal KMS
   device by an in-kernel `geminipda-drm` driver, and Mesa's `kmsro`
@@ -120,7 +121,8 @@ generation explicitly.
 | `devices/planet-geminipda/kernel/` | Kernel derivation (published v6.6 base + tracked delta + lean config); `postInstall` builds the out-of-tree `sramldo-smc.ko` (A72 bring-up SMC). The delta adds **`geminipda-drm`**, the KMS driver for the LK framebuffer |
 | `modules/hardware-soc-mediatek-mt6797.nix` | Out-of-tree MT6797 SoC fragment (upstreaming = phase 6) |
 | `services/` | Device services and desktop sessions (see the table below) |
-| `config/gemini.nix` | Stage-2 system configuration (headless base + g_ether SSH, device services, Mesa, GNOME default, on-device Nix) |
+| `config/gemini.nix` | Stage-2 system configuration (headless base + USB-NIC (CDC-ECM) SSH, device services, Mesa, GNOME default, on-device Nix) |
+| `bin/lib/host.sh` | Host-side link helpers shared by the device scripts: platform detection, MAC-based USB-NIC discovery, net-up, ping, USB-id probes, devshell re-exec (Linux + macOS) |
 | `pkgs/` | In-repo package forks/pins: `mesa-geminipda`, `wlroots-geminipda`, `gemwl` (legacy), `gemcli`, `gemdemo`, `gemini-exodus`, `gemini-firmware`, `gemini-xkeyboard-config`, … |
 | `patches/` | The tracked Mesa panfrost (T880 polygon-list) patch |
 | `bin/` | Host/device tooling: build/deploy, flash/repartition, recovery, repo sync — see `AGENTS.md` |
@@ -171,6 +173,7 @@ the operational cheat sheet is in `AGENTS.md`.
 | [docs/wine-d3d.md](docs/wine-d3d.md) | Windows (wine-wow64/box64) on the PDA |
 | [docs/library-deltas.md](docs/library-deltas.md) | The "published base + in-repo delta" pattern |
 | [docs/building.md](docs/building.md) | Which build system, when — the platform-dispatched build map |
+| [docs/usb-network.md](docs/usb-network.md) | The USB gadget NIC: RNDIS → CDC-ECM, and the now-possible Mac reboot/flash cycle |
 | [docs/macos-build.md](docs/macos-build.md) | Building the images from a Mac (container VM): receipts, gotchas, limits |
 | [docs/handover-*.md](docs/) | Point-in-time handover notes (historical) |
 
@@ -221,16 +224,25 @@ Flash images: `TARGET=default` gives `boot.img` + the rootfs image.
 Flashing is manual (no fastboot) and is orchestrated by
 `bin/flash-nixos.sh`, which converges the device to TWRP from any state
 and then streams the rootfs to p27. A repartition is a one-way operation
-via `bin/repartition-nixos.sh`. **Building is platform-independent now;
-flashing is not** — the flash workflow still assumes the Linux host, and a
-macOS flash path is future work ([docs/macos-build.md](docs/macos-build.md)
-"Owed / next").
+via `bin/repartition-nixos.sh`. **Both building and flashing are
+platform-dispatched now:** since the USB NIC is CDC-ECM (2026-09-17) a
+Mac can drive the whole reboot/flash cycle over the cable
+([docs/usb-network.md](docs/usb-network.md)) — the one thing that still
+needs a Linux host is preloader/BROM recovery (`bin/run-mtk.sh`; Apple's
+container has no USB passthrough — [docs/macos-build.md](docs/macos-build.md)).
+Before touching the device, `bash bin/flash-nixos.sh preflight` answers
+read-only whether a flash can run from this host (artifacts + sha256
+ledger, the `boot.img` cmdline requirements, toolchain, ssh key, sudo,
+device state).
 
 Measured boot image (**Mac build 2026-09-17**, the self-built lean
 kernel): 9,988,096 B = **9.5 MiB** — kernel payload 7.66 MiB + appended
 DTB, minimal initrd 1.86 MiB — `bootopt=64S3,32N2,64N2` and
 `fbcon=rotate:3` present, both verified. The same refactor rebuilt the
-identical sha256 on both sides (`b2404b13…`).
+identical sha256 on both sides (`b2404b13…`). The RNDIS → CDC-ECM USB
+NIC change rebuilt it once more (2026-09-17 (c): 9,984,000 B, kernel
+payload 4,610 B smaller, sha256 `2e8f43ad…`) —
+[docs/usb-network.md](docs/usb-network.md).
 
 The operational details — build commands, the kernel base+delta model,
 the step-by-step flash procedure and its safety model, and the on-device

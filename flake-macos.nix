@@ -16,10 +16,16 @@
 #       the current system, exactly as devShells.x86_64-linux.default is
 #       for the Linux workstation). It carries the host-side tools
 #       bin/macos/* need — python3 (the egress proxy), rsync (staging the
-#       tree for the build VM), cacert (the VM's CA bundle), adb (the host
-#       half of the flash workflow to come) — so nothing depends on
-#       Homebrew or the Xcode CLT. The Apple `container` CLI is NOT in
-#       nixpkgs; that one stays a host prerequisite.
+#       tree for the build VM), cacert (the VM's CA bundle) — so nothing
+#       depends on Homebrew or the Xcode CLT — PLUS the tooling the device
+#       scripts need on darwin: adb (the flash cycle, which works over the
+#       CDC-ECM gadget since 2026-09-17 — docs/usb-network.md) and the GNU
+#       coreutils/findutils (the scripts use `timeout`/`stat -c`/`du`,
+#       which macOS's BSD tools do not provide; bin/lib/host.sh re-execs
+#       into this devshell for them). `lsusb` deliberately has no darwin
+#       counterpart — the scripts probe the bus with system_profiler
+#       instead. The Apple `container` CLI is NOT in nixpkgs; that one
+#       stays a host prerequisite.
 #
 #   packages.aarch64-darwin.caBundle
 #       The CA bundle that bin/macos/build.sh mounts into the VM at
@@ -39,10 +45,11 @@ in
       rsync          # staging the working tree for the build VM (real rsync,
                      # not macOS's openrsync, when the host one is missing)
       cacert         # packages.aarch64-darwin.caBundle — the VM's /etc/ssl/certs
-      android-tools  # adb — the host side of the flash workflow (future work)
+      android-tools  # adb — the host half of the flash cycle (works on
+                     # macOS; drives the TWRP/Google gadget 18d1:4ee2)
       git            # rule 0: the host revision the build records
-      coreutils
-      findutils
+      coreutils      # the device scripts' `timeout`/`stat -c`/`du` …
+      findutils      # (bin/lib/host.sh re-execs into this devshell for them)
       curl           # bin/macos/build.sh net — egress diagnostics
     ];
 

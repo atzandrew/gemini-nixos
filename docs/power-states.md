@@ -50,7 +50,9 @@ built in-repo, delta byte-verified) and flashed as boot.img sha256
 - `systemctl reboot` → clean self-boot to a new boot_id in ~40 s
   (`70dd8a9d…` → `dff7d973…`). [verified 2026-09-10]
 - `systemctl poweroff` → unit off: the USB gadget disappears with no
-  preloader/RNDIS and no loop (no limbo). [verified 2026-09-10]
+  preloader/gadget-NIC and no loop (no limbo). [verified 2026-09-10;
+  that run's NIC enumerated as RNDIS — the gadget is CDC-ECM since
+  2026-09-17, docs/usb-network.md]
 - The userspace-WDT escape was not needed; the §7 primary paths pass.
 - **Gotcha that cost a boot loop:** the shared TOPRGU block. See the
   [corrected 2026-09-10] note in §5.

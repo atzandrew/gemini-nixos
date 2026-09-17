@@ -3,9 +3,11 @@
 # over USB from the host (adb states: TWRP / Android).
 #
 # Adapted from the GeminiPDA project's build/boot-switch.sh (same
-# mechanism, verified on this hardware 2026-08-30). Three deltas:
+# mechanism, verified on this hardware 2026-08-30). Four deltas:
 #   * adb/lsusb come from the repo flake devshell — if they are not on
-#     the bare host PATH the script re-executes itself inside `nix develop`;
+#     the bare host PATH the script re-executes itself inside `nix develop`
+#     (bin/lib/host.sh; on macOS the devshell is flake-macos.nix's
+#     aarch64-darwin one, which also supplies the GNU coreutils);
 #   * no `linux` (Gemian boot2-copy) command — this project's Linux is the
 #     NixOS boot.img flashed into `boot` itself; booting it = `android`
 #     below (para-clear + reboot → NORMAL → whatever is in `boot`);
@@ -30,11 +32,18 @@
 # ssh — no adbd), converge to TWRP with bin/flash-nixos.sh (para write over
 # ssh + WDT EXRST self-boot), which then uses this script's `flash`.
 #
-# Usage (from the repo root, any host):
+# Usage (from the repo root, any host: Linux or macOS):
 #   bash bin/boot-switch.sh status
 #   bash bin/boot-switch.sh twrp|android
 #   bash bin/boot-switch.sh flash [image] [twrp|android]
 #   bash bin/boot-switch.sh restore
+#
+# [2026-09-17] macOS is a supported host: adb drives the TWRP/Google gadget
+# on macOS natively, and the USB-state probes now go through the shared
+# helpers (bin/lib/host.sh) instead of `lsusb` — which is what made this
+# script Linux-only and blocked the Mac flash cycle (docs/usb-network.md).
+# On macOS USB state detection is best-effort (system_profiler, no
+# usbutils); adb states (twrp/android/offline) are exact.
 #
 # State after each target:
 #   twrp    -> TWRP on every power-on (default, sticky; para=boot-recovery)
@@ -53,26 +62,30 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# adb/lsusb live in the flake devshell (bare host PATH has no adb —
-# AGENTS.md rule 7). Re-exec once inside `nix develop` when missing;
-# the flag prevents an infinite re-exec if the devshell lacks the tool.
-if ! command -v adb >/dev/null 2>&1 || ! command -v lsusb >/dev/null 2>&1; then
-  if [ -z "${GEMINI_DEVSH_REEXEC:-}" ]; then
-    export GEMINI_DEVSH_REEXEC=1
-    cd "$ROOT"
-    exec nix develop --command bash "bin/boot-switch.sh" "$@"
-  fi
-  echo "!! adb/lsusb not found even inside the devshell — does the flake devShell" >&2
-  echo "   carry android-tools + usbutils? (flake.nix, devShells.x86_64-linux.default)" >&2
-  exit 1
+# Shared host helpers (platform detection, the USB NIC, USB-id probes,
+# the devshell re-exec) — bin/lib/host.sh.
+. "$ROOT/bin/lib/host.sh"
+
+# adb lives in the flake devshell (bare host PATH has no adb — AGENTS.md
+# rule 7); on macOS so do the GNU coreutils this script's `timeout` calls
+# need. Re-exec once inside the devshell when they are missing; the
+# GEMINI_DEVSH_REEXEC guard inside the helper prevents a loop.
+if gemini_need_devshell; then
+  gemini_devshell_reexec "$ROOT/bin/boot-switch.sh" "$@" || exit 1
 fi
 
 P=/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name
 PARA_BACKUP=${PARA_BACKUP:-$ROOT/stock-dump/para.bin}
-BOOTIMG_DEFAULT=${BOOTIMG_DEFAULT:-$ROOT/result/boot.img}
-# (result/ = `nix build .#packages.x86_64-linux.default`; pass an explicit
-# image path if you built only .#bootimg.)
 BOOT_BACKUP_DIR=${BOOT_BACKUP_DIR:-$ROOT/stock-dump}
+# Default boot image: Linux publishes result/ in the repo, the macOS build
+# model collects into ~/.cache/gemini-macos/out (bin/macos/build.sh). Pass
+# an explicit path to override (or a bootimg-only build).
+if [ -f "$ROOT/result/boot.img" ] || ! gemini_is_macos; then
+  bootdir="$ROOT/result"
+else
+  bootdir="${GEMINI_MACOS_CACHE:-$HOME/.cache/gemini-macos}/out"
+fi
+BOOTIMG_DEFAULT=${BOOTIMG_DEFAULT:-$bootdir/boot.img}
 
 adb_q()  { timeout 30 adb "$@"; }
 adb_sh() { timeout 120 adb shell "$@"; }
@@ -91,9 +104,9 @@ state() {
     if echo "$line" | grep -q 'unauthorized'; then echo unauthorized; return; fi
     echo adb-offline; return
   fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2008'; then echo poc; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2000'; then echo preloader; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:0003'; then echo brom; return; fi
+  if gemini_usb_present 0e8d:2008; then echo poc; return; fi
+  if gemini_usb_present 0e8d:2000; then echo preloader; return; fi
+  if gemini_usb_present 0e8d:0003; then echo brom; return; fi
   echo offline
 }
 
@@ -175,7 +188,7 @@ backup_para() {
 
 # ---- commands ----------------------------------------------------------------
 cmd_status() {
-  local s
+  local s usb
   s=$(state)
   echo "device state : $s"
   case "$s" in
@@ -185,10 +198,16 @@ cmd_status() {
       adb_sh "dd if=$P/para bs=32 count=1 2>/dev/null" | od -An -tx1 | head -1 || true
       ;;
   esac
-  # 0e8d = MediaTek (android 201c / poc 2008 / preloader 2000 / brom 0003),
-  # 18d1 = Google AOSP gadget (TWRP/Android recovery adb)
-  lsusb 2>/dev/null | grep -iE '0e8d|18d1' | sed 's/^/usb          : /' \
-    || echo "usb          : (no MediaTek/AOSP gadget on USB)"
+  # MediaTek 0e8d (android 201c / poc 2008 / preloader 2000 / brom 0003)
+  # + Google AOSP gadget 18d1 (TWRP/Android recovery adb). Printed as
+  # vid:pid — the platform-neutral form (lsusb on Linux, system_profiler
+  # on macOS — bin/lib/host.sh).
+  usb=$(gemini_usb_ids | grep -iE '^(0e8d|18d1):' || true)
+  if [ -n "$usb" ]; then
+    printf '%s\n' "$usb" | sed 's/^/usb          : /'
+  else
+    echo "usb          : (no MediaTek/AOSP gadget visible on USB)"
+  fi
 }
 
 cmd_twrp() {
@@ -214,7 +233,7 @@ cmd_android() {
 
 cmd_flash() {
   local img="${1:-$BOOTIMG_DEFAULT}" target="${2:-twrp}" bak
-  [ -f "$img" ] || { echo "!! image not found: $img (build it: nix build .#packages.aarch64-linux.default)" >&2; exit 1; }
+  [ -f "$img" ] || { echo "!! image not found: $img (build it: bash bin/build.sh start bootimg)" >&2; exit 1; }
   case "$target" in twrp|android) ;; *) echo "!! target must be twrp|android (got: $target)" >&2; exit 1 ;; esac
   ensure_twrp
   backup_para

@@ -25,6 +25,11 @@
 # it to configuration.nix environment.systemPackages) — the script fails
 # loudly rather than half-configuring the host.
 #
+# [2026-09-17] LINUX-ONLY by design: it is `ip`/`nft`/`sysctl`. The Mac
+# does not need it — the device's own NetworkManager connects to Wi-Fi
+# (services/wifi.nix), and the USB NIC is a link-local debug path only.
+# On macOS the equivalent would be pf; not implemented.
+#
 # Ported from the GeminiPDA project (build/usb-tether-nat.sh), 2026-09-08
 # (outstanding.md item 7); delta: auto-detected default upstream iface +
 # explicit tool checks. Device side (persistent): the static 10.15.19.82

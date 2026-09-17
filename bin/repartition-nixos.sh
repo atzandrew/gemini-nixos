@@ -49,9 +49,17 @@
 #   bash bin/repartition-nixos.sh all --yes
 #       apply (destructive) then stop in TWRP; run `boot` when ready.
 #
-# Images default to result/boot.img + result/system.img (build with
-# `nix build .#packages.aarch64-linux.default`); override with
-# GEMINI_BOOT_IMG / GEMINI_ROOTFS_IMG.
+# [2026-09-17] Host-side probes go through bin/lib/host.sh, so this no
+# longer hard-fails on a host without `lsusb` (macOS). It is still a
+# LINUX-HOST tool by policy: it is a one-way destructive operation which
+# has only ever been rehearsed/verified from the Linux workstation, and
+# the Mac has no preloader/BROM recovery path (Apple's container has no
+# USB passthrough) if something goes wrong mid-way. Nothing about the
+# mechanism blocks macOS — it is a deliberate, untested-here restriction.
+#
+# Images default to result/boot.img + result/system.img on Linux and to
+# the mac build cache (~/.cache/gemini-macos/out) on darwin; override
+# with GEMINI_BOOT_IMG / GEMINI_ROOTFS_IMG.
 #
 # LONG OPERATION: rootfs streaming is ~8 GB; run under run-job:
 #   bash bin/run-job.sh start repartition -- \
@@ -61,20 +69,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Shared host helpers (platform detection, the USB NIC + its ping, the
+# USB-id probe, the devshell re-exec) — bin/lib/host.sh.
+. "$ROOT/bin/lib/host.sh"
+
 # adb lives in the flake devshell (bare host PATH has no adb — AGENTS.md
-# rule 7). Re-exec once inside `nix develop` when missing.
-if ! command -v adb >/dev/null 2>&1; then
-  if [ -z "${GEMINI_DEVSH_REEXEC:-}" ]; then
-    export GEMINI_DEVSH_REEXEC=1
-    cd "$ROOT"
-    exec nix develop --command bash "bin/repartition-nixos.sh" "$@"
-  fi
-  echo "!! adb not found even inside the devshell — does the flake devShell" >&2
-  echo "   carry android-tools? (flake.nix, devShells.x86_64-linux.default)" >&2
-  exit 1
+# rule 7); on macOS so do the GNU coreutils this script's `timeout` calls
+# need. Re-exec once inside the devshell when they are missing.
+if gemini_need_devshell; then
+  gemini_devshell_reexec "$ROOT/bin/repartition-nixos.sh" "$@" || exit 1
 fi
 
-DEV=10.15.19.82
+DEV="$GEMINI_DEV_IP"
 KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
 # TWRP by-name dir (existing partitions); the NEW partition is written at
 # its raw offset so its node is not needed.
@@ -87,8 +93,15 @@ NEW_SIZE_SECT=121651167      # up to the preserved `flashinfo` (p28)
 BACKUP_DIR="$ROOT/stock-dump/repartition-20260910"
 GPT_PRIMARY="$BACKUP_DIR/gpt-primary-new.bin"
 GPT_BACKUP="$BACKUP_DIR/gpt-backup-new.bin"
-BOOT_IMG="${GEMINI_BOOT_IMG:-$ROOT/result/boot.img}"
-ROOTFS_IMG="${GEMINI_ROOTFS_IMG:-$ROOT/result/system.img}"
+# Artifact defaults: result/ on Linux, the mac build cache on darwin
+# (bin/macos/build.sh); overridable with GEMINI_BOOT_IMG/GEMINI_ROOTFS_IMG.
+if [ -f "$ROOT/result/boot.img" ] || ! gemini_is_macos; then
+  ART_DIR="$ROOT/result"
+else
+  ART_DIR="${GEMINI_MACOS_CACHE:-$HOME/.cache/gemini-macos}/out"
+fi
+BOOT_IMG="${GEMINI_BOOT_IMG:-$ART_DIR/boot.img}"
+ROOTFS_IMG="${GEMINI_ROOTFS_IMG:-$ART_DIR/system.img}"
 YES=0
 # Host scratch for read-back comparisons. /tmp may live on a full root
 # filesystem; default to the repo's gitignored logs/ (on the same volume
@@ -120,7 +133,8 @@ state() {
     if echo "$line" | grep -q 'unauthorized'; then echo unauthorized; return; fi
     echo adb-offline; return
   fi
-  if timeout 2 bash -c "ping -c 1 -W 1 $DEV >/dev/null 2>&1"; then
+  # no adb device — is a Linux rootfs up over the USB NIC instead?
+  if gemini_ping; then
     if timeout 8 ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 root@"$DEV" true >/dev/null 2>&1; then
@@ -128,9 +142,9 @@ state() {
     fi
     echo linux-nossh; return
   fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2008'; then echo poc; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:2000'; then echo preloader; return; fi
-  if lsusb 2>/dev/null | grep -q '0e8d:0003'; then echo brom; return; fi
+  if gemini_usb_present 0e8d:2008; then echo poc; return; fi
+  if gemini_usb_present 0e8d:2000; then echo preloader; return; fi
+  if gemini_usb_present 0e8d:0003; then echo brom; return; fi
   echo offline
 }
 
@@ -155,19 +169,19 @@ converge_twrp() {
   case "$s" in
     twrp) say "already in TWRP"; return 0 ;;
     linux|linux-nossh)
-      say "Linux up over g_ether (no adb) — para=boot-recovery + WDT EXRST self-boot to TWRP"
+      say "Linux up over the USB NIC (no adb) — para=boot-recovery + WDT EXRST self-boot to TWRP"
       devssh 'best=""; bs=0; for D in $(lsblk -dn -o NAME | grep -E "^mmcblk[0-9]+$"); do S=$(blockdev --getsize64 /dev/$D 2>/dev/null || echo 0); if [ "$S" -gt "$bs" ]; then bs=$S; best=$D; fi; done; [ -b /dev/${best}p2 ] || { echo "no para partition (largest mmcblk=$best)"; exit 1; }; { printf "boot-recovery\0"; head -c 18 /dev/zero; } > /tmp/bootcmd.bin; dd if=/tmp/bootcmd.bin of=/dev/${best}p2 bs=32 count=1 conv=fsync 2>/dev/null && dd if=/dev/${best}p2 bs=32 count=1 2>/dev/null | grep -qa "boot-recovery" && echo "PARA-WRITTEN+VERIFIED ($best)" || { echo "!! para write/verify FAILED"; exit 1; }' \
         || die "para write over ssh failed"
       say "arming WDT for EXRST self-boot (MODE=0x2200005D + 0x10007004=0x48)"
       wdt_exrst
-      say "device resetting — waiting for TWRP (USB 18d1:4ee2)..."
-      local i
+      say "device resetting — waiting for TWRP (adb recovery)..."
+      local i s
       for ((i=1; i<=36; i++)); do
         sleep 5
-        if lsusb 2>/dev/null | grep -q '18d1:4ee2'; then
+        s=$(state)
+        if [ "$s" = twrp ]; then
           say "TWRP up after ~$((i*5))s (adbd settling)"
-          sleep 10
-          wait_for twrp 12
+          sleep 5
           return 0
         fi
       done

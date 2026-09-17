@@ -110,7 +110,11 @@ BootROM (in-SoC, unerasable)
 - `AGENTS.md` — golden-repo rules; migration status (M1–M7)
 - `docs/boot-process.md` — plain-language boot explainer (receipt pointers)
 - `docs/repartition-android-space.md` — partition map + para layout §2
-- `bin/run-mtk.sh` — patched-mtkclient launcher (preloader/BROM mode);
-  `bin/usb-watch.sh` — USB-state watcher (device classification)
+- `bin/run-mtk.sh` — patched-mtkclient launcher (preloader/BROM mode;
+  **Linux host only** — no USB passthrough into Apple's container);
+  `bin/usb-watch.sh` — USB-state watcher (device classification; Linux
+  lsusb / macOS system_profiler via `bin/lib/host.sh`)
+- `docs/usb-network.md` — the USB gadget NIC (CDC-ECM since 2026-09-17)
+  and the host-side Linux/macOS helpers used by the DR scripts
 - Legacy receipts until M1: `GeminiPDA/docs/{flashing,boot-chain,hardware}.md`
 - Legacy session history until M7: `GeminiPDA/docs/session-log.md`

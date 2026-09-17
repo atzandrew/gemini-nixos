@@ -266,9 +266,20 @@ g_ether (CDC ECM) is the console-of-record for this device
 (10.15.19.82). Mobile NixOS gadget support: `mobile.usb.mode =
 "gadgetfs"` with configfs functions (`modules/initrd-usb.nix`,
 `usb-gadget.nix`); stage-2 networking + `services.openssh` are plain
-NixOS. Keep the fixed MACs via the g_ether kernel params (proven).
-(If ECM specifically is wanted rather than RNDIS/ADB, a tiny extension
-of the gadget functions set is needed — cosmetic.)
+NixOS. The project does NOT use those: the precomposed `g_ether` gadget
+is kept (auto-binds the UDC in kernel context — no userspace ordering to
+get wrong on the only debug link) and the fixed MACs come from the
+g_ether kernel params (proven).
+
+**[corrected 2026-09-17]** This section used to read "g_ether (CDC ECM)"
+while the *receipt* was RNDIS: `ether.c` registers RNDIS first when
+`CONFIG_USB_ETH_RNDIS=y`, so every host picked it and the unit enumerated
+as `0525:a4a2`. That symbol is now **off** (`bin/prune-kernel-config.sh`
+§9c): the gadget registers a single CDC-ECM configuration
+(`0525:a4a1`), which is what makes macOS — no RNDIS driver — able to use
+the link and the reboot/flash cycle. The "tiny extension" this section
+predicted turned out to be a kernel-config subtraction. Full receipts:
+**`docs/usb-network.md`** (🟡 not yet reflashed/on glass).
 
 ### 3.8 Serial console, fbcon, framebuffer console
 
