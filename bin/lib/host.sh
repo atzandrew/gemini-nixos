@@ -176,6 +176,44 @@ gemini_usb_present() {
   gemini_usb_ids | tr 'A-F' 'a-f' | grep -qx "$want"
 }
 
+# ---- SSH identity (the keypair is committed IN this repo) --------------
+# No important file lives outside the repo: the admin keypair is
+# keys/gemini_ed25519 (private) + .pub, committed alongside the code, and
+# the device trusts both its login half (config/gemini.nix
+# authorizedKeys.keyFiles) and uses it as its PINNED sshd host key — so a
+# from-scratch reflash needs no key provisioning and does not change the
+# device's SSH identity. Rationale and the (accepted) security trade:
+# keys/README.md. Override with GEMINI_SSH_KEY=<path> to use another key.
+GEMINI_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GEMINI_KEY_DIR="${GEMINI_KEY_DIR:-$GEMINI_REPO_ROOT/keys}"
+GEMINI_SSH_KEY="${GEMINI_SSH_KEY:-$GEMINI_KEY_DIR/gemini_ed25519}"
+GEMINI_KNOWN_HOSTS="${GEMINI_KNOWN_HOSTS:-$GEMINI_KEY_DIR/known_hosts}"
+
+# gemini_ssh_key — print the admin private key path, tightening its mode
+# first. Git stores only the exec bit, so a fresh clone arrives 0644 and
+# ssh refuses it ("permissions are too open"); fixing it here means the
+# scripts work straight after a clone. rc 1 + a hint when the key is gone.
+gemini_ssh_key() {
+  local key="$GEMINI_SSH_KEY" mode=""
+  if [ ! -f "$key" ]; then
+    echo "!! SSH key '$key' not found" >&2
+    echo "   It is committed in this repo (keys/gemini_ed25519 — see keys/README.md);" >&2
+    echo "   set GEMINI_SSH_KEY=<path> to use a different identity." >&2
+    return 1
+  fi
+  # coreutils stat on Linux + in the devshell; BSD stat on bare macOS.
+  mode=$(stat -c '%a' "$key" 2>/dev/null || stat -f '%Lp' "$key" 2>/dev/null || true)
+  case "$mode" in
+    400|600|"") : ;; # fine (or unknowable — let ssh decide)
+    *)
+      if chmod 600 "$key" 2>/dev/null; then
+        echo "$(basename "$key"): chmod 600 (git cannot store permissions, ssh requires them)" >&2
+      fi
+      ;;
+  esac
+  printf '%s\n' "$key"
+}
+
 # ---- tooling / devshell (rule 7) ---------------------------------------
 
 # gemini_ensure_tools <tool>... — rc 0 when all are on PATH.

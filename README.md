@@ -120,6 +120,7 @@ generation explicitly.
 | `devices/planet-geminipda/initrd.nix` | Minimal partition-scanning busybox initrd (R1; replaces Mobile NixOS stage-1 in the boot image) |
 | `devices/planet-geminipda/kernel/` | Kernel derivation (published v6.6 base + tracked delta + lean config); `postInstall` builds the out-of-tree `sramldo-smc.ko` (A72 bring-up SMC). The delta adds **`geminipda-drm`**, the KMS driver for the LK framebuffer |
 | `modules/hardware-soc-mediatek-mt6797.nix` | Out-of-tree MT6797 SoC fragment (upstreaming = phase 6) |
+| `keys/` | The device SSH identity, committed on purpose: `gemini_ed25519` is both the admin login key and the **pinned sshd host key** (so a reflash never changes the device's identity). Rationale + the accepted trade: `keys/README.md` |
 | `services/` | Device services and desktop sessions (see the table below) |
 | `config/gemini.nix` | Stage-2 system configuration (headless base + USB-NIC (CDC-ECM) SSH, device services, Mesa, GNOME default, on-device Nix) |
 | `bin/lib/host.sh` | Host-side link helpers shared by the device scripts: platform detection, MAC-based USB-NIC discovery, net-up, ping, USB-id probes, devshell re-exec (Linux + macOS) |

@@ -37,8 +37,9 @@ set -e
 cd "$(dirname "$0")/.."
 . bin/lib/host.sh
 DEV="$GEMINI_DEV_IP"
-KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
-[ -f "$KEY" ] || { echo "!! SSH key $KEY not found — see bin/device-ssh.sh header" >&2; exit 1; }
+# The admin key is committed in this repo (keys/README.md); the helper also
+# fixes a fresh clone's 0644 (git cannot store 0600).
+KEY=$(gemini_ssh_key) || exit 1
 SSH() { ssh -i "$KEY" \
   -o BatchMode=yes -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

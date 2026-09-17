@@ -281,6 +281,7 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 | **DRM/KMS driver for the LK framebuffer** (the standard-device enabler; GNOME prerequisite) | `devices/planet-geminipda/kernel/delta/drivers/gpu/drm/tiny/geminipda-drm.c` |
 | Kernel config pruning + delta sync tools (**§9c = the RNDIS-off / CDC-ECM gadget rule — re-run after any regeneration**) | `bin/prune-kernel-config.sh`, `bin/sync-kernel-delta.sh` (replaces the retired `bin/snapshot-kernel.sh`) |
 | **Rootfs ext4 image builder shim** (R13: growable mke2fs geometry; **2026-09-10: re-execs under fakeroot + `chown -R 0:0` so the image gets root-owned inodes — without it a fresh install has NO WiFi (NM rejects non-root plugin files) and logrotate fails**) | `pkgs/make-ext4fs-shim.nix` (wired via `config/gemini.nix` nixpkgs overlay) |
+| **SSH identity, in the repo** (2026-09-17): `keys/gemini_ed25519` is BOTH root/cjdell's login key (declared in `config/gemini.nix`) AND the device's **pinned sshd host key** (activation installs it 0600; `hostKeys` is a single ed25519 entry) — so a from-scratch reflash needs no provisioning and raises no "REMOTE HOST IDENTIFICATION HAS CHANGED". All host scripts default to it (`bin/lib/host.sh` `gemini_ssh_key`, which also fixes a fresh clone's 0644). Deliberate public key: single-user lab device | `keys/` + `config/gemini.nix`, `bin/lib/host.sh` |
 | boot.img header inspection | `bin/dump-bootimg-header.sh` |
 | **Recovery tooling** — patched-mtkclient launcher (preloader/BROM), USB-state watcher | `bin/run-mtk.sh`, `bin/usb-watch.sh` (+ devshell `mtkclient` = store pkg + DAs) |
 | **USB gadget NIC: RNDIS → CDC-ECM** (2026-09-17, 🟡 config built / not reflashed): the precomposed `g_ether` gadget registers ONE CDC-ECM configuration (`0525:a4a1`) instead of RNDIS-first (`0525:a4a2`), so **macOS** (no RNDIS driver) uses the same `10.15.19.82` link Linux does — the enabler for the full Mac reboot/flash cycle. `bin/prune-kernel-config.sh` §9c holds the config rule (RNDIS symbols off); `bin/lib/host.sh` holds the host-side Linux/macOS differences (MAC discovery, `ip`/`ifconfig`, ping, `lsusb`/`system_profiler`, devshell re-exec). Not switched to configfs/legacy-gadget semantics on purpose (fail-safe: usb0 is the only debug link) | **`docs/usb-network.md`** + `bin/lib/host.sh` |
@@ -331,9 +332,12 @@ is found by its **MAC** (`42:00:15:19:82:*`, the g_ether host/dev pair),
 so USB-port renumbering no longer matters; the device auto-configures its
 side at boot. Hand-rolled ssh needs `sudo bash bin/net-up.sh` first.
 [2026-09-17: this is **Linux + macOS** now, and the gadget is **CDC-ECM**
-(`0525:a4a1`) — `bin/lib/host.sh`, `docs/usb-network.md`. On a Mac, copy
-`~/.ssh/id_ed25519_gemini` over and run `sudo -v` once per shell (macOS
-sudo timestamps are per-tty) before a cycle.]
+(`0525:a4a1`) — `bin/lib/host.sh`, `docs/usb-network.md`. The admin key is
+IN the repo (`keys/gemini_ed25519`, `keys/README.md`) and the device
+declares it (login key + pinned sshd host key), so there is nothing to
+copy and a reflash does not change the device's SSH identity; on a Mac
+just `sudo -v` once per shell (sudo timestamps are per-tty) before a
+cycle.]
 
 **Remote reboot of a running Linux:** software resets POWER THE UNIT OFF
 (verified 2026-08-31) — only the LK-configured WDT EXRST path

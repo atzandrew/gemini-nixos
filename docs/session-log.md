@@ -5,6 +5,80 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-17 (d) — the SSH identity moved into the repo (login key + pinned host key)
+
+Ask: *"create a new pub/private key pair for the gemini and add to this
+repo. security is not a concern for this device in its current state. also
+use this for the host key so SSH doesn't complain on new connections after
+reflashing from scratch. no important files should live outside of the
+repo. when done, commit"*.
+
+**What was wrong before.** The admin key lived at
+`~/.ssh/id_ed25519_gemini` (outside the repo), its pubkey was pasted inline
+into `config/gemini.nix`, and a from-scratch rootfs needed a manual
+re-provision pass (password login + `cat >> authorized_keys`). On the Mac
+that key does not exist at all, so the ssh half of the flash cycle was
+dead on arrival. Separately, sshd's host key was the NixOS-generated one,
+so **every reinstall changed the device's identity** — which is precisely
+what produces `REMOTE HOST IDENTIFICATION HAS CHANGED` and stale
+`known_hosts` lines after a reflash.
+
+**Now.** New keypair committed at **`keys/`** (ed25519, fingerprint
+`SHA256:5P4/WXMpdUQ0G0K5p69d1pCiYwoOwp7EWJykjxBnFKI`), and it plays both
+roles:
+
+1. **login key** — `config/gemini.nix` declares
+   `users.users.{root,cjdell}.openssh.authorizedKeys.keyFiles =
+   [ ../keys/gemini_ed25519.pub ]`, so a fresh rootfs is ssh-reachable with
+   zero provisioning (the manual recipe is retired — the note in
+   `bin/device-ssh.sh`'s header is gone). The legacy inline workstation
+   pubkey STAYS, marked transitional: the rootfs currently on the device
+   still trusts only it, and the workstation's private half is not in this
+   repo. Drop it once everything in play has been reflashed.
+2. **pinned sshd host key** — `services.openssh.hostKeys` is overridden to
+   a single ed25519 entry at `/etc/ssh/ssh_host_ed25519_key`, and
+   `system.activationScripts.gemini-ssh-hostkey` installs the repo key
+   there as a real 0600 root file (verified: the activation text resolves
+   to `/nix/store/n9r7…-gemini_ed25519` → `install -m 0600`). It must be an
+   activation script and not `environment.etc`: /etc entries are symlinks
+   into the world-readable store and **sshd refuses group/other-readable
+   host keys**. Consequence (accepted, documented): the private key is in
+   git *and* in the world-readable store. `generateHostKeys` is left at its
+   default so the sshd-keygen unit is the failsafe — it is conditioned on
+   the file being absent, so it no-ops while activation works.
+
+**Nothing outside the repo.** All host scripts now default to the repo
+key: `bin/lib/host.sh` gained `GEMINI_KEY_DIR` / `GEMINI_SSH_KEY` /
+`GEMINI_KNOWN_HOSTS` + `gemini_ssh_key()`, which also fixes the fresh-clone
+permission trap (git stores only the exec bit, so a clone is 0644 and ssh
+refuses it — the helper chmods 600 and says so). Wired into `device-ssh`,
+`device-reboot`, `flash-nixos` (non-fatally, so `preflight` still runs and
+reports a missing key), `repartition-nixos`, `deploy.sh` (POSIX sh, so a
+plain `${GEMINI_SSH_KEY:-$repo/keys/gemini_ed25519}` + chmod there) and
+`gemshell-dev.sh`. `keys/known_hosts` ships the pinned host key for
+`10.15.19.82` so a human/tool can verify against the repo; the scripts
+keep their long-standing `StrictHostKeyChecking=no` +
+`UserKnownHostsFile=/dev/null` (a flash must never be blocked by host-key
+state — and with a pinned host key the steady state is clean anyway).
+`preflight` now checks that `known_hosts` still matches the key's public
+half, so the two cannot drift.
+
+**Verified.** `nix eval`: `services.openssh.hostKeys` = the single pinned
+ed25519 entry (NixOS's default rsa+ed25519 is genuinely replaced),
+`authorizedKeys.keyFiles` = the repo pubkey for root *and* cjdell, and the
+activation script text installs from the store path at 0600. `preflight`:
+ssh key ✅ + hostkey ✅ (only `sudo -v` and the deliberately unbuilt
+`system.img` remain as warnings). The chmod trap was tested by setting the
+key 0644 and re-resolving it. Caveat worth knowing: the flake cannot see
+`keys/` until it is `git add`ed (a git flake evaluates the committed tree)
+— it is in this commit for that reason.
+
+**Flagged for the future (in `keys/README.md`, not just here):** the
+private key is public in git + world-readable in the store. That is fine
+for this single-user lab device and is what the ask chose, but the README
+lists what to do the day it stops being acceptable (new key outside the
+repo, rotate `authorizedKeys` + host key in one change).
+
 ## 2026-09-17 (c) — USB NIC: RNDIS → CDC-ECM, so the Mac can drive the reboot/flash cycle
 
 Ask: *"move from RNDIS USB NIC to a more cross-platform USB NIC driver to

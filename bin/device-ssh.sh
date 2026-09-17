@@ -1,20 +1,18 @@
 #!/bin/bash
 # device-ssh.sh — SSH into the Gemini PDA over the USB gadget network.
 # Usage: bash bin/device-ssh.sh [command...]   (no args = interactive shell)
-# Device: 10.15.19.82, root. KEY-BASED auth (2026-09-02): the host key
-# ~/.ssh/id_ed25519_gemini is installed on the device
-# (/root/.ssh/authorized_keys).
+# Device: 10.15.19.82, root. KEY-BASED auth: the key lives IN this repo —
+# keys/gemini_ed25519 — and the device declares its public half in
+# config/gemini.nix, so a from-scratch reflash needs NO manual
+# provisioning (the old "log in with the `toor` password and append the
+# pubkey" recipe is retired). keys/README.md has the rationale + the
+# accepted security trade; GEMINI_SSH_KEY=<path> overrides the identity.
 #
 # [2026-09-17] Works on Linux AND macOS. The gadget is CDC-ECM since
 # 2026-09-17 (it used to be RNDIS), which both hosts drive natively, and
 # the host interface is found by its MAC rather than a hardcoded name.
 # See bin/lib/host.sh and docs/usb-network.md. A reach-the-device-somewhere-
 # else override is still honoured: GEMINI_DEV_IP=<ip> (Wi-Fi/LAN).
-#
-# To re-provision a fresh rootfs (password: toor):
-#   nix shell nixpkgs#sshpass -- -p toor ssh -o StrictHostKeyChecking=no \
-#     -o UserKnownHostsFile=/dev/null root@10.15.19.82 \
-#     'umask 077; cat >> /root/.ssh/authorized_keys' < ~/.ssh/id_ed25519_gemini.pub
 #
 # GOLDEN RULE: the host side of the USB link is DOWN after any device
 # power-off/power-cycle. If the link looks down, bring it up automatically
@@ -27,20 +25,18 @@
 # nothing else changes.
 #
 # Ported from the GeminiPDA project (build/device-ssh.sh).
-KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
-if [ ! -f "$KEY" ]; then
-  echo "!! SSH key $KEY not found — re-provision it (see header)" >&2
-  exit 1
-fi
 cd "$(dirname "$0")/.."
 # Host-side link helpers (Linux `ip` / macOS `ifconfig`, MAC-based
-# interface discovery, platform ping) — see bin/lib/host.sh.
+# interface discovery, platform ping, the repo SSH identity) —
+# bin/lib/host.sh.
 #
 # Remember whether the caller set GEMINI_DEV_IP BEFORE the lib defines its
 # default: a value from the environment means "reach the device there and
 # skip host-side setup" (Wi-Fi/LAN). The lib adopts it either way.
 GEMINI_DEV_IP_OVERRIDE="${GEMINI_DEV_IP:-}"
 . bin/lib/host.sh
+
+KEY=$(gemini_ssh_key) || exit 1
 
 if [ -n "$GEMINI_DEV_IP_OVERRIDE" ]; then
   exec ssh -i "$KEY" \

@@ -39,8 +39,9 @@
 # Long ops (the build, or a big first `nix copy` of a native closure):
 # wrap in `bash bin/run-job.sh start <name> -- bash bin/deploy.sh ...`.
 #
-# Device access: bin/device-ssh.sh (auto net-up), key ~/.ssh/id_ed25519_gemini
-# (host ~/.ssh/config entry '10.15.19.82' supplies it for plain nix copy).
+# Device access: bin/device-ssh.sh (auto net-up). The admin key is
+# committed in this repo (keys/gemini_ed25519 — see keys/README.md), and
+# the same file is what NIX_SSHOPTS below hands to `nix copy`.
 set -eu
 
 repo=/home/cjdell/Projects/gemini-nixos
@@ -48,7 +49,11 @@ repo=/home/cjdell/Projects/gemini-nixos
 # GEMINI_DEV_IP when the unit is reachable another way (Wi-Fi/LAN) —
 # bin/device-ssh.sh honours the same variable.
 dev=${GEMINI_DEV_IP:-10.15.19.82}
-key=$HOME/.ssh/id_ed25519_gemini
+# The key lives in the repo (no important file outside it). chmod first:
+# git cannot store 0600 and ssh refuses a world-readable private key.
+key=${GEMINI_SSH_KEY:-$repo/keys/gemini_ed25519}
+[ -f "$key" ] || { echo "deploy: no ssh key at $key — it is committed at keys/gemini_ed25519 (see keys/README.md)" >&2; exit 1; }
+chmod 600 "$key" 2>/dev/null || true
 profile=/nix/var/nix/profiles/system
 
 sudo_build() { sudo nix build --store local "$@"; }

@@ -81,7 +81,10 @@ if gemini_need_devshell; then
 fi
 
 DEV="$GEMINI_DEV_IP"
-KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
+# Admin key: committed in this repo (keys/gemini_ed25519, keys/README.md).
+# Resolved non-fatally for the same reason as bin/flash-nixos.sh — a
+# TWRP-only run needs no ssh at all.
+KEY=$(gemini_ssh_key 2>/dev/null || printf '%s\n' "$GEMINI_SSH_KEY")
 # TWRP by-name dir (existing partitions); the NEW partition is written at
 # its raw offset so its node is not needed.
 P=/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name

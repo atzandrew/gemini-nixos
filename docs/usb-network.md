@@ -151,6 +151,7 @@ sourced where needed):
 | `bin/usb-watch.sh` | VID map updated (`0525:a4a1`); bus read via the lib |
 | `bin/repartition-nixos.sh` | same probe conversion (it no longer hard-fails on a host without `lsusb`); artifact defaults follow the platform. Still a Linux-host tool **by policy** — see below |
 | `bin/macos/vm-build.sh` | the collector now also publishes the conventional `boot.img` / `system.img` names the flash scripts default to (store paths are hash-prefixed) |
+| `bin/lib/host.sh` (`gemini_ssh_key`) | every host script's key default moved from `~/.ssh/id_ed25519_gemini` to the **repo's** `keys/gemini_ed25519`, and the helper tightens a fresh clone's 0644 → 0600 (also `bin/deploy.sh`, `bin/gemshell-dev.sh`) |
 
 ## The Mac cycle, end to end
 
@@ -179,18 +180,48 @@ key is a warning: neither is needed for a `boot` flash).
   the flake's **darwin devshell** for `adb` + GNU coreutils
   (`flake-macos.nix`; `bin/lib/host.sh`'s `gemini_need_devshell`), so
   Homebrew or the Xcode CLT are not required.
-- **Two host prerequisites on the Mac**, both easy to forget:
-  - the admin SSH key at `~/.ssh/id_ed25519_gemini`
-    (`bin/device-ssh.sh` refuses to run without it; the same key is in the
-    device's `/root/.ssh/authorized_keys`) — copy it from the Linux
-    workstation, mode 600. **Only needed when the device is at the NixOS
-    desktop**: the flash hop to TWRP is a para write + WDT EXRST over ssh.
-    From TWRP (the sticky default) the whole flash is adb-only, so a Mac
-    without the key can still flash a unit that is already in TWRP —
-    `preflight` reports which case you are in.
-  - **`sudo -v` once per shell**: macOS `sudo` timestamps are per-tty, and
-    the first gadget-drop of a cycle has to re-apply `10.15.19.1` (the
-    scripts print a hint when they cannot).
+- **Nothing to copy for SSH any more**: the admin key is committed at
+  `keys/gemini_ed25519` and the device declares it, so a fresh clone can
+  log in and flash with no provisioning (`bin/lib/host.sh` tightens a
+  fresh clone's 0644 to 0600 automatically; `keys/README.md` has the
+  rationale and the accepted security trade).
+- **`sudo -v` once per shell** is still needed: macOS `sudo` timestamps
+  are per-tty, and the first gadget-drop of a cycle has to re-apply
+  `10.15.19.1` (the scripts print a hint when they cannot).
+
+### The SSH identity lives in the repo — and is the host key too
+
+The device's identity is part of the repo, not of this or that host's
+`~/.ssh` (2026-09-17):
+
+| | |
+|---|---|
+| Login key | `keys/gemini_ed25519` — declared for root + cjdell in `config/gemini.nix` (`authorizedKeys.keyFiles`), so a from-scratch reflash needs **no** manual key provisioning |
+| Host key | the **same** key, installed as `/etc/ssh/ssh_host_ed25519_key` (0600) by an activation script, with `services.openssh.hostKeys` pinned to that one entry |
+| Verification | `keys/known_hosts` carries its public half for `10.15.19.82`, so `ssh -o UserKnownHostsFile=keys/known_hosts root@10.15.19.82` verifies against the repo |
+
+The point of pinning the **host** key is that a generated one changes on
+every install — which is exactly what produces `REMOTE HOST
+IDENTIFICATION HAS CHANGED` (and stale `known_hosts` lines) after
+reinstalling from scratch. Pinned, the device's identity is stable for
+the life of the key: reflash as often as you like, no warning, no
+cleanup. `bin/flash-nixos.sh preflight` checks that `keys/known_hosts`
+still matches `keys/gemini_ed25519.pub`, so the two cannot silently drift.
+
+Two consequences to know:
+
+- `hostKeys` replaces NixOS's default `[rsa, ed25519]` list, so the device
+offers **ed25519 only** (every OpenSSH since 6.5 is fine);
+- the private key is in git **and** in the world-readable nix store (the
+activation script installs *from* a store path — the only way to get a
+0600 copy; `environment.etc` would be a symlink to a 0444 file and sshd
+refuses those). Deliberate: security is not a concern for this single-user
+lab device — `keys/README.md` states when that must be revisited.
+
+The scripts themselves keep `StrictHostKeyChecking=no` +
+`UserKnownHostsFile=/dev/null` (as they always had): a flash must never be
+blocked by host-key state, and with the pinned key the steady state is
+clean anyway.
 
 ### Readiness on 2026-09-17 (what that Mac could/could not do)
 
@@ -202,13 +233,14 @@ built and the device **not attached**:
 | `boot.img` + integrity vs the build ledger | ✅ present, 9.6 MiB, sha256 `2e8f43ad…`, matches |
 | `bootopt=64S3,32N2,64N2` / `fbcon=rotate:3` in the cmdline | ✅ both |
 | toolchain (adb + GNU coreutils via the darwin devshell) | ✅ `adb 37.0.0`, `timeout`/`stat`/`sha256sum` coreutils 9.11 |
-| SSH key `~/.ssh/id_ed25519_gemini` | ⚠️ absent on this Mac (copy it, or flash from TWRP) |
+| SSH login key | ✅ `keys/gemini_ed25519` (in the repo) |
+| pinned host key vs `keys/known_hosts` | ✅ they match |
 | sudo without a prompt | ⚠️ needs `sudo -v` in the shell doing the flash |
 | `system.img` (only a full reflash needs it) | ⚠️ not built (and not needed for this change) |
 | device | ⚪ offline (nothing attached at the time) |
 
-Verdict: **flash possible** — the two real actions before a flash are
-copying the SSH key (or starting from TWRP) and `sudo -v`.
+Verdict: **flash possible** — the only remaining action before a flash is
+`sudo -v` in the shell driving it.
 
 ### Still not possible from a Mac
 

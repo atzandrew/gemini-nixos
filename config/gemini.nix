@@ -195,16 +195,60 @@ in
   ];
 
   # ---- Users / access ---------------------------------------------------
-  # The bring-up/admin interface is ssh over g_ether as root@10.15.19.82,
-  # keyed by ~/.ssh/id_ed25519_gemini (bin/device-ssh.sh). NixOS's
-  # default sshd (PermitRootLogin prohibit-password) allows root pubkey
-  # login, but root must actually carry the key: without it there is NO
-  # ssh path into the system (root is locked; serial is the only login).
-  # pubkey == the host's id_ed25519_gemini.pub, the same key the
-  # GeminiPDA Debian rootfs has in /root/.ssh/authorized_keys.
-  users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1AU4h4b3z6GFRHVRgXCJ5UMfJU5F8B7A38u7migkuh gemini-pda-root (device-ssh.sh)"
+  # The bring-up/admin interface is ssh over the USB NIC as
+  # root@10.15.19.82. The login key is **committed in this repo** —
+  # keys/gemini_ed25519(.pub), see keys/README.md — and declared here, so a
+  # from-scratch reflash needs NO manual key provisioning (the old recipe
+  # was: log in with the `toor` password and append the pubkey by hand;
+  # that is retired). bin/lib/host.sh defaults every host script to the same
+  # file, so nothing important lives outside the repo. Security trade:
+  # keys/README.md (deliberate, single-user lab device).
+  #
+  # The legacy inline pubkey below is the Linux workstation's old
+  # ~/.ssh/id_ed25519_gemini: kept for the TRANSITION only, because the
+  # rootfs currently on the device still trusts it (and the workstation's
+  # own key is not in this repo). Drop it once every device in play has
+  # been reflashed with this generation — the repo key is the canonical one.
+  users.users.root.openssh.authorizedKeys.keyFiles = [
+    ../keys/gemini_ed25519.pub
   ];
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1AU4h4b3z6GFRHVRgXCJ5UMfJU5F8B7A38u7migkuh gemini-pda-root (device-ssh.sh, legacy — see comment)"
+  ];
+
+  # ---- SSH host key: PINNED (from this repo) ---------------------------
+  # The device's sshd host key is the SAME committed keypair, installed as
+  # a real 0600 file by the activation script below, and sshd is told to
+  # use exactly that one key. Why: a generated host key changes on every
+  # from-scratch install, which is what makes ssh scream
+  # "REMOTE HOST IDENTIFICATION HAS CHANGED" (and leaves stale known_hosts
+  # entries) after a reflash. Pinned => the device identity is stable and
+  # keys/known_hosts stays valid forever.
+  #
+  # Notes:
+  #  * hostKeys REPLACES NixOS's default [rsa, ed25519] list, so no other
+  #    (randomly generated) host key is offered — clients must speak
+  #    ed25519, which every OpenSSH since 6.5 does;
+  #  * generateHostKeys is left at its default (true) as a FAILSAFE: the
+  #    sshd-keygen unit is conditioned on our file being absent/empty, so it
+  #    does nothing normally, and would restore a working (if unpinned)
+  #    sshd rather than stop starting if activation ever failed;
+  #  * the install must be an activation script, not environment.etc: /etc
+  #    entries are symlinks into the world-readable store and sshd refuses
+  #    host keys that are group/other-readable. Consequence: the private
+  #    key IS in the store (documented in keys/README.md).
+  services.openssh.hostKeys = [
+    { type = "ed25519"; path = "/etc/ssh/ssh_host_ed25519_key"; }
+  ];
+  system.activationScripts.gemini-ssh-hostkey = {
+    deps = [ "etc" ];
+    text = ''
+      install -d -m 0755 /etc/ssh
+      install -m 0600 ${../keys/gemini_ed25519} /etc/ssh/ssh_host_ed25519_key
+      install -m 0644 ${../keys/gemini_ed25519.pub} /etc/ssh/ssh_host_ed25519_key.pub
+    '';
+  };
+
   # This PDA is the device called `gemini` everywhere else (hostname was
   # NixOS's default `nixos` in the rootfs; the Debian rootfs it replaces
   # uses `gemini`).
@@ -241,10 +285,15 @@ in
       "input"
       "bluetooth"
     ];
-    # Same operator key as root: `ssh cjdell@10.15.19.82` debugs the
-    # desktop session as the session user (root stays the admin path).
+    # Same operator key as root — the repo key + the legacy workstation key
+    # (see the comment at the root account above): `ssh cjdell@10.15.19.82`
+    # debugs the desktop session as the session user (root stays the admin
+    # path).
+    openssh.authorizedKeys.keyFiles = [
+      ../keys/gemini_ed25519.pub
+    ];
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1AU4h4b3z6GFRHVRgXCJ5UMfJU5F8B7A38u7migkuh gemini-pda-root (device-ssh.sh)"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1AU4h4b3z6GFRHVRgXCJ5UMfJU5F8B7A38u7migkuh gemini-pda-root (device-ssh.sh, legacy — see comment)"
     ];
   };
   security.sudo.enable = true;

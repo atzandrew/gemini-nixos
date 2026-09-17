@@ -31,7 +31,11 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
 dev="${GEMINI_DEV_IP:-10.15.19.82}"
-key="$HOME/.ssh/id_ed25519_gemini"
+
+# Admin key: committed in this repo (keys/gemini_ed25519, keys/README.md).
+# The lib helper resolves the path and tightens a fresh clone's 0644.
+. "$repo/bin/lib/host.sh"
+key=$(gemini_ssh_key)
 ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$key")
 unit=gemshell-dev.service
 

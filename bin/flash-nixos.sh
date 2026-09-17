@@ -93,7 +93,11 @@ if gemini_need_devshell; then
 fi
 
 DEV="$GEMINI_DEV_IP"
-KEY="${GEMINI_SSH_KEY:-$HOME/.ssh/id_ed25519_gemini}"
+# The admin key is committed in this repo (keys/gemini_ed25519, see
+# keys/README.md). Resolved NON-fatally: `preflight` must still run (and
+# report it) when the key is missing, and a flash from TWRP needs no ssh at
+# all — the ssh paths themselves (bin/device-ssh.sh) check it.
+KEY=$(gemini_ssh_key 2>/dev/null || printf '%s\n' "$GEMINI_SSH_KEY")
 # Artifacts: Linux publishes result/ in the repo; the macOS build model
 # collects into ~/.cache/gemini-macos/out. Prefer result/, fall back to
 # the mac cache on darwin (never silently — `status` shows the path used).
@@ -314,12 +318,28 @@ cmd_preflight() { # read-only: is a flash actually possible from this host?
 
   # 5. SSH key: only needed to converge a RUNNING LINUX device to TWRP
   #    (para write + WDT EXRST over ssh). From TWRP the flash is adb-only.
+  #    The key is committed in the repo — keys/gemini_ed25519 — so this
+  #    should only be missing on a hand-trimmed checkout.
   if [ -f "$KEY" ]; then
     printf '  ok    ssh key  %s\n' "$KEY"
   else
     printf '  warn  ssh key  %s MISSING — needed only if the device is at the NixOS desktop\n' "$KEY"
-    printf '        (from TWRP the flash is adb-only; or point GEMINI_SSH_KEY at the key)\n'
+    printf '        (committed at keys/gemini_ed25519; or point GEMINI_SSH_KEY at a key)\n'
     warn=1
+  fi
+
+  # 5b. The pinned HOST key: keys/known_hosts must carry the public half of
+  #     the key the device will present as its sshd host key (both come from
+  #     keys/gemini_ed25519 via config/gemini.nix). If they drift, a plain
+  #     ssh against the repo known_hosts is what breaks — catch it here.
+  if [ -f "$GEMINI_KNOWN_HOSTS" ] && [ -f "$KEY.pub" ]; then
+    if awk '!/^#/ { print $3 }' "$GEMINI_KNOWN_HOSTS" \
+         | grep -Fxq "$(awk '{ print $2 }' "$KEY.pub")"; then
+      printf '  ok    hostkey  keys/known_hosts carries the pinned device host key\n'
+    else
+      printf '  FAIL  hostkey  keys/known_hosts does NOT match %s.pub\n' "$KEY"
+      fail=1
+    fi
   fi
 
   # 6. sudo: needed to (re-)apply the host address on the USB NIC when the

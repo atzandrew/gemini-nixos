@@ -116,5 +116,9 @@ BootROM (in-SoC, unerasable)
   lsusb / macOS system_profiler via `bin/lib/host.sh`)
 - `docs/usb-network.md` — the USB gadget NIC (CDC-ECM since 2026-09-17)
   and the host-side Linux/macOS helpers used by the DR scripts
+- `keys/` — the device SSH identity, committed: `gemini_ed25519` is both
+  the admin login key and the **pinned sshd host key**, so a rebuild from
+  scratch needs no key provisioning and does not change the device's
+  identity (`keys/README.md` has the rationale + the accepted trade)
 - Legacy receipts until M1: `GeminiPDA/docs/{flashing,boot-chain,hardware}.md`
 - Legacy session history until M7: `GeminiPDA/docs/session-log.md`

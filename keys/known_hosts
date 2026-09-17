@@ -1,0 +1,17 @@
+# known_hosts for this device — kept in the repo on purpose.
+#
+# The device's sshd host key is PINNED to keys/gemini_ed25519 (see the SSH
+# section of config/gemini.nix), not generated per install, so this entry
+# stays valid across a from-scratch reflash: no "REMOTE HOST IDENTIFICATION
+# HAS CHANGED" after reinstalling. Use it with:
+#
+#   ssh -o UserKnownHostsFile=keys/known_hosts root@10.15.19.82
+#
+# (bin/device-ssh.sh and friends deliberately run with
+# StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null — a flash must
+# never be blocked by host-key state — so they neither need nor touch this
+# file. It exists so a human/tool CAN verify against the repo.)
+#
+# Keep it in sync with the key (bin/flash-nixos.sh preflight checks this):
+#   ssh-keygen -y -f keys/gemini_ed25519
+10.15.19.82 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfbrOwr8K31h6e+4kE/cdz++DQlDHkF7Vd/n4Y0/KhH

@@ -26,3 +26,11 @@ hwparam.json
 
 # gemshell build artifacts
 pkgs/gemshell/target/
+
+# NOTE: keys/ is deliberately NOT ignored (2026-09-17). The device's SSH
+# identity — keys/gemini_ed25519 (admin login key + pinned sshd host key),
+# its .pub, and keys/known_hosts — is committed so that a fresh clone can
+# flash and ssh with no provisioning and a reflash never changes the
+# device's host key. This is a deliberate trade for a single-user lab
+# device; keys/README.md states the consequences and when to reverse it.
+# Do not add a `keys/` or `*.key` rule here.
