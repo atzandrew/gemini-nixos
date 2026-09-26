@@ -243,6 +243,7 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
 | **NixOS rootfs layout** — TWRP + NixOS only since 2026-09-10 (single 58 GiB p27 `linux`; supersedes the 2026-09-07 dual-boot plan §9/§10) | `docs/repartition-android-space.md` (§12) |
 | "Published base + in-repo delta" pattern (mesa done; kernel next) | `docs/library-deltas.md` |
 | **What was actually tried / happened** (dated entries; golden log) | `docs/session-log.md` |
+| **Long-standing goals** (persistent, not one session's work) — **G1: stop chronic battery depletion; a real deep sleep + a real, measured poweroff** | `docs/standing-goals.md` |
 | **Disaster recovery** — full-flash-erase → TWRP playbook (levels 0–2), image ledger + sha256, gather checklist, drills | `docs/disaster-recovery/` (README · inventory · gather · drills) |
 | Flake entry; Mobile NixOS pin (`2c132754`); **nixpkgs pinned in-flake** (`26.11pre1068949` — see README Versions + this file's "Pins (maintenance)"); devShell (host x86_64, MNX npins) | `flake.nix` |
 | Out-of-tree device definition (boot.img geometry, borrowed kernel, minimal initrd wiring) | `devices/planet-geminipda/` |

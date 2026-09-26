@@ -5,6 +5,57 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-26 — G1 recorded: chronic battery depletion, and doubt that the unit ever truly powers off
+
+Ask: *"note in the project a long standing goal. this device is suffering
+chronic battery depletion issues, often going below the safe voltage and
+requiring a bench power supply to recover a safe voltage. we need to make
+the device actually deep sleep/shutdown as i'm not convinced we've ever
+managed to switch it off fully"*.
+
+**Device access (macOS host, no Linux involved).** Device was in **TWRP**
+(adb, via the darwin devshell: `nix develop --command adb devices` →
+serial `CQMJJREEINNRSKGE  recovery`). No flash/install of any kind.
+
+**Battery reading (TWRP, USB attached).** TWRP sysfs is stale as
+documented — `POWER_SUPPLY_CAPACITY=-1`, `status=Not charging` — so the
+dmesg `[PE+]` line is the truth:
+
+- `Vbat=3564 mV`, `AvgVbat≈3499 mV`, **charging**: `CHGEN=1`,
+  `ChrStat=2`, `Ichg=400`, `Ibat≈+440–480 mA`.
+- `Vbus=5100`, **`PE+ is not connected`** (plain-USB fallback, Ilim 500 mA
+  — no high-voltage/PE+ negotiation).
+- battery temp 26–27 °C, health Good. SMB side reported `CAPACITY_SMB=50`
+  (untrustworthy — no fuel gauge).
+- **VBAT 3.56 V is already below the 3.65 V warn threshold** while on the
+  charger: the pack was substantially depleted. The guard's crit
+  (orderly poweroff) is 3.50 V and the vendor hard-off 3.40 V.
+
+**Decision.** Recorded the ask as a first-class long-standing goal in the
+new **`docs/standing-goals.md`** — **G1: stop chronic battery depletion;
+make the device truly sleep and truly power off**. Key point written there:
+the 2026-09-10 "poweroff verified" result (`docs/power-states.md`) was
+measured only as *"the USB gadget disappears, no preloader/NIC loop"*,
+which a merely-halted AP with its USB transceiver off produces just as
+well. **It did not measure post-shutdown battery current**, so it is not
+evidence the PMIC actually cut the rails — consistent with the user's
+suspicion that the unit never fully switches off. The ~1.6 W awake floor
+(`docs/power-sleep.md`) draining "off" would exactly explain the chronic
+deep discharge. G1's first action is therefore to **re-run the poweroff
+test with a current measurement/bench supply**, then build the s2idle wake
+source.
+
+**Repo changes (docs only; nothing built or flashed):** new
+`docs/standing-goals.md`; README power bullet + Documentation table;
+AGENTS.md "Where things live" row.
+
+**Device left:** in TWRP, on USB and charging (~3.56 V and rising, ≈+
+0.44 A). No boot-image or partition writes. Safe.
+
+Next action: G1 step 1 — poweroff with a measured current draw (USB data
+detached), then decide whether the `mt6797-power` driver's RTC_BBPU path
+needs instrumenting.
+
 ## 2026-09-17 (d) — the SSH identity moved into the repo (login key + pinned host key)
 
 Ask: *"create a new pub/private key pair for the gemini and add to this

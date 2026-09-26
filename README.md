@@ -57,8 +57,15 @@ layout were reclaimed into it — see
 - **Power** — battery guard, silver-button light clamshell sleep/wake
   (`gemcli sleep` / `gemini-sleepd`; systemd `suspend` is deliberately
   disabled because it locks the unit up), GNOME "Power Mode" driving the
-  A72 cluster, and working `reboot`/`poweroff` (custom reset/poweroff
-  kernel drivers).
+  A72 cluster, and `reboot`/`poweroff` (custom reset/poweroff kernel
+  drivers).
+  > ⚠️ **Open standing goal (G1):** true deep sleep / true power-off are
+  > **not** proven, and the unit has repeatedly deep-discharged below the
+  > safe voltage (bench-supply recovery). The 2026-09-10 poweroff result
+  > was measured only as "USB disappeared", not as a battery-current
+  > collapse — so we are **not convinced it ever fully switches off**.
+  > Until G1 closes, the device must not be left idle unplugged. See
+  > [docs/standing-goals.md](docs/standing-goals.md).
 - **Touch** — a real 10-point multitouch device, no emulated cursor,
   correct 180° rotation.
 - **Keyboard** — the Gemini UK layout registered with GNOME, including
@@ -159,6 +166,7 @@ the operational cheat sheet is in `AGENTS.md`.
 | Doc | Contents |
 |---|---|
 | [docs/session-log.md](docs/session-log.md) | Dated record of what was actually tried — the project's ground truth |
+| [docs/standing-goals.md](docs/standing-goals.md) | Long-running goals not closed by any one session — **G1: stop chronic battery depletion / true sleep+poweroff** |
 | [docs/mobile-nixos-port-feasibility.md](docs/mobile-nixos-port-feasibility.md) | Feasibility study and the phased plan (phase table = roadmap) |
 | [docs/boot-process.md](docs/boot-process.md) | Plain-language boot explainer with receipt pointers |
 | [docs/phase-2-on-glass.md](docs/phase-2-on-glass.md) | The 2026-09-07 first-boot milestone, the `bootopt` discovery, and the recovery receipts |
