@@ -93,6 +93,17 @@ container). **Kernel config + host scripts are built-but-not-flashed
 (boot.img reflash owed).** Receipts + verification + rollback:
 **`docs/usb-network.md`**.
 
+**2026-09-26 (d): gemshell Wayland-app TOUCH FIXED on glass** — the
+compositor's `local_coords` omitted `wl_surface.set_buffer_scale`, so at
+UI scale 1.5 (`wl_output.scale = 2`) input was delivered in 2× buffer
+pixels and every app ignored touch; now tracked and applied (verified at
+150% with the fixed binary run transiently). **Residual:** a slight
+tap-offset from the ignored `xdg_surface.set_window_geometry` (CSD shadow
+margin) — logged for a future session, not fixed. **Open app-hosting
+gaps:** no session D-Bus for clients, client EGL `dri2 screen` failures.
+Receipts: `docs/gemshell.md` §"2026-09-26" + `docs/session-log.md`
+2026-09-26 (d).
+
 ⚠️ **Boot.img cmdline field: KEEP `bootopt=64S3,32N2,64N2` in it** — LK
 consumes it via `platform_parse_bootopt`; without it the boot hangs on
 the LK logo (~15 s WDT loop) before any kernel output (discovered

@@ -100,6 +100,12 @@ pub struct SurfaceInner {
     pub frame_cbs: Vec<WlCallback>,
     /// true once committed with a buffer (mapped)
     pub mapped: bool,
+    /// `wl_surface.set_buffer_scale` (default 1). Input events
+    /// (wl_touch/wl_pointer) are in SURFACE-LOCAL coordinates — the
+    /// buffer size divided by this scale — not buffer pixels. Ignoring
+    /// it delivered 2x-too-large touch coords at ui_scale 1.5 (the
+    /// "apps don't respond to touch" report, 2026-09-26).
+    pub buffer_scale: i32,
 }
 
 /// A wl_shm buffer (a view into its pool). Immutable after creation.
@@ -551,8 +557,12 @@ impl Dispatch<WlSurface, SurfaceData, Compositor> for Compositor {
             }
             WlSurfaceRequest::SetOpaqueRegion { .. }
             | WlSurfaceRequest::SetInputRegion { .. }
-            | WlSurfaceRequest::SetBufferTransform { .. }
-            | WlSurfaceRequest::SetBufferScale { .. } => {}
+            | WlSurfaceRequest::SetBufferTransform { .. } => {}
+            WlSurfaceRequest::SetBufferScale { scale } => {
+                // Not double-buffered: applies immediately, and input
+                // coords are surface-local (buffer px / scale).
+                data.inner.lock().unwrap().buffer_scale = scale.max(1);
+            }
             _ => {}
         }
     }

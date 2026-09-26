@@ -106,6 +106,9 @@ pub struct Window {
     pub w: f32,
     pub h: f32,
     pub buffer: Option<std::sync::Arc<BufferData>>,
+    /// `wl_surface.set_buffer_scale` for this window's surface (>=1).
+    /// Input coords are surface-local = buffer px / this scale.
+    pub buffer_scale: i32,
     pub workspace: u32,
     pub minimized: bool,
     pub maximized: bool,
@@ -1599,15 +1602,23 @@ impl Compositor {
     }
 
     /// Surface-local logical coords (scene buffer rect -> client pixels;
-    /// clients with 1:1 buffers get exact pixels).
+    /// clients with 1:1 buffers get exact pixels). wl_touch/wl_pointer
+    /// coordinates are in SURFACE-LOCAL space, i.e. buffer pixels divided
+    /// by the surface's buffer scale — so a client that calls
+    /// `set_buffer_scale(2)` (every app at gemshell's 150% UI scale) gets
+    /// half the buffer's pixel range. Missing the `/scale` sent 2x
+    /// coordinates and touches fell outside the surface (the "apps don't
+    /// respond to touch" report, 2026-09-26).
     fn local_coords(&self, w: &Window, x: f32, y: f32) -> (f32, f32) {
         let (bx, by, bw, _bh) = w.buffer_rect();
         let Some(buf) = &w.buffer else {
             let ty = if w.csd { 0.0 } else { TITLEBAR_H };
             return (x - w.x, y - w.y - ty);
         };
-        let scale = (bw / buf.w as f32).max(1e-6);
-        ((x - bx) / scale, (y - by) / scale)
+        // scene units per buffer pixel, times buffer scale -> scene units
+        // per surface-local unit.
+        let k = (bw / buf.w as f32).max(1e-6) * w.buffer_scale.max(1) as f32;
+        ((x - bx) / k, (y - by) / k)
     }
 
     // -----------------------------------------------------------------
@@ -1726,6 +1737,7 @@ impl Compositor {
             w: ww,
             h: wh,
             buffer: None,
+            buffer_scale: 1,
             workspace: self.ws_target as u32,
             minimized: false,
             maximized: true,
@@ -1996,6 +2008,7 @@ impl Compositor {
             w: w.clamp(40.0, self.lw as f32),
             h: h.clamp(40.0, self.lh as f32),
             buffer: None,
+            buffer_scale: 1,
             workspace: self.ws_target as u32,
             minimized: false,
             maximized: false,
@@ -2376,9 +2389,9 @@ impl Compositor {
         let Some(data) = surface.data::<SurfaceData>() else {
             return;
         };
-        let (buf, win) = {
+        let (buf, win, scale) = {
             let inner = data.inner.lock().unwrap();
-            (inner.pending_buffer.clone(), inner.window)
+            (inner.pending_buffer.clone(), inner.window, inner.buffer_scale.max(1))
         };
         let Some(buf) = buf else {
             return;
@@ -2392,9 +2405,13 @@ impl Compositor {
             .window_texture(win, buf.w, buf.h, buf.stride, buf.format, map);
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
             w.buffer = Some(buf.clone());
+            // Input coords are surface-local (buffer px / buffer scale),
+            // and so is a client's logical size (2026-09-26).
+            w.buffer_scale = scale;
+            let s = scale as f32;
             if !w.maximized && w.snap == Snap::None && !w.is_popup {
-                let bw = (buf.w as f32).min(self.lw - 16.0);
-                let bh = (buf.h as f32).min(self.lh - STATUS_H - TASKBAR_H - TITLEBAR_H - 16.0);
+                let bw = (buf.w as f32 / s).min(self.lw - 16.0);
+                let bh = (buf.h as f32 / s).min(self.lh - STATUS_H - TASKBAR_H - TITLEBAR_H - 16.0);
                 if (bw - w.w).abs() > 1.0 || (bh - w.h).abs() > 1.0 {
                     w.w = bw;
                     w.h = bh;

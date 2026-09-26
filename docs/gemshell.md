@@ -1,6 +1,6 @@
 # gemshell — the native Gemini PDA Wayland compositor + desktop shell
 
-Last updated: 2026-09-11
+Last updated: 2026-09-26
 
 A custom, Rust-based, Wayland-native desktop for the Gemini PDA: the
 `gemshell` compositor (KMS + Mesa OpenGL, a handful of shell services)
@@ -140,6 +140,43 @@ restore/close affordance. Two fixes:
   resolving the keysym. Root cause is not proven (the poll loop can drop
   an RALT-up while a frame renders); this is a self-healing safety net.
   Only on a real evdev fd — nested mode (`kbd_fd = -1`) skips it.
+
+### 2026-09-26 — Wayland-app touch FIXED (buffer-scale transform) + known offset
+
+**Symptom (on glass):** apps open and render, but **ignore every touch**
+(the compositor's own chrome/launcher work). Root cause was NOT the
+protocol: `wl_seat.capabilities` advertises Touch, the client calls
+`get_touch`, and `wl_touch.down/motion/up` reach it. It was the
+**coordinate space**.
+
+`Compositor::local_coords` omitted `wl_surface.set_buffer_scale`.
+Wayland input coordinates are **surface-local** = buffer pixels ÷ buffer
+scale. With the persisted UI scale 1.5 (`wl_output.scale = 2`), clients
+allocate 2× buffers and call `set_buffer_scale(2)` — gnome-calculator:
+configure 1440×588, buffer **2880×1232** → surface-local **1440×616** —
+while gemshell delivered e.g. `(884, 1024)`: 2× too large, outside the
+surface, so GTK dropped it. At UI scale 1.0 (output scale 1, factor 1)
+the bug is invisible, which is why the 2026-09-12 pass missed it.
+
+**Fix:** track `set_buffer_scale` in `SurfaceInner` (it was in the
+ignored request arm), carry it on `Window`, and apply it in
+`local_coords` (`k = bw/buf.w × buffer_scale`). The non-maximized window
+auto-size now also divides buffer dims by the scale. Fixed + verified on
+glass at 150% (`agipxng1i25ygry2am7x20pppjxd16gb-gemshell-0.1.0`).
+
+**Known imperfection (future session):** taps respond but land
+**slightly offset** from the button. Likely the ignored
+`xdg_surface.set_window_geometry`: GTK's CSD buffer carries a shadow
+margin (~14 surface-local px) that is not excluded when the buffer rect
+maps to the window, so the content origin is off by that inset. Fix ≈
+honour `set_window_geometry` (and/or the CSD inset) in the
+buffer→surface transform.
+
+**Still open (app hosting):** no session D-Bus is started for clients
+(GTK/portal apps log `Cannot autolaunch D-Bus without X11 $DISPLAY`;
+`org.freedesktop.portal.Desktop` unavailable), and clients log
+`MESA-EGL: failed to get driver name for fd -1` /
+`failed to create dri2 screen`.
 
 ### Variable UI scale
 

@@ -5,6 +5,72 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-26 (d) — gemshell on glass: WAYLAND-APP TOUCH FIXED (buffer-scale input transform); app-hosting issues logged
+
+Ask: *"bring gemshell up on the device so I can remind myself of the
+issues … it currently does not host Wayland apps properly"* — then, on
+glass: apps open but **ignore all touch**.
+
+Led the device to the gemshell session (`sudo gemcli session set gemshell
+--reboot`; marker now `gemshell`, GDM skipped, `gemini-gemshell.service`
+active, own socket `/run/gemshell/wayland-0`, panel renders). Reached it
+with the interim **password hop** (`cjdell` / `0000`, passwordless sudo):
+the gen-54 rootfs predates the repo-key commit `1020d4e`, so
+`bin/device-ssh.sh`'s pubkey path still fails (usb-network.md caveat).
+
+**Root cause (found, fixed, verified).** `Compositor::local_coords`
+omitted `wl_surface.set_buffer_scale`. Wayland input coordinates are
+**surface-local** (buffer pixels ÷ buffer scale); gemshell sent buffer
+pixels. The persisted UI scale is **1.5**, so `wl_output.scale=2`, every
+client allocates a 2× buffer and calls `set_buffer_scale(2)` — e.g.
+gnome-calculator: configure 1440×588, buffer **2880×1232** →
+surface-local **1440×616** — while gemshell delivered `wl_touch.down` at
+e.g. `(884, 1024)`: 2× too large, outside the surface, so GTK dropped
+every event. The protocol path itself was correct:
+`wl_seat.capabilities(7)` includes Touch, the client calls `get_touch`,
+events arrive (receipt: `WAYLAND_DEBUG=1` client log).
+
+Proof without a rebuild: set the UI scale to 100% (output scale 1 →
+factor 1) → the same Calculator **responded** to touch.
+
+**Fix.** Track `set_buffer_scale` (was in the ignored request arm) in
+`SurfaceInner`, carry it on `Window`, and apply it in `local_coords`
+(`k = bw/buf.w * buffer_scale`); also fixed the non-maximized auto-size
+(buffer px → surface-local). `cargo check` clean (macOS host).
+
+**Build + deploy.** `bash bin/build.sh start gemshell` (macOS container;
+rev `6a5242f`-dirty) →
+`/nix/store/agipxng1i25ygry2am7x20pppjxd16gb-gemshell-0.1.0`. Only that
+path was missing on the device (all 30 closure deps already present), so
+`nix-store --export` → scp → `sudo nix-store --import`, then the
+`gemshell-dev.sh` transient model (env copied from
+`gemini-gemshell.service`).
+
+**Verified on glass at 150%:** touch now works in the app (user
+confirmed). ✅
+
+**Known imperfection (future session — user-flagged).** Taps respond but
+land **slightly offset** from the button. Likely cause: gemshell ignores
+`xdg_surface.set_window_geometry` (`wayland.rs`), so GTK's CSD shadow
+margin (~14 surface-local px) is not excluded when mapping the buffer
+rect to the window. Fix ≈ honour `set_window_geometry` (and/or the CSD
+inset) in the buffer→surface transform. Logged, NOT fixed.
+
+**Other app-hosting issues observed (open):**
+- **No session D-Bus** — the system-service compositor starts none, so
+  GTK/portal apps log `Cannot autolaunch D-Bus without X11 $DISPLAY`
+  and portals fail (`org.freedesktop.portal.Desktop` unavailable).
+- Client-side **MESA-EGL `failed to get driver name for fd -1` /
+  `failed to create dri2 screen`** warnings.
+- `resvg` SVG-icon noise (`Images decoding was disabled by a build
+  feature`, `usvg … marker-* 'none'`) — cosmetic.
+
+**Device left:** marker = `gemshell`; the fixed binary runs as the
+transient `gemshell-dev.service` (installed `gemini-gemshell.service`
+stopped). ⚠️ **A reboot falls back to the installed, unfixed gemshell**,
+where touch is dead at 150%; the interim is UI scale 100% (usable).
+Nothing flashed; `para` untouched.
+
 ## 2026-09-26 (c) — passwordless mac USB link: root LaunchDaemon re-applies 10.15.19.1 automatically
 
 Follow-up to (b): the user was prompted for their Mac admin password twice
