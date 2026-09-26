@@ -1,25 +1,25 @@
 # USB networking — the gadget is CDC-ECM, and the Mac can drive the cycle
 
-Last updated: 2026-09-17
+Last updated: 2026-09-26
 
-Status: 🟡 **config built + host scripts changed — not flashed, not on
-glass.**
+Status: ✅ **flashed + verified on glass from macOS (2026-09-26).**
 The device's USB NIC moved from RNDIS to **CDC-ECM** so that **macOS**
 (which has no RNDIS driver at all) can use the same 10.15.19.82 link the
 Linux workstation uses — and the host scripts that drive the reboot/flash
 cycle now run on both platforms. The kernel change is a **boot.img
 reflash** (`bash bin/build.sh start bootimg` → `bash bin/flash-nixos.sh
-boot`), which has **not** happened; the image below is built, verified
-against the boot contract, and sitting in the artifact cache. **No rootfs
-change is involved** — the device-side side of the link (usb0 =
-10.15.19.82, static, in `config/gemini.nix`) is untouched, so `boot`
-alone carries this change.
+boot`); on **2026-09-26** it was built, flashed and booted entirely from a
+MacBook (no Linux host): macOS enumerated `0525:a4a1` (CDC-ECM), drove the
+link natively and survived a reboot cycle — receipts in the verification
+section below and `docs/session-log.md`. **No rootfs change is involved**
+— the device-side side of the link (usb0 = 10.15.19.82, static, in
+`config/gemini.nix`) is untouched, so `boot` alone carries this change.
 
 Read with: `bin/lib/host.sh` (the host-side code), the cheat sheet in
 `AGENTS.md`, `docs/macos-build.md` (the Mac build half),
 `docs/disaster-recovery/` (recovery).
 
-## Receipt: the built boot.img (2026-09-17, nothing flashed)
+## Receipt: the built boot.img (2026-09-17; flashed 2026-09-26)
 
 | | |
 |---|---|
@@ -48,7 +48,7 @@ Proof the config took effect, from the built kernel's own output
 - `usb_f_ncm.ko` is still there: the configfs NCM option is deliberately
   kept for a future Windows-capable path (see "Why not configfs" below).
 
-Still owed: the **on-glass** verification list below.
+On-glass verification: **done 2026-09-26** (from macOS) — see below.
 
 ## Why this change exists
 
@@ -151,6 +151,7 @@ sourced where needed):
 | `bin/usb-watch.sh` | VID map updated (`0525:a4a1`); bus read via the lib |
 | `bin/repartition-nixos.sh` | same probe conversion (it no longer hard-fails on a host without `lsusb`); artifact defaults follow the platform. Still a Linux-host tool **by policy** — see below |
 | `bin/macos/vm-build.sh` | the collector now also publishes the conventional `boot.img` / `system.img` names the flash scripts default to (store paths are hash-prefixed) |
+| `bin/macos/{usb-nic-up.sh,com.gemini.usb-nic.plist,install-usb-nic-daemon.sh}` | **NEW 2026-09-26**: root LaunchDaemon keeping `10.15.19.1/24` on the gadget NIC, so the mac link is passwordless across reboots/replugs (`AGENTS.md` rule 6) |
 | `bin/lib/host.sh` (`gemini_ssh_key`) | every host script's key default moved from `~/.ssh/id_ed25519_gemini` to the **repo's** `keys/gemini_ed25519`, and the helper tightens a fresh clone's 0644 → 0600 (also `bin/deploy.sh`, `bin/gemshell-dev.sh`) |
 
 ## The Mac cycle, end to end
@@ -185,9 +186,41 @@ key is a warning: neither is needed for a `boot` flash).
   log in and flash with no provisioning (`bin/lib/host.sh` tightens a
   fresh clone's 0644 to 0600 automatically; `keys/README.md` has the
   rationale and the accepted security trade).
-- **`sudo -v` once per shell** is still needed: macOS `sudo` timestamps
-  are per-tty, and the first gadget-drop of a cycle has to re-apply
-  `10.15.19.1` (the scripts print a hint when they cannot).
+- **Passwordless host link (macOS):** a root **LaunchDaemon** keeps
+  `10.15.19.1/24` on the gadget interface, so no `sudo -v` / admin prompt
+  is needed for the link any more (2026-09-26). See "Passwordless USB-NIC
+  link" below. On Linux the existing `sudo -n` path still applies.
+
+### Passwordless USB-NIC link (macOS LaunchDaemon, 2026-09-26)
+
+The host end of the link (`10.15.19.1/24`) must be re-applied after
+**every** device power cycle — the gadget interface (and its address)
+disappears on power-off (golden rule). `ifconfig` needs root and macOS
+`sudo` timestamps are per-tty, so doing it from scripts/agents meant an
+admin prompt each time the address was lost. Fixed for good by a root
+**LaunchDaemon** that polls for the gadget MAC and assigns the address
+within `GEMINI_USB_NIC_INTERVAL` (default 5 s):
+
+| | |
+|---|---|
+| Source (repo) | `bin/macos/usb-nic-up.sh`, `bin/macos/com.gemini.usb-nic.plist` |
+| Installer | `bin/macos/install-usb-nic-daemon.sh` (`install` / `uninstall` / `status` / `selftest`; `GEMINI_SELFTEST=1 install` proves the auto-(re)assign) |
+| Installed | `/usr/local/libexec/gemini-usb-nic.sh`, `/Library/LaunchDaemons/com.gemini.usb-nic.plist`, log `/var/log/gemini-usb-nic.log` |
+| Label | `com.gemini.usb-nic` — `launchctl print system/com.gemini.usb-nic` |
+
+One-time install (the last admin prompt; `sudo`, or with no terminal
+`osascript -e 'do shell script "GEMINI_SELFTEST=1 bash <abs>/bin/macos/install-usb-nic-daemon.sh install" with administrator privileges'`):
+
+```sh
+sudo bash bin/macos/install-usb-nic-daemon.sh install
+```
+
+After that the daemon re-applies `10.15.19.1` whenever the device boots
+or the cable is replugged, so `device-ssh.sh` / `flash-nixos.sh` never
+hit the link-down/`sudo` path. Interface discovery is by MAC
+(`42:00:15:19:82:`) — the same rule as `bin/lib/host.sh` — so it survives
+USB-port renumbering. macOS-only; on Linux `sudo -n` already covers the
+link.
 
 ### The SSH identity lives in the repo — and is the host key too
 
@@ -278,21 +311,43 @@ because `usb0` is this unit's only network debug path:
   functions stay in the config, so a configfs gadget remains a small,
   additive follow-up.
 
-## Verification (owed — needs the boot.img above flashed)
+## Verification — done on glass 2026-09-26 (macOS, no Linux host)
 
-On glass, after flashing the new `boot.img`:
+The CDC-ECM `boot.img` was flashed and booted from the MacBook
+(`bash bin/build.sh start bootimg` → `bash bin/flash-nixos.sh boot` →
+`boot-nixos`); full narrative + hashes in `docs/session-log.md`. Against
+the list this doc originally carried:
 
-1. `lsusb | grep 0525` on the Linux host → must show **`0525:a4a1`**
-   (ECM). `0525:a4a2` = the old RNDIS gadget (image not updated);
-   `049f:505a` = the CDC-Subset fallback (ECM rejected — then revisit).
-2. `bash bin/net-up.sh` → `OK: 10.15.19.82 reachable`, and
-   `bash bin/device-ssh.sh 'uname -a'` works with no name hardcoding.
-3. macOS: `ifconfig -a | grep -A3 'ether 42:00:15:19:82'` shows the
-   interface, then `bash bin/device-ssh.sh 'uname -a'` (after `sudo -v`).
-4. `bash bin/device-reboot.sh` → link drops, device comes back with a new
-   `boot_id`.
-5. `dmesg` on the device: `g_ether` probe messages, and on the host
-   `dmesg | grep cdc_ether` (Linux) — no RNDIS mentions.
+1. USB id → ✅ macOS `ioreg -p IOUSB`: `idVendor=0x0525`,
+   `idProduct=0xA4A1` ("Linux 6.6.0 with mtu3") = **`0525:a4a1`**. No
+   `a4a2`, no `049f:505a`.
+2. net-up + ssh → ✅ interface `en12` (host MAC `42:00:15:19:82:00`) took
+   `10.15.19.1/24`; `10.15.19.82` pinged and answered ssh. ⚠️ the
+   canonical root/repo-key ssh is subject to the **rootfs-generation
+   caveat** below.
+3. macOS `ifconfig` interface → ✅ as above; `bin/device-ssh.sh` works
+   once the rootfs carries `keys/gemini_ed25519` (caveat below).
+4. `device-reboot.sh` cycle → ✅ link dropped on reboot, `en12` returned
+   with no address, re-adding `10.15.19.1/24` recovered it; new `boot_id`
+   `f9bb2f93…` (was `34774926…`). The reboot was issued via a `cjdell`
+   login; the script's root path has the same key caveat.
+5. device `dmesg` → ✅ `cdc_ether` registered, `g_ether gadget.0: HOST MAC
+   42:00:15:19:82:00 / MAC 42:00:15:19:82:01 / g_ether ready`, `mtu3 …
+   gadget (high-speed) pullup D+`. macOS binds `AppleUSBECM` — the link
+   works with no RNDIS kext.
+
+### ⚠️ Rootfs-generation caveat (2026-09-26)
+
+The device was running **gen 54 (2026-09-11)**, i.e. *before* the repo-key
+commit `1020d4e`. Its root account still trusts only the transitional
+**legacy workstation key** (private half not in this repo), so
+`bin/device-ssh.sh` / `device-reboot.sh` / `flash-nixos.sh`'s
+converge-over-ssh hop **fail on the current rootfs** with
+`Permission denied (publickey…)` — a key-generation gap, not a CDC-ECM
+problem. Flashing from **TWRP/Android needs no ssh**, which is how the
+2026-09-26 cycle ran. Fix = redeploy/reflash a generation ≥ `1020d4e`
+(`cjdell` + passcode `0000` with passwordless sudo is the interim
+on-device path that verification used).
 
 The kernel change touches **no display code** (golden rule 5 is not
 involved), but it *is* a boot.img, so the usual flash safety applies:

@@ -5,6 +5,126 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-26 (c) — passwordless mac USB link: root LaunchDaemon re-applies 10.15.19.1 automatically
+
+Follow-up to (b): the user was prompted for their Mac admin password twice
+during that cycle (once per link-drop, via `osascript … with administrator
+privileges` around the `ifconfig`). Ask: make the flow user-less.
+
+**Cause.** The host end of the link loses `10.15.19.1/24` on every device
+power cycle (golden rule); `ifconfig` needs root, and macOS `sudo`
+timestamps are per-tty — so scripts/agents cannot re-apply it unattended.
+
+**Fix — macOS-only root LaunchDaemon (rule 6, committed):**
+- `bin/macos/usb-nic-up.sh` — polls for the gadget MAC
+  (`42:00:15:19:82:`) and assigns `10.15.19.1/24` when it is missing;
+  `--once` for a single pass.
+- `bin/macos/com.gemini.usb-nic.plist` — `RunAtLoad` + `KeepAlive`, log
+  `/var/log/gemini-usb-nic.log`.
+- `bin/macos/install-usb-nic-daemon.sh` — install / uninstall / status /
+  selftest; installs to `/usr/local/libexec/gemini-usb-nic.sh` +
+  `/Library/LaunchDaemons/com.gemini.usb-nic.plist`.
+
+Installed on this Mac with **one** admin prompt (`osascript … install`
+with `GEMINI_SELFTEST=1`): the selftest deleted `10.15.19.1` and the
+daemon restored it within the 5 s poll window. Receipts:
+`launchctl print system/com.gemini.usb-nic` → `state = running`;
+`/var/log/gemini-usb-nic.log` → `assigned 10.15.19.1/255.255.255.0 to
+en12`; ping OK. From now the link comes up across device reboots/replugs
+with no password. Linux unaffected (`sudo -n` already covers it).
+
+Docs: `docs/usb-network.md` new §"Passwordless USB-NIC link" + the
+`sudo -v` notes rewritten; `docs/macos-build.md`; `AGENTS.md` cheat-sheet
+note + rule-6 host line.
+
+## 2026-09-26 (b) — first kernel build + flash + verify from the MacBook: CDC-ECM proven on glass, no Linux host involved
+
+Ask: *"try a kernel build/deploy/verify from this macbook now that we've
+implemented USB ethernet compatibility. device is currently in twrp."*
+
+Outcome: ✅ the whole macOS cycle ran end to end for a **boot.img** (the
+kernel + minimal initrd), and the CDC-ECM USB NIC is now **verified on
+glass from macOS**: build → TWRP flash over adb → boot → link up → reboot
+cycle. No Linux host involved; nothing on the Linux side touched.
+
+**Build (macOS → Apple `container` aarch64 NixOS VM).**
+`bash bin/build.sh start bootimg` (host rev
+`f542127b90d055f1db4afb43e459533706aa6e45`), egress **DIRECT** (no
+Tailscale proxy needed this time), rc 0. It reproduced the CDC-ECM image
+**byte-for-byte**:
+`/nix/store/0h3hkydixy98r6vchianjib1nmrg8m59-mobile-nixos_planet-geminipda_boot.img`,
+9,984,000 B, sha256
+`2e8f43adccc3738eef36927bf9fe2618b4755d559efe09c7c94d9eca7f06d26e` —
+identical to the 2026-09-17 build (the kernel code is unchanged since
+`96f24b5`), so this rebuild proves reproducibility rather than adding a
+new hash.
+
+**Bug found + fixed (rule 6).** `bin/boot-switch.sh`'s `backup_para()`
+ran `adb pull … stock-dump/para.bin` **without creating `stock-dump/`**,
+so on a clone that has never flashed (this Mac) the first flash aborted
+with `adb: error: cannot create file/directory '…/stock-dump/para.bin'`.
+Added `mkdir -p "$(dirname "$PARA_BACKUP")"` (the boot-backup path already
+had its own `mkdir -p`). No device writes had happened at that point.
+
+**Flash (Mac, TWRP already up → adb only).** `bash bin/flash-nixos.sh boot`:
+`preflight` first (all ok: artifact+ledger match,
+`bootopt=64S3,32N2,64N2`, `fbcon=rotate:3`), then
+- backed up `para` → `stock-dump/para.bin`,
+- backed up current `boot` → `stock-dump/boot-20260926-175629.img` (16 MiB),
+- pushed 9,984,000 B → p22 `boot` (`dd`, 9+1 records). rc 0, stayed in TWRP.
+
+**Boot + link (macOS, CDC-ECM proven).** `bash bin/flash-nixos.sh
+boot-nixos` (para cleared + reboot). macOS enumerated the gadget with **no
+RNDIS**: `ioreg -p IOUSB` → `idVendor=0x0525 (1317)`,
+`idProduct=0xA4A1 (42145)` ("Linux 6.6.0 with mtu3") — i.e.
+**`0525:a4a1`, the CDC-ECM gadget** (the pre-change RNDIS id was
+`0525:a4a2`). Interface `en12` came up carrying the host MAC
+`42:00:15:19:82:00`, took `10.15.19.1/24` (root — macOS `ifconfig`), and
+`10.15.19.82` answered ping AND ssh. On-device `dmesg`: `cdc_ether`
+registered, `g_ether gadget.0: HOST MAC 42:00:15:19:82:00 / MAC
+42:00:15:19:82:01 / g_ether ready`, `mtu3 … gadget (high-speed) pullup
+D+`; `/proc/cmdline` carries the `g_ether.*` params and `fbcon=rotate:3`
+(rule-5 build, display untouched). Kernel `6.6.0 #1-mobile-nixos`.
+
+**Reboot cycle (golden rule).** `sudo systemctl reboot` (via a `cjdell`
+login — see below) dropped the link; `en12` came back with **no address**
+(as documented), re-applying `10.15.19.1/24` + ping recovered in <5 s. New
+`boot_id` `f9bb2f93-f4f1-4d34-b3f2-419e7899e1fb` vs
+`34774926-a8be-4c51-b1a1-0dab221ba6ae` before; product id still
+`0x0525:0xa4a1`.
+
+**⚠️ Gap surfaced: the running rootfs predates the repo-key commit.** The
+device runs **gen 54 (2026-09-11)**; its
+`/etc/ssh/authorized_keys.d/root` holds exactly one key — the **legacy
+Linux-workstation key** whose private half is *not* in this repo (the
+transitional key kept deliberately by `1020d4e`). So the canonical host
+scripts that ssh as **root with `keys/gemini_ed25519`** —
+`device-ssh.sh` / `device-reboot.sh`, and `flash-nixos.sh`'s
+converge-to-TWRP-from-a-running-Linux hop — **cannot log in until the
+device is redeployed/reflashed with a generation ≥ `1020d4e`**.
+- `root` is `prohibit-password` → no password fallback.
+- `cjdell` accepts the documented passcode (`0000`) and is in `wheel`
+  with passwordless sudo, so the on-device verification above went through
+  `cjdell` + an askpass script; `bin/device-ssh.sh` stays root-only.
+- Flashing **from TWRP/Android needs no ssh at all**, so the Mac cycle is
+  fully usable whenever the device is already in recovery (as here).
+
+**Version lines (rule 0).** kernel built in-repo, `linux 6.6.0`; boot.img
+sha256 `2e8f43ad…` (store `0h3hkydi…`); boot backup
+`stock-dump/boot-20260926-175629.img`; device left booted into NixOS
+(gen 54) on the new boot.img, para cleared, USB CDC-ECM link up on the
+Mac.
+
+**Repo changes:** `bin/boot-switch.sh` mkdir fix; this log;
+`docs/usb-network.md` status → flashed/verified + the key gap;
+`docs/macos-build.md` "Owed" → the mac flash cycle is exercised. Nothing
+committed.
+
+Next: bring the device rootfs to a generation ≥ `1020d4e` (a `toplevel`
+deploy or rootfs reflash) so the root-key ssh paths — and the
+from-running-Linux converge hop — work from the Mac; then drop the
+transitional legacy key from `config/gemini.nix`.
+
 ## 2026-09-26 — G1 recorded: chronic battery depletion, and doubt that the unit ever truly powers off
 
 Ask: *"note in the project a long standing goal. this device is suffering

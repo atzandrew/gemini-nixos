@@ -1,11 +1,14 @@
 # Building this repo's images on a Mac (no Linux machine involved)
 
-Last updated: 2026-09-17
+Last updated: 2026-09-26
 
 Status: ✅ **WORKS** — on 2026-09-17 a complete, flash-ready `boot.img`
 was built **entirely from an M5 Mac** (macOS 26.6.2, 10 CPU / 32 GiB),
-verified against the boot contract below. **Nothing was flashed**; this
-doc is about the build path only.
+verified against the boot contract below. **On 2026-09-26 that same image
+was built, flashed and booted from the Mac too** (device in TWRP → adb
+flash → CDC-ECM link + reboot cycle verified, no Linux host) — see
+"Owed / next" and `docs/session-log.md`. The build-path receipts below
+are the 2026-09-17 ones.
 
 Entry point: `bash bin/build.sh start bootimg` (it detects the platform
 and picks this path on a Mac). `docs/building.md` is the map for humans
@@ -216,9 +219,11 @@ verification list and the rollback: **`docs/usb-network.md`**.
 So, from a Mac now:
 
 - ✅ **build** the images in the aarch64 VM (`bash bin/build.sh`) — above;
-- ✅ **USB link + ssh** — `bash bin/device-ssh.sh '<cmd>'` (run `sudo -v`
-  once per shell: macOS sudo timestamps are per-tty, and the first
-  gadget-drop of a cycle has to re-apply `10.15.19.1`);
+- ✅ **USB link + ssh** — `bash bin/device-ssh.sh '<cmd>'`. The link is
+  **passwordless** since 2026-09-26: a root LaunchDaemon
+  (`bin/macos/install-usb-nic-daemon.sh`, one-time install) re-applies
+  `10.15.19.1` whenever the gadget re-enumerates, so no `sudo -v` is
+  needed — see docs/usb-network.md §"Passwordless USB-NIC link";
 - ✅ **reboot** — `bash bin/device-reboot.sh` (WDT EXRST; link drop and
   boot_id change are judged by ping/ssh now, not `lsusb`);
 - ✅ **flash** — `bash bin/flash-nixos.sh status|boot|rootfs|boot-nixos`
@@ -254,14 +259,18 @@ watch, since the VM's disk image lives on it.
 
 ## Owed / next
 
-- **Nothing has been flashed from the Mac** — deliberately (rule 5: a
-  flash needs the TWRP/para safety cycle). Both boot images built here
-  (2026-09-17) are verified but undeployed; the CDC-ECM one is the image
-  `bin/flash-nixos.sh boot` would write once the flash cycle is exercised.
-- A `rootfs`/`toplevel` build from the Mac (`bash bin/build.sh start rootfs`).
-- **Exercise the mac flash workflow on glass** — the scripts now support
-  it (`bin/lib/host.sh`, docs/usb-network.md); what is untested is the
-  real cycle: `bin/build.sh` → `bin/flash-nixos.sh boot` → `boot-nixos`
-  → `bin/device-reboot.sh`.
+- ✅ **The mac flash cycle was exercised on glass on 2026-09-26** (no
+  Linux host): `bash bin/build.sh start bootimg` → `bash bin/flash-nixos.sh
+  preflight` → `boot` (device already in TWRP, so adb-only — no ssh hop) →
+  `boot-nixos` → link verified (`0525:a4a1`, ping + ssh) → reboot cycle.
+  Receipts: `docs/session-log.md` 2026-09-26 (b), `docs/usb-network.md`.
+- ⚠️ **Rootfs-generation caveat found that day:** the device ran gen 54
+  (before the repo-key commit `1020d4e`), so the **root/repo-key ssh**
+  paths (`device-ssh.sh`, `device-reboot.sh`, `flash-nixos.sh`'s
+  converge-over-ssh hop) cannot log in yet. TWRP/adb flashes are
+  unaffected. Fix = redeploy/reflash a generation ≥ `1020d4e`.
+- A `rootfs`/`toplevel` build from the Mac (`bash bin/build.sh start
+  rootfs`) — still owed, and the natural way to close the caveat above
+  once the mac deploy/copy path is wired.
 - **Owed verification on the device side:** the CDC-ECM enumeration
-  (`0525:a4a1`) — the list in docs/usb-network.md.
+  (`0525:a4a1`) is now ✅ (above).

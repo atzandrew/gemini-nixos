@@ -181,6 +181,7 @@ ensure_twrp() {
 backup_para() {
   if [ ! -f "$PARA_BACKUP" ]; then
     echo ">> backing up para -> $PARA_BACKUP (first write this session)"
+    mkdir -p "$(dirname "$PARA_BACKUP")"
     adb_sh "dd if=$P/para of=/tmp/para.bin bs=512 count=1 conv=fsync" >/dev/null
     adb_q pull /tmp/para.bin "$PARA_BACKUP" >/dev/null
   fi
