@@ -5,6 +5,59 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-26 (e) — gemshell wedge ROOT CAUSE + FIX: the compositor never sent `wl_buffer.release` (wl_shm clients leaked >900 MB/app → RAM exhaustion)
+
+Ask: gemshell was "fine for a few minutes then suddenly extremely
+slow", then "locked up again after a few interactions". Signature on
+glass: **kernel alive (ping 0.25 ms) but userspace dead** (sshd banner
+timeout) — the known hard-wedge shape (2026-09-09), reproduced under
+gemshell while GNOME stayed stable.
+
+**Diagnosis (read-only, over the interim password hop — the gen-54
+rootfs predates the repo key).**
+- The frozen boot's journal (`journalctl -b -1`; journald is
+  persistent) ends with a kernel `Purging N bytes` storm from
+  **panfrost.ko** (`pr_info_ratelimited` in `panfrost_gem_shrinker_scan`,
+  v6.6 `panfrost_gem_shrinker.c` — verified by `strings` on the module),
+  i.e. heavy memory reclaim, then silence. No OOM, panic, RCU stall or
+  GPU fault was logged (`CONFIG_DETECT_HUNG_TASK`/`SOFTLOCKUP` are OFF;
+  `/sys/fs/pstore` — ramoops IS wired — was empty: the freeze emitted
+  nothing).
+- Instrumented the live box: `gnome-calculator` launched under gemshell
+  grew **384 KB → 920 MB RSS in ~27 s**, with `Shmem:` (its wl_shm
+  pools) 37 MB → 843 MB. A few apps/interactions exhaust the 3.7 GB
+  RAM; with **no swap** the reclaim thrashes → userspace starves → wedge.
+
+**Root cause.** The compositor never sent `wl_buffer.release` — the
+`Dispatch<WlBuffer>` impl was empty and `SurfaceInner` did not even keep
+the buffer resource. A compositor MUST release a wl_buffer once it is
+done reading it, so a wl_shm client may recycle it. Without it GTK4
+allocates a fresh shm pool every frame → unbounded growth. (The legacy
+gemwl compositor got this from wlroots; the hand-rolled wl_shm path in
+gemshell regressed it.)
+
+**Fix.** Keep the attached `wl_buffer` in
+`SurfaceInner.pending_buffer_wl` and call `release()` from
+`surface_commit` as soon as `window_texture()` has copied the pixels
+into a GL texture (nothing reads the buffer afterwards). Also release on
+the no-window/early-return paths so the client is never left holding it.
+
+**Verified on glass** (`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0`,
+built via the macOS container, shipped with `nix-store --import`, run
+transiently as `gemshell-dev.service` with the installed unit's env):
+the same `gnome-calculator` now plateaus at **~107 MB RSS** and
+`Shmem:` ~75 MB (flat), `MemAvailable` steady ~3.28 GB. ✅
+
+**Device left:** `gemshell-dev.service` (fixed binary) active,
+`gemini-gemshell.service` stopped; a GC root pins the new path
+(`/nix/var/nix/gcroots/gemshell-fix`). ⚠️ A reboot falls back to the
+installed (unfixed) binary — deploy the fix (toplevel build +
+`bin/deploy.sh`, or a reflash) to make it permanent. Nothing flashed;
+`para` untouched.
+
+Source: `pkgs/gemshell/src/compositor/wayland.rs`,
+`pkgs/gemshell/src/compositor/mod.rs`; docs/gemshell.md "2026-09-26 (e)".
+
 ## 2026-09-26 (d) — gemshell on glass: WAYLAND-APP TOUCH FIXED (buffer-scale input transform); app-hosting issues logged
 
 Ask: *"bring gemshell up on the device so I can remind myself of the

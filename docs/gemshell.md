@@ -178,6 +178,37 @@ buffer→surface transform.
 `MESA-EGL: failed to get driver name for fd -1` /
 `failed to create dri2 screen`.
 
+### 2026-09-26 (e) — wl_shm buffer leak FIXED (`wl_buffer.release`) — the freeze root cause
+
+**Symptom (on glass):** gemshell was "fine for a few minutes then
+suddenly extremely slow", then **locked up**; ping still answered
+(kernel alive) but sshd could not even send a banner (userspace dead).
+GNOME was stable under the same loads.
+
+**Root cause: the compositor never sent `wl_buffer.release`.** The
+`Dispatch<WlBuffer, BufferData, Compositor>` impl was empty and
+`SurfaceInner` did not keep the buffer resource. A compositor MUST
+release a wl_buffer when it is done reading it, so a wl_shm client may
+recycle it. Without the release, GTK4 can never reuse a buffer and
+**allocates a fresh shm pool every frame**. Receipt on glass:
+`gnome-calculator` grew **384 KB → 920 MB RSS in ~27 s** (`Shmem:`
+37 MB → 843 MB). A few apps exhaust the 3.7 GB RAM; with no swap the
+kernel enters reclaim thrash (visible as the panfrost shrinker's
+`Purging N bytes`, `panfrost_gem_shrinker_scan`) and userspace starves
+— the hard-wedge signature. GNOME is unaffected because wlroots/GTK
+release correctly there.
+
+**Fix:** `SurfaceInner.pending_buffer_wl` now stores the attached
+`wl_buffer`; `surface_commit` calls `release()` immediately after
+`window_texture()` has copied the pixels into a GL texture (nothing
+reads the buffer afterwards), including on the no-window/early-return
+paths.
+
+**Verified on glass:** the same calculator now plateaus at **~107 MB
+RSS**, `Shmem:` ~75 MB flat (`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0`).
+Run transiently (`gemshell-dev.service`); a reboot needs the fix
+deployed (toplevel build + `bin/deploy.sh`, or a reflash).
+
 ### Variable UI scale
 
 Settings > Display offers **100% / 150% / 200%**. Design:

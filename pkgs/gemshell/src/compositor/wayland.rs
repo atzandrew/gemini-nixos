@@ -94,6 +94,14 @@ pub struct SurfaceInner {
     /// is created)
     pub window: Option<u32>,
     pub pending_buffer: Option<Arc<BufferData>>,
+    /// The `wl_buffer` resource attached for the next commit, kept so the
+    /// compositor can send `wl_buffer.release` once its pixels have been
+    /// copied into a GL texture. A compositor MUST release a buffer when
+    /// done with it; without this, wl_shm clients (GTK4) can never recycle
+    /// a buffer and allocate a brand-new shm pool every frame — a single
+    /// `gnome-calculator` grew to 920 MB RSS in ~27 s on glass, exhausting
+    /// RAM (the "Purging …" panfrost reclaim storm + freeze, 2026-09-26).
+    pub pending_buffer_wl: Option<WlBuffer>,
     /// true if the client attached/damaged since the last commit
     pub damaged: bool,
     /// frame callbacks waiting for the next present
@@ -541,6 +549,10 @@ impl Dispatch<WlSurface, SurfaceData, Compositor> for Compositor {
             }
             WlSurfaceRequest::Attach { buffer, x: _, y: _ } => {
                 let mut inner = data.inner.lock().unwrap();
+                // Keep the resource too, so `surface_commit` can hand it
+                // back to the client (`wl_buffer.release`) once the pixels
+                // are consumed (2026-09-26).
+                inner.pending_buffer_wl = buffer.clone();
                 inner.pending_buffer =
                     buffer.and_then(|b| b.data::<BufferData>().cloned().map(std::sync::Arc::new));
                 inner.damaged = true;

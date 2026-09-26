@@ -104,6 +104,19 @@ gaps:** no session D-Bus for clients, client EGL `dri2 screen` failures.
 Receipts: `docs/gemshell.md` §"2026-09-26" + `docs/session-log.md`
 2026-09-26 (d).
 
+**2026-09-26 (e): gemshell FREEZE fixed — the compositor never sent
+`wl_buffer.release`.** GTK4/wl_shm clients could not recycle buffers and
+allocated a fresh shm pool every frame: one `gnome-calculator` reached
+**920 MB RSS in ~27 s** (verified on glass), so a few apps exhausted RAM
+and the no-swap reclaim thrash wedged userspace (kernel still pinged).
+Now the attached `wl_buffer` is kept on the surface and released from
+`surface_commit` right after the pixels are copied into a GL texture;
+the same calculator plateaus at ~107 MB. Verified on glass with
+`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0` run transiently; a
+reboot still falls back to the installed binary until the fix is
+deployed/reflashed. Receipts: `docs/gemshell.md` §"2026-09-26 (e)" +
+`docs/session-log.md` 2026-09-26 (e).
+
 ⚠️ **Boot.img cmdline field: KEEP `bootopt=64S3,32N2,64N2` in it** — LK
 consumes it via `platform_parse_bootopt`; without it the boot hangs on
 the LK logo (~15 s WDT loop) before any kernel output (discovered

@@ -2389,20 +2389,44 @@ impl Compositor {
         let Some(data) = surface.data::<SurfaceData>() else {
             return;
         };
-        let (buf, win, scale) = {
-            let inner = data.inner.lock().unwrap();
-            (inner.pending_buffer.clone(), inner.window, inner.buffer_scale.max(1))
+        let (buf, win, scale, wl_buf) = {
+            let mut inner = data.inner.lock().unwrap();
+            (
+                inner.pending_buffer.clone(),
+                inner.window,
+                inner.buffer_scale.max(1),
+                inner.pending_buffer_wl.take(),
+            )
         };
+        // Hand the wl_buffer back to the client as soon as the compositor
+        // is done with its pixels. The pixels are copied into a GL texture
+        // synchronously in `window_texture` below, and nothing reads the
+        // buffer afterwards, so it can be released on the spot. Without
+        // this, wl_shm clients (GTK4) never learn a buffer is free and
+        // allocate a new shm pool every frame — a >900 MB leak per app in
+        // under a minute (found on glass 2026-09-26; the RAM exhaustion
+        // then wedges the box via the panfrost shrinker + no swap).
         let Some(buf) = buf else {
+            if let Some(wl) = wl_buf {
+                let _ = wl.release();
+            }
             return;
         };
         let Some(win) = win else {
+            // Not a toplevel/popup yet: nothing consumes the pixels, but
+            // the client must still get the buffer back.
+            if let Some(wl) = wl_buf {
+                let _ = wl.release();
+            }
             return;
         };
         let map: &[u8] = &buf.map[..];
         let tex = self
             .renderer
             .window_texture(win, buf.w, buf.h, buf.stride, buf.format, map);
+        if let Some(wl) = wl_buf {
+            let _ = wl.release();
+        }
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
             w.buffer = Some(buf.clone());
             // Input coords are surface-local (buffer px / buffer scale),
