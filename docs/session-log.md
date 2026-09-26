@@ -47,6 +47,10 @@ built via the macOS container, shipped with `nix-store --import`, run
 transiently as `gemshell-dev.service` with the installed unit's env):
 the same `gnome-calculator` now plateaus at **~107 MB RSS** and
 `Shmem:` ~75 MB (flat), `MemAvailable` steady ~3.28 GB. ✅
+**User-confirmed under sustained use** (7 clients open, heavy app
+interaction): `Shmem:` ~200 MB, gemshell RSS ~175 MB, `MemAvailable`
+~3.0 GB — flat over minutes (a host-side sampler; before the fix a single
+app reached 843 MB shmem).
 
 **Device left:** `gemshell-dev.service` (fixed binary) active,
 `gemini-gemshell.service` stopped; a GC root pins the new path

@@ -205,9 +205,11 @@ reads the buffer afterwards), including on the no-window/early-return
 paths.
 
 **Verified on glass:** the same calculator now plateaus at **~107 MB
-RSS**, `Shmem:` ~75 MB flat (`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0`).
-Run transiently (`gemshell-dev.service`); a reboot needs the fix
-deployed (toplevel build + `bin/deploy.sh`, or a reflash).
+RSS**, `Shmem:` ~75 MB flat (`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0`);
+user-confirmed under sustained use (7 clients: `Shmem:` ~200 MB,
+gemshell ~175 MB, `MemAvailable` ~3.0 GB — flat). Run transiently
+(`gemshell-dev.service`); a reboot needs the fix deployed (toplevel
+build + `bin/deploy.sh`, or a reflash).
 
 ### Variable UI scale
 

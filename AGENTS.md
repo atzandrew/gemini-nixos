@@ -112,9 +112,11 @@ and the no-swap reclaim thrash wedged userspace (kernel still pinged).
 Now the attached `wl_buffer` is kept on the surface and released from
 `surface_commit` right after the pixels are copied into a GL texture;
 the same calculator plateaus at ~107 MB. Verified on glass with
-`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0` run transiently; a
-reboot still falls back to the installed binary until the fix is
-deployed/reflashed. Receipts: `docs/gemshell.md` §"2026-09-26 (e)" +
+`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0` run transiently
+(user-confirmed under sustained multi-app use: 7 clients, `Shmem:` ~200 MB,
+gemshell ~175 MB, all flat); a reboot still falls back to the installed
+binary until the fix is deployed/reflashed. Receipts:
+`docs/gemshell.md` §"2026-09-26 (e)" +
 `docs/session-log.md` 2026-09-26 (e).
 
 ⚠️ **Boot.img cmdline field: KEEP `bootopt=64S3,32N2,64N2` in it** — LK
