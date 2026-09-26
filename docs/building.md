@@ -67,13 +67,21 @@ Linux host uses, and the host scripts take a darwin branch through
 a Mac: preloader/BROM recovery (`bin/run-mtk.sh` — no USB passthrough
 into Apple's container) and `bin/repartition-nixos.sh`.
 
+**Deploy (not flash) from a Mac:** `bash bin/macos/deploy.sh`
+(`status`/`deploy`/`rollback`) builds `toplevel` in the container VM,
+then has the VM `nix copy` the closure delta to the device and switch
+the system profile — no reflash, old generations stay for rollback.
+First used 2026-09-26 to deploy the gemshell fix as device gen 55
+(`docs/macos-build.md` §"Deploy to the device"). On Linux the same job is
+`bin/deploy.sh`.
+
 ## How the separation is organised
 
 | Piece | Scope |
 |---|---|
 | `bin/build.sh` | **cross-platform dispatcher** — the only thing a caller/agent needs to know |
 | `bin/build-linux.sh` | Linux implementation (wraps `nix build` + `bin/run-job.sh`; `toplevel` → `bin/deploy.sh`) |
-| `bin/macos/` | **everything macOS-specific**: `build.sh` (host driver), `vm-build.sh` (in-VM builder), `proxy.py` (the VM's egress) |
+| `bin/macos/` | **everything macOS-specific**: `build.sh` (host driver), `vm-build.sh` (in-VM builder), `deploy.sh` (ship a built toplevel + switch generations), `proxy.py` (the VM's egress) |
 | `flake-macos.nix` | **darwin-only flake outputs** (the devshell a Mac uses, the CA bundle its VM mounts), merged into `outputs` by `mergeOutputs`. The Linux outputs in `flake.nix` are not touched by it. |
 | `docs/building.md` (this file) | the decision map |
 | `docs/macos-build.md` | the macOS receipts, gotchas, and what a Mac still cannot do |

@@ -52,12 +52,20 @@ interaction): `Shmem:` ~200 MB, gemshell RSS ~175 MB, `MemAvailable`
 ~3.0 GB — flat over minutes (a host-side sampler; before the fix a single
 app reached 843 MB shmem).
 
-**Device left:** `gemshell-dev.service` (fixed binary) active,
-`gemini-gemshell.service` stopped; a GC root pins the new path
-(`/nix/var/nix/gcroots/gemshell-fix`). ⚠️ A reboot falls back to the
-installed (unfixed) binary — deploy the fix (toplevel build +
-`bin/deploy.sh`, or a reflash) to make it permanent. Nothing flashed;
-`para` untouched.
+**Deployed properly (Mac → device, no Linux host).** `bash bin/build.sh
+start toplevel` built
+`33dr0yrpy9f3brjpjq6hbb6l2wc3hsyz-nixos-system-gemini-26.11pre-git` (its
+closure carries `wasa7…-gemshell`); `nix copy` from the build VM shipped
+the 22 s delta and `switch-to-configuration switch` activated it →
+**generation 55**. That Mac-side flow is committed as
+**`bin/macos/deploy.sh`** (`status`/`deploy`/`rollback`) — the macOS
+counterpart of `bin/deploy.sh`. The device's root now accepts the repo
+key, so `bin/device-ssh.sh` works directly (the gen-54 rootfs caveat is
+gone).
+
+**Device left:** gen 55 current, `gemini-gemshell.service` active on the
+fixed binary, `para` clear. Nothing flashed. (A transient
+`gemshell-dev.service` run + a GC root were used during bring-up.)
 
 Source: `pkgs/gemshell/src/compositor/wayland.rs`,
 `pkgs/gemshell/src/compositor/mod.rs`; docs/gemshell.md "2026-09-26 (e)".

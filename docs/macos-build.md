@@ -100,6 +100,7 @@ point is `bin/build.sh` and the Linux half is `bin/build-linux.sh`.
 | `bin/build.sh` | either | the dispatcher — platform detection + the one verb surface (`docs/building.md`) |
 | `bin/macos/build.sh` | the Mac | stage the tree, drive the container, `start`/`wait`/`log`/`status`/`net`/`stage`/`shell`/`vm`/`stop` |
 | `bin/macos/vm-build.sh` | inside the VM | the actual native build (`nix build … packages.aarch64-linux.<TARGET>`) + artifact/identity collection |
+| `bin/macos/deploy.sh` | the Mac + VM | ship a built `toplevel` to the device and switch generations — the macOS `bin/deploy.sh` (see "Deploy to the device") |
 | `bin/macos/proxy.py` | the Mac | stdlib CONNECT proxy for the VM's egress (see below) |
 
 ```sh
@@ -110,6 +111,43 @@ bash bin/build.sh status            # container, egress, artifacts, hashes
 
 By hand (below the dispatcher) is also fine, and useful for the mac-only
 verbs: `bash bin/macos/build.sh net|stage|stop|shell|vm`.
+
+### Deploy to the device (no Linux host, no reflash)
+
+`bin/deploy.sh` (the Linux workstation path) needs the host Nix store +
+the Pi builder, so it cannot run on a Mac. **`bin/macos/deploy.sh`** is
+the macOS counterpart. It builds `packages.aarch64-linux.toplevel` in
+the container VM, then has the **VM** `nix copy` the closure delta to
+the device (the VM can reach the device over the USB-NIC network) and
+runs the same profile switch + `switch-to-configuration switch` as
+`deploy.sh`:
+
+```sh
+bash bin/macos/deploy.sh status          # device generations
+bash bin/macos/deploy.sh deploy          # build + ship + switch (rule 8 polling)
+bash bin/macos/deploy.sh deploy PATH     # ship + switch an existing toplevel
+bash bin/macos/deploy.sh rollback [N]    # profile N generations back
+```
+
+Receipts / gotchas (first run 2026-09-26, deployed the `wl_buffer.release`
+fix as device gen 55):
+
+- `nix copy` transfers only the **missing** paths — the delta for a
+  gemshell-only change was ~22 s (a kernel + config + drv change).
+- The VM image has **no `/etc/passwd`**, so `ssh` there dies with "No
+  user exists for uid 0" until a root entry is seeded; the script does
+  this and installs the repo key into the VM (`base64` over
+  `container exec`).
+- The **device's root must accept the repo key** (`keys/gemini_ed25519`);
+  a rootfs that predates commit `1020d4e` does not, and the script
+  errors with the manual recipe. Once a ≥ `1020d4e` generation is
+  deployed, `bin/device-ssh.sh` and later deploys work untouched.
+- The activation is ordinary `switch-to-configuration switch` — no
+  flashing; old generations stay selectable for `rollback`.
+- Provenance gap: the mac build uses `builtins.getFlake "path:$src"`, so
+  `system.configurationRevision` is empty in these generations; use the
+  build manifest (`~/.cache/gemini-macos/out/toplevel.manifest`,
+  `host-revision`) as the rule-0 receipt.
 
 ### What nix-on-darwin does here (flake-macos.nix)
 
@@ -264,13 +302,14 @@ watch, since the VM's disk image lives on it.
   preflight` → `boot` (device already in TWRP, so adb-only — no ssh hop) →
   `boot-nixos` → link verified (`0525:a4a1`, ping + ssh) → reboot cycle.
   Receipts: `docs/session-log.md` 2026-09-26 (b), `docs/usb-network.md`.
-- ⚠️ **Rootfs-generation caveat found that day:** the device ran gen 54
-  (before the repo-key commit `1020d4e`), so the **root/repo-key ssh**
-  paths (`device-ssh.sh`, `device-reboot.sh`, `flash-nixos.sh`'s
-  converge-over-ssh hop) cannot log in yet. TWRP/adb flashes are
-  unaffected. Fix = redeploy/reflash a generation ≥ `1020d4e`.
-- A `rootfs`/`toplevel` build from the Mac (`bash bin/build.sh start
-  rootfs`) — still owed, and the natural way to close the caveat above
-  once the mac deploy/copy path is wired.
+- ✅ **Rootfs-generation caveat CLOSED 2026-09-26 (e):** the device was
+  on gen 54 (before the repo-key commit `1020d4e`), so the root/repo-key
+  ssh paths could not log in. A mac **toplevel** build +
+  `bin/macos/deploy.sh` shipped and activated **generation 55**
+  (2026-09-26, rev `c6702ef`), after which `bin/device-ssh.sh` works
+  directly — the interim password hop (`cjdell`/`0000`) is no longer
+  needed. See `docs/session-log.md` 2026-09-26 (e).
+- A `rootfs` build from the Mac (`bash bin/build.sh start rootfs`) is
+  still owed (the `toplevel` path is now exercised end-to-end).
 - **Owed verification on the device side:** the CDC-ECM enumeration
   (`0525:a4a1`) is now ✅ (above).
