@@ -116,8 +116,8 @@ the same calculator plateaus at ~107 MB. Verified on glass with
 (user-confirmed under sustained multi-app use: 7 clients, `Shmem:` ~200 MB,
 gemshell ~175 MB, all flat). **Deployed as generation 55** via the new
 Mac path `bin/macos/deploy.sh` (container `toplevel` build + `nix copy`
-from the VM + profile switch), so it survives reboots. Receipts:
-`docs/gemshell.md` §"2026-09-26 (e)" +
+from the VM + profile switch), so it survives reboots (reboot-verified).
+Receipts: `docs/gemshell.md` §"2026-09-26 (e)" +
 `docs/session-log.md` 2026-09-26 (e).
 
 ⚠️ **Boot.img cmdline field: KEEP `bootopt=64S3,32N2,64N2` in it** — LK

@@ -209,7 +209,8 @@ RSS**, `Shmem:` ~75 MB flat (`wasa7dasvxm15kihi2xv8m2nznjglk8x-gemshell-0.1.0`);
 user-confirmed under sustained use (7 clients: `Shmem:` ~200 MB,
 gemshell ~175 MB, `MemAvailable` ~3.0 GB — flat). **Deployed as system
 generation 55** via `bin/macos/deploy.sh` (Mac container build +
-`nix copy` + profile switch), so the fix survives reboots.
+`nix copy` + profile switch) and **reboot-verified**, so the fix
+survives reboots.
 
 ### Variable UI scale
 

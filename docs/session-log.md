@@ -63,6 +63,10 @@ counterpart of `bin/deploy.sh`. The device's root now accepts the repo
 key, so `bin/device-ssh.sh` works directly (the gen-54 rootfs caveat is
 gone).
 
+**Persistence proven:** a WDT-EXRST reboot came back with a new
+`boot_id`, `/run/current-system` = the gen-55 toplevel, and
+`gemini-gemshell.service` active on `wasa7…` (2026-09-26).
+
 **Device left:** gen 55 current, `gemini-gemshell.service` active on the
 fixed binary, `para` clear. Nothing flashed. (A transient
 `gemshell-dev.service` run + a GC root were used during bring-up.)
