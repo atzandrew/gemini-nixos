@@ -5,6 +5,78 @@ Hardware/boot ground truth lives in the sibling project
 (`/home/cjdell/Projects/GeminiPDA/docs/session-log.md`) — cross-reference
 when a session touches device behaviour. Latest entry first.
 
+## 2026-09-29 — G1 evidence: an on-USB poweroff is structurally NOT a poweroff (LK's POC trap boots the OS); 100 mA measured draw shows the unit stays alive
+
+Ask: the unit sat on a USB charger for several days after
+`systemctl poweroff` yet still draws **100 mA @ 5 V ≈ 0.5 W**
+continuously; VBAT holds steady at **4.00 V (so not charging)**; the
+compute area is slightly above room temperature. "Shutting down" from
+TWRP just boots Linux. Read-only investigation — the device is not
+enumerating on this host and `10.15.19.82` is unreachable, so all of this
+is source/analysis against this repo plus the legacy tree on
+`zen3-nixos:~/Projects/GeminiPDA`; no device or repo-code action taken.
+
+**Findings.**
+
+1. **The unit is not off.** 0.5 W of load with the screen/USB-radio off is
+   the "limbo" class G1 suspected, not a PMIC-quiescent off.
+2. **On USB, a poweroff cannot be a true off — LK turns it into
+   off-mode charging, which *boots a kernel*.** [source-verified]
+   - our fallback: `mt6797-power.c:138-179` — write `RTC_BBPU = 0x4309`,
+     wait 1 s, then a **mode-0 WDT reset** while a charger holds the rails.
+   - LK `mt_kernel_power_off_charging.c:97` + `boot_mode.c:254`: charger
+     present + `is_force_boot()` false → `KERNEL_POWER_OFF_CHARGING_BOOT`.
+   - `platform.c:801` turns the **display on**; `mt_boot.c:1490` **loads the
+     `boot` image and jumps to the kernel**; `atags.c:921` passes
+     `androidboot.mode=charger`.
+   - our `boot` image is the normal NixOS image, so charger mode = **boot
+     Linux** — exactly the TWRP observation (TWRP poweroff → LK POC →
+     normal boot.img → NixOS).
+   - the vendor is identical: `mt_power_off` (`mtk_rtc_common.c:397`) →
+     `machine_restart("charger")` → `arch_reset("charger")` →
+     `wd_api->wd_sw_reset(0)` (`wd_api.c:583-618`) = mode 0, no bypass.
+   - **no LK path yields "off with a charger":** `off-mode-charge=0` and
+     every `is_force_boot()` flag choose `NORMAL_BOOT`, never off. LK only
+     powers off when no charger is present.
+3. **The 2026-09-10 "poweroff verified" was not evidence of off** — it only
+   saw "USB went silent", which is an orderly shutdown + halted AP. G1
+   already suspected this; the 100 mA draw now confirms it. [corrects
+   `docs/power-states.md` "Implementation status" / §7 step 3.]
+4. **Legacy corroboration** (GeminiPDA `docs/session-log.md`): 2026-08-30
+   documents the POC trap verbatim ("lands ANY boot without a live
+   power-key press + WDT-bypass + rtc 2sec into
+   KERNEL_POWER_OFF_CHARGING_BOOT when a charger is detected"); 2026-09-04
+   records "`shutdown -r now` over ssh on this unit = POWER OFF".
+5. **Not yet explained: VBAT flat at 4.00 V.** The BQ25896 power-path *does*
+   drop charge current to zero when the load eats the input
+   (`docs/hardware.md:855-877`), but IINLIM is the chip default 500 mA (and
+   our kernel reports 500 mA), so a ~100 mA load should leave charge
+   headroom and VBAT should rise. A flat VBAT therefore suggests the
+   charger is *not in a normal charging state* — the known B-19/B-22 "VBUS
+   present but NOT charging" failure mode. Unverified (device not
+   reachable); check REG00/REG03/REG0B/REG12/REG13 with
+   `services/scripts/bq25896-raw.sh`.
+6. **Deltas vs the vendor poweroff path** (candidates, low confidence): our
+   driver omits `hal_rtc_bbpu_pwdn()`'s SRCLKENA-GPIO-low step and 32 K
+   export disable (`mt6351/mtk_rtc_hal.c:180`), and the vendor warm-reset
+   calls `pmic_pre_wdt_reset()` (PMIC sleep-mode buck voltages) before
+   SWRST — ours does not. LK omits them too, so not obviously required.
+
+Two states fit the measurements and are distinguishable: **(A) LK POC /
+charging mode** — display ON (`platform.c:801`), USB → `0e8d:2008`, power
+key boots; **(B) halted-AP limbo** — dark, no USB, power key dead. That
+TWRP's poweroff *does* reach LK (Linux) while ours appears not to hints our
+path lands in (B), i.e. our mode-0 fallback may not reach LK — unproven.
+
+**Next (G1 step 1).** `systemctl poweroff` **on battery, USB data
+detached**, log VBAT ≥ 30 min (flat = off, falling = limbo), and read
+`RTC_BBPU` back after the 0x4309 write (boot readback is `0x000d`; poweroff
+must clear bit 2 — `mt_rtc_hw.h`: `RTC_BBPU_BBPU` "1: power on, 0: power
+down"). Instrument the driver to log whether the mode-0 fallback executes.
+Because a true off on USB is impossible, also make the VBUS-present idle
+state actually charge (item 5), or "off-mode charging" still drains the
+pack. **Full instrumented plan: `docs/power-states.md` §9.**
+
 ## 2026-09-26 (e) — gemshell wedge ROOT CAUSE + FIX: the compositor never sent `wl_buffer.release` (wl_shm clients leaked >900 MB/app → RAM exhaustion)
 
 Ask: gemshell was "fine for a few minutes then suddenly extremely
@@ -3435,6 +3507,9 @@ regenerated. Confirmed the only config delta is `CONFIG_MTK6797_POWER=y`.
 - `systemctl reboot` → new boot_id (`70dd8a9d…` → `dff7d973…`) in ~40 s.
 - `systemctl poweroff` → USB went silent (no preloader/RNDIS, no loop, no
   limbo); the unit is off. Screen state not observed (user may confirm).
+  **[corrected 2026-09-29 — see the 2026-09-29 entry at the top: this was
+  NOT a true off. "USB went silent" also describes a halted AP, and a
+  2026-09-29 measurement found the unit alive (100 mA @ 5 V).]**
 - The pre-existing `dev_addr_check` wlan0 warning in dmesg is unrelated
   (Wi-Fi MAC address, NetworkManager).
 

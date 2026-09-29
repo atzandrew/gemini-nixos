@@ -1,15 +1,26 @@
 # Power states of the Gemini PDA — reboot, poweroff, and the limbo state
 
-**Last updated:** 2026-09-10 (research + implementation session — driver
-built, flashed and verified on glass; see "Implementation status" below)
+**Last updated:** 2026-09-29 (G1 evidence: an on-USB poweroff is
+**not** a true off — LK's POC trap boots the OS; the 2026-09-10
+"poweroff verified" result is corrected below)
 
-Task: `systemctl reboot` leaves the device in a black-screen limbo (PMIC on,
-power key dead, only a 10 s power+side-button hold recovers it) and
-`systemctl poweroff` is impossible. We need a real reboot (without the
-userspace WDT hack) and a real powerdown (battery safety: an off device
-must not keep draining below the safe voltage when USB is disconnected).
+Original task (2026-09-10; **[status corrected 2026-09-29]**): `systemctl
+reboot` left the device in a black-screen limbo (PMIC on, power key dead,
+only a 10 s power+side-button hold recovered it) and `systemctl poweroff`
+was impossible. We needed a real reboot (without the userspace WDT hack)
+and a real powerdown (battery safety: an off device must not keep draining
+below the safe voltage when USB is disconnected).
 
-## TL;DR
+**Status:** **reboot is FIXED** (the delta driver's WDT SWRST restart
+handler; `systemctl reboot` self-boots cleanly — on glass 2026-09-10, §
+"Implementation status"). **poweroff is NOT fixed** — it is still an open
+standing goal (G1): the 2026-09-10 result was not a true off, and a
+2026-09-29 measurement found the unit alive (100 mA @ 5 V) after a
+poweroff. `systemctl poweroff` on battery is unproven; on USB it is
+structurally impossible (LK POC boots the OS). See below and
+`docs/standing-goals.md` G1.
+
+## TL;DR (the 2026-09-10 pre-implementation analysis; see "Status" above for what was actually built)
 
 - The limbo is **arm64 mainline behaviour, not a bug in our config**:
   Linux 6.6 arm64 `machine_restart()` with no registered restart handler
@@ -19,8 +30,10 @@ must not keep draining below the safe voltage when USB is disconnected).
   black screen, no backlight), and the power key is routed to the dead AP —
   hence dead. Only the PMIC's hardware long-press reset (10 s power+side) or
   the WDT EXRST recover it.
-- Poweroff fails earlier: `poweroff(2)` is **refused** (`-EINVAL`) because
-  `kernel_can_power_off()` is false — no poweroff handler exists.
+- Poweroff failed earlier: `poweroff(2)` was **refused** (`-EINVAL`) because
+  `kernel_can_power_off()` was false — no poweroff handler existed. A
+  handler now exists, so the call is accepted; whether it truly cuts the
+  rails is the open G1 question (see "Status" and `docs/standing-goals.md`).
 - Both mechanisms exist and are **fully source-verified** for this exact
   SoC/PMIC, and both are reachable from our kernel:
   - **Reboot** = the TOPRGU/WDT **SWRST external reset** — the exact
@@ -49,10 +62,26 @@ built in-repo, delta byte-verified) and flashed as boot.img sha256
   (timeout=31 sec, nowayout=0)`.
 - `systemctl reboot` → clean self-boot to a new boot_id in ~40 s
   (`70dd8a9d…` → `dff7d973…`). [verified 2026-09-10]
-- `systemctl poweroff` → unit off: the USB gadget disappears with no
-  preloader/gadget-NIC and no loop (no limbo). [verified 2026-09-10;
+- `systemctl poweroff` → the USB gadget disappears with no
+  preloader/gadget-NIC and no loop (no limbo). [observed 2026-09-10;
   that run's NIC enumerated as RNDIS — the gadget is CDC-ECM since
   2026-09-17, docs/usb-network.md]
+  - **⚠️ [corrected 2026-09-29] This was NOT evidence the unit switched
+    off.** "USB went silent" is equally produced by an orderly shutdown
+    followed by a halted AP with its USB transceiver off (the limbo
+    class). A 2026-09-29 measurement on the same class of state found
+    the unit drawing **100 mA @ 5 V ≈ 0.5 W** continuously with VBAT
+    flat at 4.00 V — i.e. **alive, not off**. Worse, with USB attached a
+    true off is *architecturally impossible*: our fallback's mode-0 WDT
+    reset hands over to LK, and LK sends any charger-present boot into
+    `KERNEL_POWER_OFF_CHARGING_BOOT`, which **loads the `boot` image and
+    boots a kernel** (`gemini-lk lk/platform/mt6797/platform.c:801`,
+    `lk/app/mt_boot/mt_boot.c:1490`; the vendor `mt_power_off` →
+    `machine_restart("charger")` → `wd_sw_reset(0)` does the same). On
+    this unit that kernel is NixOS, so "off-mode charging" boots Linux —
+    which is exactly what TWRP's poweroff does. **Only an on-battery
+    measurement can test "off".** Full receipts: docs/session-log.md
+    2026-09-29.
 - The userspace-WDT escape was not needed; the §7 primary paths pass.
 - **Gotcha that cost a boot loop:** the shared TOPRGU block. See the
   [corrected 2026-09-10] note in §5.
@@ -79,10 +108,10 @@ straight through.
 |---|---|---|---|---|
 | Cold boot | PMIC POR (power on, or the 10 s PWRBB reset) | LK initialises | Required long-press to release boot | Normal. |
 | WDT EXRST reboot | TOPRGU SWRST (or WDT expiry) with `AUTO_RESTART` ("bypass power key") | LK re-initialises | Not required — self-boots | What `gemini-wdt-reboot` does; field-verified since 2026-08-31. |
-| **Limbo (current `systemctl reboot`)** | arm64 `machine_restart` with no handler → boot CPU halted in `while(1)` | Dead (no LK) | **Dead** — PMIC still routes key events to the "running" AP | PMIC + panel logic keep drawing ≈1.6 W. Recovery: 10 s PWRBB reset or WDT EXRST. |
+| **Limbo (pre-fix `systemctl reboot`, historical)** | arm64 `machine_restart` with no handler → boot CPU halted in `while(1)` | Dead (no LK) | **Dead** — PMIC still routes key events to the "running" AP | PMIC + panel logic keep drawing ≈1.6 W. Recovery: 10 s PWRBB reset or WDT EXRST. Fixed by the restart handler (2026-09-10). |
 | True poweroff (target) | MT6351 `RTC_BBPU` = `KEY\|AUTO\|PWREN` (PWRBB pulled low) | Off | Works — cold boot | PMIC cuts main rails; RTC/charger/key-scan alive (µA-mA). Vendor "shutdown" = this write. |
 
-## 3. Why the current behaviour is what it is (mainline v6.6, source-verified 2026-09-10)
+## 3. Why that limbo happened (mainline v6.6, source-verified 2026-09-10; fixed for `reboot`, still true for the *unproven* poweroff)
 
 Fetched from the `v6.6` tag (torvalds/linux):
 
@@ -273,13 +302,20 @@ says), and a defined off-mode-charging state on USB.
    driver's probe should first *read* a known RTC register (e.g. the
    RTC second counter `0x401a`) and sanity-check it before any write.
    **[resolved 2026-09-10]** — probe reads `RTC_BBPU` = `0x000d`
-   (reachable), and the BBPU write path shuts the unit down.
+   (reachable). [corrected 2026-09-29] Reachability is proven; that the
+   *write* actually clears `RTC_BBPU_BBPU` bit 2 (power down) is still
+   unverified — see `docs/session-log.md` 2026-09-29.
 3. **Post-BBPU behaviour with USB attached is not verified on this unit.**
    We copy the vendor/LK fallback (WDT reset mode 0 after ~1 s if alive).
    Record actual behaviour in the test. **[resolved 2026-09-10]** —
-   `systemctl poweroff` on USB takes the unit down (USB vanishes, no
-   preloader/RNDIS, no loop); a full off-mode-charging display was not
-   separately confirmed (screen not observed at the time).
+   `systemctl poweroff` on USB made USB vanish (no preloader/RNDIS, no
+   loop); a full off-mode-charging display was not separately confirmed.
+   **[re-opened + corrected 2026-09-29]** "USB vanished" does **not**
+   prove off. With USB attached this fallback hands to LK, and LK's POC
+   path **boots the `boot` image in charger mode** — i.e. an on-USB
+   poweroff is an off-mode-charging *boot*, not an off (and on this unit
+   it boots NixOS). Measured state days after one such poweroff: 100 mA
+   @ 5 V, VBAT flat — alive. See §7 and `docs/session-log.md` 2026-09-29.
 4. **Why exactly the power key is dead in the limbo** is an inference
    (PMIC key routing assumes a live AP; STRUP auto-boot only follows POR /
    WDT-bypass resets). The observables (limbo after `reboot(2)`, 10 s combo
@@ -297,9 +333,15 @@ Prereq: build the kernel with the driver (delta + config), flash the
 boot.img via `bin/flash-nixos.sh boot` with **para = boot-recovery** (TWRP
 sticky) until verified; keep a `stock-dump/` boot backup current.
 
-**Results (2026-09-10):** steps 1 and 2 pass; step 3 (poweroff on USB)
-passes in the sense that the unit turns off (no limbo, no loop) but the
-screen state was not observed. The first flash of the driver
+**Results (2026-09-10):** step 1 passes (reboot self-boots). Step 2
+(poweroff on battery) was **not actually run with a measurement**. Step 3
+(poweroff on USB) was recorded as "the unit turns off", but **[corrected
+2026-09-29] that was not a true off** — with a charger attached LK routes
+the fallback reset into POC and *boots a kernel*; the "USB vanished"
+observation is also produced by a halted AP. The 2026-09-29 100 mA
+measurement confirms the unit stayed alive. A valid poweroff test must be
+**on battery with USB detached, and measured** (see §7 step 2 and
+`docs/session-log.md` 2026-09-29). The first flash of the driver
 boot-looped — root cause and fix in §5 / `docs/session-log.md`
 2026-09-10e (shared TOPRGU block must be mapped without claiming it).
 `gemini-wdt-reboot` is now marked fallback-only (its script header);
@@ -312,13 +354,17 @@ rather than changed untested).
    `systemctl reboot`. Expected: clean self-boot within ~5 s, panel
    initialised (no flicker — rule 5), journal starts fresh with
    "Restarting system" on the UART console. Failure → 10 s power+side.
-2. **Poweroff on battery**: `systemctl poweroff`. Expected: device truly
-   off (no backlight; VBAT flat for ≥5 min — no 1.6 W drain), power key
-   cold-boots normally. Failure → 10 s combo.
+2. **Poweroff on battery**: `systemctl poweroff` **with USB data
+   detached**. Expected: device truly off (no backlight; VBAT flat for
+   ≥5 min — no 1.6 W drain), power key cold-boots normally. **This is the
+   only meaningful poweroff test** [2026-09-29]. Failure → 10 s combo.
 3. **Poweroff on USB**: `systemctl poweroff` with a charger. Expected:
    off-mode charging (LK charging display / auto-charge, powerkey boots the
-   OS) — record whatever actually happens; the mode-0 WDT fallback defines
-   the acceptable worst case (a normal boot).
+   OS) — record whatever actually happens. **[corrected 2026-09-29] Do
+   not read "off" from this**: LK's POC path *boots the kernel* (here =
+   NixOS) whenever a charger is present, so the observable is a normal
+   boot, not an off. The mode-0 WDT fallback's "acceptable worst case"
+   is exactly this boot. Only step 2 tests off.
 4. **Battery guard end-to-end**: with the driver in, let
    `gemini-battery-guard` reach CRIT on battery (or `BATTERY_GUARD_CRIT_MV`
    raised + fake supply) — confirm the guard's poweroff is a real powerdown.
@@ -329,12 +375,75 @@ rather than changed untested).
 ## 8. What this fixes downstream
 
 - `systemctl reboot` — clean reboot, no limbo, no 10 s combo.
-- `systemctl poweroff` — true powerdown; **battery safety** (guard's CRIT
-  poweroff becomes real; an idle "off" unit no longer drifts below the safe
-  voltage).
+- `systemctl poweroff` — *intended* true powerdown; **battery safety**
+  (guard's CRIT poweroff becomes real; an idle "off" unit no longer drifts
+  below the safe voltage). **[corrected 2026-09-29] Not yet demonstrated —
+  see §6 item 3 / §7: an on-USB poweroff is a POC boot, and the on-battery
+  poweroff has not been measured.**
 - The userspace WDT hack becomes a fallback, not the primary path.
 - Prerequisite for any suspend/s2idle work (`docs/power-sleep.md`): a
   working poweroff handler is the same `register_platform_power_off` slot.
+
+## 9. Making `poweroff` real — instrumented next-session plan (2026-09-29)
+
+Objective: make `systemctl poweroff` **on battery, USB detached** actually
+cut the rails (G1 acceptance #1). The on-USB case stays "off-mode charging"
+(§2/§6) and is out of scope for "off".
+
+What we know going in (all source-verified — see the source index):
+- the BBPU **read** path works (probe reads `0x000d`); the **write** has
+  never been read back, so we do not know whether it sticks.
+- the driver's poweroff = BBPU write → `mdelay(1000)` → **mode-0 WDT reset**
+  → `while(1)` (`mt6797-power.c:138-179`). The mode-0 reset has never been
+  independently observed to run.
+- with a charger the mode-0 reset lands in LK POC, which **boots the
+  kernel** (so it is a boot, not an off).
+- the boot readback `0x000d` is power-**on** (`RTC_BBPU_BBPU` bit 2 = 1); a
+  successful poweroff must leave bit 2 = 0.
+
+**Step 0 — characterise the current "off" state** (cheap, no flash): with
+the unit in the observed ~100 mA state, note (a) is the screen lit?
+(b) does it enumerate on a host as `0e8d:2008` (LK POC) or nothing? (c) does
+the power key boot it, do nothing, or need a 10 s hold? This distinguishes
+**(A) LK POC / charging mode** from **(B) halted-AP limbo** (session-log
+2026-09-29).
+
+**Step 1 — instrument the driver** (a build, not necessarily flashed yet):
+- read `RTC_BBPU` back immediately after the `0x4309` write and `dev_info`
+  it (did bit 2 clear?);
+- `pr_emerg`/log at entry to `mt6797_power_off` and just before the mode-0
+  WDT fallback (did we reach it? did the 1 s elapse?);
+- leave the restart handler untouched.
+
+**Step 2 — on battery (USB data detached), the three failure modes separate:**
+- low/quiescent current + VBAT flat → the write worked → off, done;
+- still alive → the BBPU write did not stick (or was overwritten) → Step 3;
+- reality check: on battery LK's own `kernel_power_off_charging_detection()`
+  → `mt6575_power_off()` is a second chance — it re-writes BBPU and, after
+  ~1 s, does `mtk_arch_reset(0)`. So a true off on battery *should* be
+  reachable even if our kernel's write fails; if it is not, the reset/BBPU
+  path itself is broken, not just our ordering.
+
+**Step 3 — if the BBPU write does not stick**, try the vendor extras
+(candidates, not proven necessary — LK omits them):
+- `hal_rtc_bbpu_pwdn` drives **SRCLKENA/SRCLKEN_IN GPIO low** and disables
+  the **32 K export** before the BBPU write
+  (`mt6351/mtk_rtc_hal.c:180`);
+- the vendor warm-reset calls `pmic_pre_wdt_reset()` (PMIC sleep-mode buck
+  voltages) before SWRST (`power/mt6797/pmic.c:203`);
+- re-check the pwrap RTC-space write path (`mtk-pmic-wrap.c`) — confirm the
+  regmap **write** actually reaches `0x4000+` (the read does).
+
+**Step 4 — USB case (not "off"):** make "off-mode charging" actually charge,
+so a plugged-in unit does not flat-line. Dump BQ25896 REG00/REG03/REG0B/
+REG12/REG13 with `services/scripts/bq25896-raw.sh` while it is in that state.
+
+Build/flash/safety: `bash bin/build.sh start bootimg` (rule 10; on macOS it
+builds in the container VM), flash **only** the boot partition with
+`bin/flash-nixos.sh boot` (keep `para = boot-recovery` sticky until
+verified), keep `stock-dump/` boot backups, obey panel rule 5, run long ops
+under `bin/run-job.sh`, and keep the 10 s power+side hold as the
+always-available escape.
 
 ## Source index (all read 2026-09-10)
 
@@ -354,3 +463,14 @@ rather than changed untested).
   `devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/
   {mt6797.dtsi,mt6797-gemini-pda.dts}`, `services/scripts/
   {gemini-wdt-reboot,battery-guard.sh}`, `docs/power-sleep.md`
+
+**[2026-09-29 additions]** LK: `mt6797/boot_mode.c:254` (POC dispatch),
+`app/mt_boot/mt_boot.c:1490` (POC loads the boot image → boots the kernel),
+`platform/mt6797/platform.c:801` (POC turns the display on),
+`platform/mt6797/atags.c:921` (`mode=charger`). Vendor:
+`rtc/mt6351/mtk_rtc_hal.c:180` (`hal_rtc_bbpu_pwdn`: SRCLKENA-low + 32K
+export), `watchdog/mediatek/wdk/wd_api.c:583` (`arch_reset("charger")` →
+`wd_sw_reset(0)`), `power/mt6797/pmic.c:203` (`pmic_pre_wdt_reset`),
+`include/mt-plat/mt6797/include/mach/mt_rtc_hw.h` (`RTC_BBPU_BBPU` = bit 2
+"1: power on, 0: power down"). Legacy receipts: GeminiPDA session-log
+2026-08-30 (POC trap) + 2026-09-04 (`shutdown -r` = power off).

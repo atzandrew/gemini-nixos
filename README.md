@@ -63,9 +63,15 @@ layout were reclaimed into it — see
   > **not** proven, and the unit has repeatedly deep-discharged below the
   > safe voltage (bench-supply recovery). The 2026-09-10 poweroff result
   > was measured only as "USB disappeared", not as a battery-current
-  > collapse — so we are **not convinced it ever fully switches off**.
-  > Until G1 closes, the device must not be left idle unplugged. See
-  > [docs/standing-goals.md](docs/standing-goals.md).
+  > collapse — and a **2026-09-29 measurement found the unit still drawing
+  > 100 mA @ 5 V with VBAT flat, i.e. alive, days after `systemctl
+  > poweroff`**. On USB a true off is architecturally impossible: LK routes
+  > a charger-present poweroff into "off-mode charging", which loads the
+  > `boot` image and boots the OS (so TWRP's poweroff boots Linux). Only an
+  > on-battery measurement can test "off". Until G1 closes, the device must
+  > not be left idle unplugged. See
+  > [docs/standing-goals.md](docs/standing-goals.md) +
+  > [docs/power-states.md](docs/power-states.md).
 - **Touch** — a real 10-point multitouch device, no emulated cursor,
   correct 180° rotation.
 - **Keyboard** — the Gemini UK layout registered with GNOME, including
@@ -152,7 +158,7 @@ the operational cheat sheet is in `AGENTS.md`.
 | `gemini-battery-guard.service` | Battery safety daemon: low/critical VBAT alerts + orderly poweroff, USB-present-but-not-charging detection, history CSV |
 | `gemini-backlight-default.service` | Boot-time backlight = 10 % (power-saving default) |
 | `backlight`, `power`, `battstat`, `bq25896-raw.sh` | Backlight/charge control and battery/charger status CLIs (raw ADC bypasses stale driver latches) |
-| `gemini-wdt-reboot` / `gemini-boot-recovery` | Device-side WDT EXRST self-reboot and boot-into-TWRP CLIs + units (fallbacks now that plain `reboot`/`poweroff` work) |
+| `gemini-wdt-reboot` / `gemini-boot-recovery` | Device-side WDT EXRST self-reboot and boot-into-TWRP CLIs + units (fallbacks; plain `reboot` works, plain `poweroff` is **not proven** — see G1) |
 | `pipewire` / `wireplumber` / `pipewire-pulse` | The PipeWire media stack as one root system session; `pcm.gemini16` pins the analog path to S16_LE at the alsa-lib boundary |
 | `gemini-audio-defaults`, `speaker`, `audio-output`, `gemini-speakerd` | Playback route at boot; speaker-vs-headphone output; the speaker amp follows the PipeWire default sink; the L↔R-correcting virtual sink |
 | `gemini-power-profile.service` | GNOME "Power Mode" → A72 cluster (performance ⇒ A72 up) |

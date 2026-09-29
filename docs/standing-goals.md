@@ -1,6 +1,6 @@
 # Standing goals — long-running objectives the project has not closed
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-09-29
 
 This is the ledger of goals that are *not* one session's work: they stay
 open across flashes, sessions and refactors until an acceptance test
@@ -13,8 +13,10 @@ doc is for the persistent problems behind it.
 ## G1 — Stop chronic battery depletion: make the device truly sleep and truly power off
 
 **Status:** 🔴 OPEN — long-standing (known since at least 2026-09-08,
-re-affirmed 2026-09-26). The single most important goal for the unit's
-physical survival.
+re-affirmed 2026-09-26, **evidence 2026-09-29**: the unit draws **100 mA @
+5 V ≈ 0.5 W** hours-to-days after `systemctl poweroff`, with VBAT flat at
+4.00 V — i.e. it never switched off). The single most important goal for
+the unit's physical survival.
 
 **The goal.** The unit must be able to sit unused **without draining its
 battery below the safe voltage**. Concretely: a `systemctl poweroff`, and
@@ -53,14 +55,41 @@ to never let the unit sit there.
   USB gadget disappear with no preloader/NIC loop, which a merely-halted
   AP with its USB transceiver off can also produce. It did **not**
   measure battery current after shutdown. See "The suspicion" below.
+- **2026-09-29 — the suspicion is now evidence, and *why* on-USB can
+  never be a true off.** Two source-verified facts (full receipts:
+  `docs/power-states.md` §"Implementation status" + `docs/session-log.md`
+  2026-09-29):
+  1. A measured **100 mA @ 5 V ≈ 0.5 W** continuous draw hours-to-days
+     after `systemctl poweroff`, screen/USB-radio off, compute warm,
+     VBAT flat at 4.00 V. That is an alive SoC (rails up, halted or
+     LK-charging) — not a PMIC-quiescent off. **The unit never switched
+     off.**
+  2. **With a charger attached, LK cannot power off at all.** LK's
+     `kernel_power_off_charging_detection()` sends any charger-present
+     boot that lacks a power-key/WDT-bypass/2-sec flag into
+     `KERNEL_POWER_OFF_CHARGING_BOOT`, which LK implements by **loading
+     the `boot` image and jumping to the kernel**. On this unit that
+     image is NixOS → "off-mode charging" boots Linux. (Observed live:
+     TWRP's poweroff just boots Linux.) `off-mode-charge=0` and every
+     `is_force_boot()` flag choose `NORMAL_BOOT`, never off, so there is
+     no LK configuration that yields "off with a charger". The vendor is
+     byte-for-byte the same design. **Therefore every poweroff measured
+     while plugged in is confounded; only an on-battery measurement can
+     test "off".**
+  3. A residual puzzle: VBAT is flat at 4.00 V rather than slowly
+     rising, which the IINLIM=500 mA power-path should allow from a
+     ~100 mA load — i.e. the BQ25896 may be stuck in the known B-19/B-22
+     "VBUS present but NOT charging" state. Check REG00/REG03/REG0B/
+     REG12/REG13 with `services/scripts/bq25896-raw.sh`.
 
 **The suspicion (why this is still OPEN).** We are **not convinced the
 device has ever truly switched off**. A halted CPU with the PMIC still
 powered looks identical to a real poweroff from the host side (USB
 vanishes either way). The 2026-09-10 "verified" result is not sufficient
 evidence that `RTC_BBPU` actually cut the main rails. If it did not, the
-unit keeps burning the ~1.6 W awake floor indefinitely with the screen
-"off" — exactly the chronic-depletion mechanism.
+unit keeps burning hundreds of mW indefinitely with the screen "off"
+(**measured 2026-09-29: 100 mA @ 5 V ≈ 0.5 W**; the light-sleep awake
+floor is ~1.6 W) — exactly the chronic-depletion mechanism.
 
 **What "done" looks like (acceptance criteria).**
 
@@ -82,13 +111,24 @@ unit keeps burning the ~1.6 W awake floor indefinitely with the screen
 
 **Next steps.**
 
-- [ ] **Re-verify poweroff with a measurement.** Put the unit on a bench
-      supply (or an inline current meter) with USB data detached; run
-      `systemctl poweroff`; confirm the current collapses and VBAT holds.
-      Short-circuit the suspicion first — everything else depends on it.
+- [ ] **Re-verify poweroff with a measurement — ON BATTERY, USB DATA
+      DETACHED.** Put the unit on a bench supply (or an inline current
+      meter); run `systemctl poweroff`; confirm the current collapses and
+      VBAT holds. Short-circuit the suspicion first — everything else
+      depends on it. **Do not test this on a charger: 2026-09-29 proved
+      an on-USB poweroff is architecturally an off-mode-charging boot,
+      not an off** (see "Current state").
 - [ ] If poweroff does **not** cut the rails: instrument the driver
-      (RTC_BBPU readback after the write) and re-check the pwrap RTC-space
-      write path against `docs/power-states.md` §4/§5 receipts.
+      (RTC_BBPU readback *after* the 0x4309 write — boot readback is
+      `0x000d`, so the write must clear bit 2, `RTC_BBPU_BBPU` "0: power
+      down"; and log whether the mode-0 WDT fallback actually executes)
+      and re-check the pwrap RTC-space write path against
+      `docs/power-states.md` §4/§5 receipts.
+- [ ] **Because a true off on USB is impossible, make the VBUS-present
+      idle state safe/charging.** Dump the BQ25896 (REG00/REG03/REG0B/
+      REG12/REG13 via `services/scripts/bq25896-raw.sh`) and fix the
+      "VBUS present but NOT charging" state, or "off-mode charging" still
+      drains the pack while the unit appears off.
 - [ ] Build the s2idle wake source: PMIC HOMEKEY/PWRKEY INT enable +
       pwrap `INT_EN`, and a wake-capable IRQ the `mt6351-keys` driver arms
       in suspend (`docs/power-sleep.md` §Deep sleep).

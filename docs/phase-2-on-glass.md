@@ -161,18 +161,21 @@ the destructive dd (TWRP's busybox `stat` has no `-c`). [bin/flash-nixos.sh]
 Priorities P0 (blocking full use) → P3. Each gets a dated line when
 worked.
 
-- **[P1, OPEN 2026-09-10] `systemctl reboot` freezes at a black
-  screen** — not a power-off and not a reboot: the unit becomes
-  unresponsive (USB gadget gone, LCD black) and needs a hard power-off
-  (long-press power) to recover. Long-standing on this unit (the user
-  has it on the project TODO; it re-hit during the 2026-09-10 battery
-  boot-img flash attempt — see session-log 2026-09-10b). The only
-  WORKING reboot is the **WDT EXRST path** (`bin/device-reboot.sh`,
-  the Linux→reboot hops in `bin/flash-nixos.sh`, `gemini-wdt-reboot`),
-  which depends on the A72 WDT re-arm fix in §2b. Proper fix = the
-  kernel/PSCI restart handler (likely the same A72 cluster/SPM teardown
-  the A72 bring-up needs — cl2-down receipts); until then **do not use
-  `systemctl reboot`/`reboot` on glass — use the WDT path**.
+- ~~**[P1, OPEN 2026-09-10] `systemctl reboot` freezes at a black
+  screen**~~ **[FIXED 2026-09-10, verified on glass]** — not a power-off
+  and not a reboot: the unit became unresponsive (USB gadget gone, LCD
+  black) and needed a hard power-off (long-press power) to recover. Root
+  cause was arm64 `machine_restart()` with no registered restart handler
+  (the "limbo", see `docs/power-states.md`); the `mt6797-power` delta
+  driver now registers LK's WDT SWRST restart and `systemctl reboot`
+  self-boots cleanly (2026-09-10e). The original WDT EXRST path
+  (`bin/device-reboot.sh`, `gemini-wdt-reboot`) is now a fallback.
+  > Note: the *original* 2026-09-10 text blamed the A72 cluster/SPM
+  > teardown; that was a red herring — the actual cause was the missing
+  > restart handler. The A72 WDT re-arm (§2b) is still a prerequisite for
+  > the *fallback* WDT-expiry path.
+  > **[2026-09-29]** `poweroff` is the still-open half of this — it never
+  > truly cuts the rails (G1); do not confuse the two.
 
 - ~~[P0] growfs: `/` is 3.1 GiB, not 27.3 GiB~~ **[done 2026-09-07]** —
   two stacked causes, both fixed: (1) the udev by-label coldplug race
