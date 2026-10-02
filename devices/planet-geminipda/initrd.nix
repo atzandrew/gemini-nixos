@@ -60,7 +60,20 @@ let
   # recover a torn orphan chain (the 2026-09-09 boot-panic incident).
   # Plain file copy like busybox — no store paths in the cpio; the
   # boot.img stays well under the 16 MiB partition cap.
-  e2fsck = pkgs.pkgsStatic.e2fsprogs.bin;
+  e2fsck = (pkgs.pkgsStatic.e2fsprogs.overrideAttrs (oldAttrs: {
+    postPatch = (oldAttrs.postPatch or "") + ''
+      sed -i 's/blocksize=4096/blocksize=16384/g' tests/m_minrootdir/script
+      sed -i 's/ -b 4096/ -b 16384/g' tests/m_minrootdir/script
+      sed -i 's/blocksize=4096/blocksize=16384/g' tests/m_rootdir/script
+      sed -i 's/ -b 4096/ -b 16384/g' tests/m_rootdir/script
+    '';
+    # pkgsStatic (musl) e2fsprogs is not on cache.nixos.org, so it always
+    # builds locally — and its test suite fails on SELinux build hosts
+    # (e.g. Fedora Asahi): every test file carries a security.selinux
+    # xattr that `mke2fs -d` cannot copy, breaking m_rootdir. We only
+    # ship the e2fsck binary in the initrd; skip the host-dependent tests.
+    doCheck = false;
+  })).bin;
 
   # The applets the init script uses. `sh` is busybox ash; the shebang
   # in /init is `#!/bin/busybox sh`.

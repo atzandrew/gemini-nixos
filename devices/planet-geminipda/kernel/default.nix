@@ -55,6 +55,9 @@
 #               Makefile} (the LK-framebuffer DRM/KMS driver);
 #             - modified:   arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 #               (the planet,geminipda-drm node).
+#           [2026-10-02] Fifth delta-local change: drivers/power/supply/
+#           bq25890_charger.c — glitch rejection + EMA smoothing of the
+#           voltage-derived battery capacity (docs/desktop-plumbing.md).
 #           geminipda-drm.c additionally drops the redundant per-pixel alpha
 #           loop that pinned the DRM commit kworker at ~100 % CPU (see
 #           docs/session-log.md 2026-09-10k).

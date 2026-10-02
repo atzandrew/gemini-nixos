@@ -113,7 +113,10 @@ P=/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name
 # The single NixOS rootfs partition (2026-09-10 repartition): the old
 # Android system/cache/userdata + Debian linux + boot2/boot3 collapsed
 # into one ~58 GiB `linux` (p27). See bin/repartition-nixos.sh.
-TARGET_PART=linux
+# Override with GEMINI_ROOTFS_PART for units still on a stock layout
+# (e.g. GEMINI_ROOTFS_PART=userdata on a stock Android-only Gemini — the
+# initrd finds the rootfs by content, so any big partition works).
+TARGET_PART="${GEMINI_ROOTFS_PART:-linux}"
 BACKUP_DIR="$ROOT/stock-dump"
 # Static (musl) aarch64 e2fsprogs for offline rootfs growth from TWRP
 # (grow-rootfs verb). Rebuild + pin if GC'd:

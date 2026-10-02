@@ -122,8 +122,19 @@ charger-only, no coulomb counter on any i2c bus; Android's MTK
   `status` (from PG/CHG_STAT via the shared live
   `bq25890_update_state()` path — the driver keeps continuous ADC
   conversion on while online, so reads are fresh); `voltage_now`
-  (VBAT ADC, raw µV), `temp` (TS %, same table the charger reports),
+  (VBAT ADC µV, glitch-rejected — see below), `temp` (TS %, same table the charger reports),
   `health` (fault bits → GOOD/OVERVOLTAGE/OVERHEAT/…).
+- **Smoothing (2026-10-02):** the raw VBAT swings ±60–100 mV with load
+  and the curve is flat near empty, so the unfiltered % jumped 7 → 30 →
+  9 % between upower polls; the ADC also occasionally returns code 0
+  (2.304 V) mid-conversion. `bq25890_battery_vbat()` now (1) rejects
+  samples < 2.5 V (one re-read, else hold the last good value),
+  (2) runs a time-constant EMA (tau 60 s, CLOCK_BOOTTIME dt), (3) resets
+  to the raw sample on charger online/offline changes or after a > 5 min
+  gap (resume), and (4) on battery holds the reported % against upward
+  creep of < 3 points. Simulated on the 2026-10-02 run-down log: raw
+  0–19 % → smoothed 8–11 %. Only the Battery supply is smoothed; the
+  charger supply's `voltage_now` (battery-guard's input) stays raw.
 - `power_supply_changed()` notifications now fan out to BOTH supplies
   (`bq25890_supplies_changed()` — otherwise a bare charger-only notify
   never woke the battery client).

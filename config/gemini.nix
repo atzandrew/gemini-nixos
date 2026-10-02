@@ -12,6 +12,7 @@
 # force-disabled by the GNOME/gemshell modules; it has no session client
 # since the nested sessions were removed.)
 { config, lib, pkgs, ... }:
+
 let
   # Mesa 25.0.7 + geminipda panfrost fork (see pkgs/mesa-geminipda.nix
   # for why this is a standalone derivation, not nixpkgs' mesa).
@@ -25,7 +26,8 @@ let
   # mapper; docs/desktop-plumbing.md §DOSBox-X).
   dosboxXGemini = pkgs.callPackage ../pkgs/dosbox-x-gemini.nix { };
 in
-{
+{  
+
   imports = [
     # Phase 3 device services: gpu-poweron, a72-up, battery-guard,
     # backlight/power CLIs, boot-recovery, wdt-reboot.
@@ -84,6 +86,10 @@ in
     # (co-installed, marker-selected; inert unless the marker says
     # `gemshell`). docs/gemshell.md.
     ../services/gemshell.nix
+    # greetd + tuigreet in place of GDM (2026-10-02): a text greeter on
+    # tty1 with a session menu, so desktops can be swapped at login.
+    # Toggle: services.geminiGreeter.enable below.
+    ../services/greeter.nix
   ];
 
   system.stateVersion = "26.11";
@@ -131,6 +137,12 @@ in
   # install); `gemcli session set` overrides it persistently.
   services.geminiDesktop.enable = true;
   services.geminiDesktop.mode = "gnome";
+
+  # Login: greetd + tuigreet instead of GDM autologin (2026-10-02). The
+  # `gnome` marker mode now means "show the greeter"; pick the session
+  # with F3. Set to false to return to GDM + autologin.
+  # services/greeter.nix.
+  services.geminiGreeter.enable = true;
 
   # The gemshell compositor is CO-INSTALLED (the marker decides per
   # boot); its units are inert unless `gemcli session set gemshell`.
@@ -497,7 +509,18 @@ in
   networking.interfaces.usb0.ipv4.addresses = [
     { address = "10.15.19.82"; prefixLength = 24; }
   ];
-  networking.defaultGateway = "10.15.19.1";
+  # Default route via the USB host is a FALLBACK only: metric 1000 sits
+  # behind NetworkManager's Wi-Fi default route (metric ~600), so the
+  # device uses Wi-Fi for internet whenever it is connected, and the USB
+  # host only when it is the sole uplink (bin/usb-tether-nat.sh). With
+  # no metric this static route (metric 0) won every lookup and all
+  # traffic died at 10.15.19.1 when the host was not NATing.
+  # [atzero unit, 2026-10-02]
+  networking.defaultGateway = {
+    address = "10.15.19.1";
+    interface = "usb0";
+    metric = 1000;
+  };
   networking.nameservers = [ "1.1.1.1" ];
 
   # Static link only — no DHCP client needed.

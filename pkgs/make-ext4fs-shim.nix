@@ -93,7 +93,12 @@ writeShellScriptBin "make_ext4fs" ''
   # to mke2fs without touching the real (build-user-owned) tree.
   chown -R 0:0 "$dir" 2>/dev/null || true
 
-  set -- -t ext4 -b "$bs" -m 0
+  # no_copy_xattrs: don't copy the build host's xattrs into the image.
+  # On SELinux hosts (e.g. Fedora Asahi) every source file carries a
+  # security.selinux label, and `mke2fs -d` fails with "Permission
+  # denied while writing attribute". The Nix store has no meaningful
+  # xattrs (capabilities come from security.wrappers at activation).
+  set -- -t ext4 -b "$bs" -m 0 -E no_copy_xattrs
   [ -n "$uuid" ] && set -- "$@" -U "$uuid"
   [ -n "$label" ] && set -- "$@" -L "$label"
   set -- "$@" -d "$dir"

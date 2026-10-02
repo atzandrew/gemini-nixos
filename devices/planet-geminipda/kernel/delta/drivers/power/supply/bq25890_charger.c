@@ -15,6 +15,8 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/usb/phy.h>
 
 #include <linux/acpi.h>
@@ -135,6 +137,14 @@ struct bq25890_device {
 	struct bq25890_state state;
 
 	struct mutex lock; /* protect state data */
+
+	/* Battery-supply VBAT smoothing (see bq25890_battery_vbat()) */
+	struct mutex vbat_lock;    /* protects the fields below */
+	int vbat_avg_uv;           /* filtered VBAT; 0 = no sample yet */
+	int vbat_last_uv;          /* last VALID raw VBAT sample */
+	ktime_t vbat_avg_time;     /* boottime of last filter update */
+	bool vbat_avg_online;      /* charger state the average belongs to */
+	int cap_reported;          /* last reported capacity; -1 = none */
 };
 
 static DEFINE_IDR(bq25890_id);
@@ -1055,7 +1065,9 @@ static const struct power_supply_desc bq25890_power_supply_desc = {
  *     to <= 90 % — a cell under charge sits near regulation voltage
  *     while its true SoC is lower; 100 % is only claimed at charge
  *     termination (the chip's own criterion). The curve is voltage-
- *     only, so it is load-dependent by nature; honest enough for a
+ *     only, so it is load-dependent by nature — since 2026-10-02 the
+ *     VBAT feeding it is glitch-rejected and EMA-smoothed (tau 60 s,
+ *     see bq25890_battery_vbat()). Honest enough for a
  *     status icon, deliberately NOT fed to any poweroff logic (see
  *     services/plumbing.nix: upower CriticalPowerAction = Ignore;
  *     battery-guard owns the real poweroff at 3.50 V).
@@ -1108,6 +1120,109 @@ static int bq25890_capacity_from_vbat(u32 vbat_uv)
 	return bq25890_ocv[ARRAY_SIZE(bq25890_ocv) - 1].pct;
 }
 
+/*
+ * VBAT smoothing for the battery supply (2026-10-02). On battery power
+ * the raw VBAT ADC moves by +/-60-100 mV with load (CPU/GPU/radio bursts),
+ * and the OCV curve is flat at the bottom, so the unfiltered capacity
+ * jumped 7 % -> 30 % -> 9 % between upower polls. In addition the ADC
+ * occasionally returns code 0 (= 2.304 V, the BATV floor) when a read
+ * lands mid-conversion, which would map to 0 %.
+ *
+ *   1. Glitch rejection: samples below BQ25890_VBAT_VALID_MIN_UV are
+ *      re-read once; if still invalid, the previous valid value is used
+ *      and the filter is not updated (same rule as battery-guard).
+ *   2. Time-constant EMA: avg += (raw - avg) * dt / (tau + dt), with
+ *      dt measured on CLOCK_BOOTTIME so irregular poll intervals (upower,
+ *      DE widgets, suspend) weigh correctly. tau = 60 s.
+ *   3. Reset to the raw sample when the charger comes online / goes
+ *      offline (a real step in VBAT) or after a long gap (resume from
+ *      suspend), so the estimate never lags a genuine change.
+ *   4. On battery, the reported capacity may not creep UP by less than
+ *      BQ25890_CAP_RISE_PCT (load-release rebound); larger rises — e.g.
+ *      after a sustained heavy load ends — still come through.
+ *
+ * The charger supply's voltage_now stays raw (battery-guard reads it
+ * and does its own glitch filtering); only the battery supply is
+ * smoothed.
+ */
+#define BQ25890_VBAT_VALID_MIN_UV	2500000
+#define BQ25890_VBAT_TAU_MS		60000
+#define BQ25890_VBAT_RESET_MS		(5 * 60 * 1000)
+#define BQ25890_CAP_RISE_PCT		3
+
+/*
+ * Returns the filtered VBAT (uV) or a negative errno. If @raw_uv is
+ * non-NULL it receives the latest VALID raw sample (or the last good one
+ * when this read glitched).
+ */
+static int bq25890_battery_vbat(struct bq25890_device *bq, bool online,
+				int *raw_uv)
+{
+	ktime_t now = ktime_get_boottime();
+	int raw, avg;
+	s64 dt_ms;
+
+	raw = bq25890_read_vbat_uv(bq);
+	if (raw >= 0 && raw < BQ25890_VBAT_VALID_MIN_UV) {
+		msleep(30);
+		raw = bq25890_read_vbat_uv(bq);
+	}
+
+	mutex_lock(&bq->vbat_lock);
+
+	if (raw < 0 || raw < BQ25890_VBAT_VALID_MIN_UV) {
+		/* glitch / I2C error: hold the previous value */
+		if (!bq->vbat_avg_uv) {
+			mutex_unlock(&bq->vbat_lock);
+			return raw < 0 ? raw : -ENODATA;
+		}
+		goto out;
+	}
+
+	dt_ms = ktime_ms_delta(now, bq->vbat_avg_time);
+	if (!bq->vbat_avg_uv || online != bq->vbat_avg_online ||
+	    dt_ms < 0 || dt_ms > BQ25890_VBAT_RESET_MS) {
+		bq->vbat_avg_uv = raw;
+		bq->cap_reported = -1;
+	} else {
+		bq->vbat_avg_uv += (int)div64_s64((s64)(raw - bq->vbat_avg_uv) * dt_ms,
+						  BQ25890_VBAT_TAU_MS + dt_ms);
+	}
+	bq->vbat_last_uv = raw;
+	bq->vbat_avg_time = now;
+	bq->vbat_avg_online = online;
+
+out:
+	avg = bq->vbat_avg_uv;
+	if (raw_uv)
+		*raw_uv = bq->vbat_last_uv;
+	mutex_unlock(&bq->vbat_lock);
+
+	return avg;
+}
+
+/* Smoothed capacity (0..100) with the small-rebound hold on battery. */
+static int bq25890_battery_capacity(struct bq25890_device *bq, bool online)
+{
+	int vbat, pct;
+
+	vbat = bq25890_battery_vbat(bq, online, NULL);
+	if (vbat < 0)
+		return vbat;
+
+	pct = bq25890_capacity_from_vbat(vbat);
+
+	mutex_lock(&bq->vbat_lock);
+	if (!online && bq->cap_reported >= 0 &&
+	    pct > bq->cap_reported &&
+	    pct < bq->cap_reported + BQ25890_CAP_RISE_PCT)
+		pct = bq->cap_reported;
+	bq->cap_reported = pct;
+	mutex_unlock(&bq->vbat_lock);
+
+	return pct;
+}
+
 static enum power_supply_property bq25890_battery_supply_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
@@ -1126,8 +1241,10 @@ static int bq25890_battery_supply_get_property(struct power_supply *psy,
 	struct bq25890_device *bq = power_supply_get_drvdata(psy);
 	struct bq25890_state state;
 	int vbat, ret;
+	bool online;
 
 	bq25890_update_state(bq, psp, &state);
+	online = state.online && !state.hiz;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
@@ -1153,17 +1270,18 @@ static int bq25890_battery_supply_get_property(struct power_supply *psy,
 		break;
 
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		vbat = bq25890_read_vbat_uv(bq);
-		if (vbat < 0)
-			return vbat;
+		/* raw (glitch-rejected) VBAT; also feeds the filter */
+		ret = bq25890_battery_vbat(bq, online, &vbat);
+		if (ret < 0)
+			return ret;
 		val->intval = vbat;
 		break;
 
 	case POWER_SUPPLY_PROP_CAPACITY:
-		vbat = bq25890_read_vbat_uv(bq);
-		if (vbat < 0)
-			return vbat;
-		val->intval = bq25890_capacity_from_vbat(vbat);
+		ret = bq25890_battery_capacity(bq, online);
+		if (ret < 0)
+			return ret;
+		val->intval = ret;
 		if (state.chrg_status == STATUS_PRE_CHARGING ||
 		    state.chrg_status == STATUS_FAST_CHARGING) {
 			/* under charge the cell sits near regulation voltage;
@@ -1689,6 +1807,8 @@ static int bq25890_probe(struct i2c_client *client)
 	bq->id = -1;
 
 	mutex_init(&bq->lock);
+	mutex_init(&bq->vbat_lock);
+	bq->cap_reported = -1;
 	INIT_DELAYED_WORK(&bq->pump_express_work, bq25890_pump_express_work);
 
 	bq->rmap = devm_regmap_init_i2c(client, &bq25890_regmap_config);

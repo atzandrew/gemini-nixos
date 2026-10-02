@@ -42,6 +42,13 @@
 
 let
   cfg = config.services.geminiDesktop;
+  # The unit that actually runs the display manager. GDM defines
+  # `display-manager.service` itself; greetd (services/greeter.nix) is
+  # `greetd.service` with `display-manager.service` only as an ALIAS, so
+  # the console/gemshell condition must go on greetd.service — defining a
+  # separate `display-manager` unit would collide with the alias.
+  # [added 2026-10-02]
+  dmUnit = if config.services.greetd.enable then "greetd" else "display-manager";
   # Same callPackage as services/gemini-pda.nix / services/gnome.nix, so
   # the closure shares the one gemini-pda-utils store path (the apply
   # script lives there).
@@ -84,7 +91,7 @@ in
       description = "Gemini desktop/session boot selection (marker -> GDM/console)";
       wants = [ "accounts-daemon.service" ];
       after = [ "accounts-daemon.service" "systemd-user-sessions.service" ];
-      before = [ "display-manager.service" ];
+      before = lib.unique [ "display-manager.service" "${dmUnit}.service" ];
       wantedBy = [ "multi-user.target" ];
       # busctl (systemd), id/tr (coreutils), chvt (kbd). systemctl is the
       # systemd package's /run/current-system/sw/bin symlink.
@@ -108,7 +115,10 @@ in
     # or the gemshell compositor (gemshell mode, which owns the panel and
     # starts no getty). No other unit writes ConditionPathExists, so this
     # does not clobber one.
-    systemd.services.display-manager.unitConfig.ConditionPathExists =
+    # With greetd (services/greeter.nix) the `gnome` marker means "show the
+    # greeter" — the AccountsService session the applier sets is harmless
+    # and simply unused.
+    systemd.services.${dmUnit}.unitConfig.ConditionPathExists =
       "!/run/gemini-console";
 
     # The selector owns the auto-login session: it writes the

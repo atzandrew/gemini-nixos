@@ -8067,3 +8067,18 @@ string Prior = "\033[5~"
 string Next = "\033[6~"
 string Macro = "\033[M"
 string Pause = "\033[P"
+#
+# [atzero unit, 2026-10-02] Function keys on the console: Shift+Fn+1..0 = F1..F10
+# (Fn is AltGr; same convention as the desktop xkb layout's level 4 and the
+# DOSBox-X mapper). The Gemini has no F-key row, so without these the
+# console (and tuigreet's F2/F3/F12 menus) could never receive an F-key.
+	shift	altgr	keycode   2 = F1
+	shift	altgr	keycode   3 = F2
+	shift	altgr	keycode   4 = F3
+	shift	altgr	keycode   5 = F4
+	shift	altgr	keycode   6 = F5
+	shift	altgr	keycode   7 = F6
+	shift	altgr	keycode   8 = F7
+	shift	altgr	keycode   9 = F8
+	shift	altgr	keycode  10 = F9
+	shift	altgr	keycode  11 = F10

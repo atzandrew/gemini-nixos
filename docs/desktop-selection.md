@@ -1,6 +1,7 @@
 # Desktop/session selection — GNOME, gemshell, or the framebuffer console
 
-Last updated: 2026-09-12 (COSMIC and niri removed; modes are now
+Last updated: 2026-10-02 (greetd + tuigreet replace GDM — see "Login via
+greetd + tuigreet"; 2026-09-12: COSMIC and niri removed, modes are
 `gnome|gemshell|console`)
 
 **Status: the selector + GNOME/gemshell/console modes are ON GLASS.**
@@ -25,6 +26,30 @@ sections below that discuss them are kept only as the removal record.
 | `gnome` | `mutter` on card0 (panfrost/kmsro) | GDM autologin → `gnome` session | **Verified on glass** (docs/gnome-feasibility.md). Default. |
 | `gemshell` | the `gemshell` compositor on card0 (a SYSTEM service, User=cjdell — not a GDM session) | display-manager skipped; `gemini-gemshell.service` (ConditionPathExists=/run/gemini-console) | Native Rust Wayland compositor + in-process egui settings panel (docs/gemshell.md). **On glass 2026-09-11; reworked 2026-09-12** (egui UI, gemdata abstraction, present() mirror fix). No tty1 getty (the compositor owns the panel). |
 | `console` | none (fbcon tty1) | display-manager skipped; `getty@tty1` | No desktop; serial console (ttyS0) unaffected. |
+
+## Login via greetd + tuigreet (2026-10-02)
+
+**Status: built-but-not-deployed (eval-checked only).** GDM is replaced
+by greetd with the tuigreet text greeter (`services/greeter.nix`,
+toggle `services.geminiGreeter.enable` in `config/gemini.nix`). Reason:
+GDM's greeter is a full gnome-shell, and the goal is to try lighter
+desktops quickly — tuigreet's F3 menu lists every installed session
+(`services.displayManager.sessionData`), remembers the last one per user,
+and runs on the already-rotated fbcon tty1 (`fbcon=rotate:3`).
+
+- The marker modes are unchanged; with the greeter on, `gnome` means
+  "show the greeter" (the AccountsService session the applier writes is
+  unused). `gemshell`/`console` still skip the display manager.
+- greetd's unit is `greetd.service` with the alias
+  `display-manager.service` (nixpkgs `greetd.nix`), so the selector puts
+  `ConditionPathExists=!/run/gemini-console` on `greetd.service` when the
+  greeter is on (a separate `display-manager` definition would collide
+  with the alias). Eval-verified: no `display-manager` unit is defined,
+  `greetd.service` carries the condition, `gemini-desktop-apply` and
+  `gemini-panfrost-load` are ordered before both names.
+- No autologin any more (GDM autologin is force-disabled). Rollback:
+  `services.geminiGreeter.enable = false` and redeploy.
+- Unverified: GNOME's lock screen without GDM.
 
 ## Architecture
 

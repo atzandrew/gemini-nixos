@@ -596,9 +596,17 @@
 	clock-frequency = <400000>;
 	status = "okay";
 
+	/*
+	 * [atzero unit, 2026-10-01] This unit is the OTHER Gemini panel
+	 * variant: i2cdetect on i2c4 shows only 0x53 (Solomon SSD2092),
+	 * nothing at 0x62. The Novatek node is disabled and the SSD2092
+	 * node below enabled. To build for a Novatek unit, swap the two
+	 * status lines back (both nodes claim CTP_RST/GPIO68).
+	 */
 	touchscreen@62 {
 		compatible = "novatek,nt36772-ts";
 		reg = <0x62>;	/* vendor DTB cap_touch@62 */
+		status = "disabled";
 		reset-gpios = <&pio 68 GPIO_ACTIVE_LOW>;	/* CTP_RST */
 		vcc-supply = <&touch_vcc>;
 		iovcc-supply = <&vdd_fixed_1v8>;
@@ -630,6 +638,27 @@
 		touchscreen-size-y = <2160>;
 		touchscreen-inverted-x;
 		touchscreen-inverted-y;
+	};
+
+	/*
+	 * Solomon SSD2092 touch (AUO 5.99" panel variant) - vendor DTB
+	 * solomon_touch@53. Driver: drivers/input/touchscreen/ssd2092.c
+	 * (polled; boots the factory firmware already in the chip's eflash).
+	 * CTP_RST = GPIO68, CTP_INT = GPIO85, both active low. Power is the
+	 * always-on touch_vcc / 1.8 V rails LK leaves up.
+	 * Orientation copied from the Novatek node as a first guess; if
+	 * touch lands mirrored/rotated, fix the inverted-x/-y here.
+	 */
+	touchscreen@53 {
+		compatible = "solomon,ssd2092-touch";
+		reg = <0x53>;
+		reset-gpios = <&pio 68 GPIO_ACTIVE_LOW>;	/* CTP_RST */
+		irq-gpios = <&pio 85 GPIO_ACTIVE_LOW>;		/* CTP_INT */
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2160>;
+		touchscreen-inverted-x;
+		touchscreen-inverted-y;
+		status = "okay";
 	};
 };
 
