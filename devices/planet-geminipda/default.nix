@@ -132,6 +132,8 @@ in
   # (geminipda-bringup @ 188aade69), so this is the same kernel the
   # bring-up validated, rebuilt in-nix; uname -r is the self-consistent
   # "6.6.0" (no git in the source), and sramldo-smc is built in-tree
+  # [2026-10-02: base bumped to v6.6.157 stable; uname -r is now
+  # "6.6.157" — see kernel/default.nix]
   # with matching vermagic. Everything boot-critical (mmc block, ext4,
   # ...) is =y in the config; GPU/wifi modules (panfrost, mtk_wcn,
   # wlan_gen3, rtw88_*) are =m, loaded in stage-2 from this kernel's

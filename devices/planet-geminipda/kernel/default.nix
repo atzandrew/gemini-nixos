@@ -6,8 +6,17 @@
 # instead of a patch series (agents edit source files, not patch text;
 # patches are banned for this repo's kernel).
 #
-#   base  = the published upstream Linux **v6.6** release tarball
-#           (cdn.kernel.org linux-6.6.tar.gz), fetched by hash. This is
+#   base  = the published upstream Linux **v6.6.157** stable tarball
+#           (cdn.kernel.org linux-6.6.157.tar.gz), fetched by hash.
+#           [2026-10-02] Bumped from v6.6: the 61 delta files that exist
+#           upstream were 3-way merged (base v6.6, ours = delta, theirs =
+#           v6.6.157) so stable fixes are kept, not reverted; 41 were
+#           untouched by stable, 18 merged clean, 2 had add/add conflicts
+#           resolved by keeping both sides (mtk_drm_drv.c compatible list,
+#           hci.h quirk enum). Of the 462 delta-only files, one needed
+#           a fix: drv_bt/linux/hci_stp.c no longer sets hdev->dev_type
+#           (6.6.y stable removed AMP support and the field).
+#           Pre-bump state: git fc45e66. The v6.6 base was
 #           the exact base the borrowed bring-up kernel grew from: the
 #           geminipda-bringup line is v6.6 (commit
 #           ffc253263a1375a65fa6c9f62a893e9767fbebfa) + 49 linear commits,
@@ -87,11 +96,11 @@ let
   # Same fetch idiom as the mesa fork base (pkgs/mesa-geminipda.nix): a
   # fixed-output fetchurl of the canonical published archive, pinned by
   # file hash — no vendored source in this repo. Re-verify when bumping:
-  #   nix store prefetch-file --json https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.gz
+  #   nix store prefetch-file --json https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.157.tar.gz
   # (sha256 = file hash, SRI form).
   baseTar = fetchurl {
-    url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.gz";
-    hash = "sha256-PIj/RkgSLoGDK3BnvmRW7yjhGbZGSaKehPfwRpHkifk=";
+    url = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.157.tar.gz";
+    hash = "sha256-ivJdzP2ko+vxcSL/3BGSHq8ie2oOmC4Vlqzz+MkNpkI=";
   };
 
   # ---- Rule-5 gate (CORE): never build the display landmines ---------
@@ -136,7 +145,7 @@ let
   # CONFIG_EXTRA_FIRMWARE_DIR="firmware" (relative → resolved against
   # $(srctree)), and the #329 config originally pointed at an absolute
   # GeminiPDA host path (a dependency this repo must not have).
-  kernelSrc = buildPackages.runCommand "linux-geminipda-6.6-src" {
+  kernelSrc = buildPackages.runCommand "linux-geminipda-6.6.157-src" {
     nativeBuildInputs = [ buildPackages.gnutar buildPackages.gzip ];
   } ''
     mkdir -p $out/firmware
@@ -155,7 +164,7 @@ let
   # interpolation does not see sibling derivation attrs). modDirVersion
   # is the builder's `modDirify version`, which is the identity here.
   sramldoModuleSrc = ./modules/sramldo-smc;
-  modDirVersion = "6.6.0";
+  modDirVersion = "6.6.157";
 in
 
 assert lib.assertMsg (!bannedHit) ''
@@ -167,11 +176,11 @@ assert lib.assertMsg (!bannedHit) ''
 
 mobile-nixos.kernel-builder {
   src = kernelSrc;
-  # Makefile: VERSION=6 PATCHLEVEL=6 SUBLEVEL=0, no localversion (the
+  # Makefile: VERSION=6 PATCHLEVEL=6 SUBLEVEL=157, no localversion (the
   # base tarball and the delta tree have no .git, so setlocalversion
   # produces no suffix; the builder verifies kernel.release against
   # `version`).
-  version = "6.6.0";
+  version = "6.6.157";
   configfile = ./config;
 
   # The stock MediaTek LK bootloader gunzips the kernel payload and scans

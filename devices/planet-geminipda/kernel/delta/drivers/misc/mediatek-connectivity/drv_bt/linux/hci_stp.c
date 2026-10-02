@@ -34,7 +34,8 @@
  *     init-table command bytes + the cfg below, and the BD address is
  *     always (re)queried from the chip eFUSE on each open unless the
  *     bd_addr parameter is given.
- *   - hdev->dev_type = HCI_PRIMARY (HCI_BREDR enum is gone in 6.6).
+ *   - no hdev->dev_type: 6.6.0 needed HCI_PRIMARY (HCI_BREDR was gone);
+ *     6.6.y stable removed AMP support and the field itself.
  *   - driver cleans up like the vendor on close (unregister stp rx +
  *     bluez mode off + WMT BT func off).
  *
@@ -721,7 +722,8 @@ static int __init hci_stp_init(void)
 	}
 	hu->hdev = hdev;
 	hdev->bus = HCI_UART;
-	hdev->dev_type = HCI_PRIMARY;
+	/* hdev->dev_type = HCI_PRIMARY removed: 6.6.y stable dropped AMP
+	 * support (and the dev_type field); every hci_dev is primary. */
 	hci_set_drvdata(hdev, hu);
 
 	hdev->open = hci_stp_open;
