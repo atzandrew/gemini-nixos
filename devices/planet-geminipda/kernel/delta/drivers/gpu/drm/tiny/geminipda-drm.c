@@ -74,6 +74,10 @@
  *    sync, pixels copied, full-frame count) for measuring without
  *    ftrace.  No hardware register is touched (CORE RULE 5).
  *
+ *  - Software vblank at refresh_hz (default 60) so flips complete at
+ *    panel rate instead of copy rate.  [2026-10-03] See the comment above
+ *    geminipda_drm_vblank_tick().
+ *
  * CORE RULE 5: this driver never initialises the panel.  LK does that.
  * The shadow blit only writes the already-initialised scanout region, so
  * there is no path from here to the "uninitialised panel" flicker.  The
@@ -82,6 +86,7 @@
  */
 
 #include <linux/dma-mapping.h>
+#include <linux/hrtimer.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
@@ -92,6 +97,7 @@
 #include <asm/unaligned.h>
 
 #include <drm/drm_atomic.h>
+#include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc_helper.h>
@@ -109,6 +115,7 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_vblank.h>
 
 #define DRIVER_NAME	"geminipda-drm"
 #define DRIVER_DESC	"Gemini PDA (MT6797) LK framebuffer DRM/KMS driver"
@@ -181,6 +188,10 @@ struct geminipda_drm_device {
 	void __iomem *screen_base;
 	struct drm_display_mode mode;
 	u32 formats[4];
+	/* Software vblank (see geminipda_drm_vblank_tick()). */
+	struct hrtimer vblank_timer;
+	u64 vblank_period_ns;
+	bool vblank_on;
 };
 
 static struct geminipda_drm_device *
@@ -500,13 +511,160 @@ geminipda_drm_crtc_helper_mode_valid(struct drm_crtc *crtc,
 }
 
 /*
- * The CRTC is always enabled.  Screen updates are performed by the
- * primary plane's atomic_update function; disabling clears the screen in
- * the primary plane's atomic_disable function.
+ * Software vblank.  [2026-10-03]
+ *
+ * The LK scanout is free-running and this driver never touches the
+ * display hardware (CORE RULE 5), so there is no real vblank interrupt.
+ * Without one, the DRM core completed every page flip as soon as the
+ * blit finished, compositors believed the panel refreshed at copy speed
+ * (labwc: ~157 commits/s on a 60 Hz panel — ~100 wasted frames/s) and
+ * KWin's frame scheduler worked from irregular timestamps.  An hrtimer
+ * now ticks at refresh_hz and drives drm_crtc_handle_vblank(); flip
+ * events are armed in atomic_flush and delivered on the next tick, with
+ * exact periodic timestamps (as in vkms).  The tick is NOT synchronised
+ * to the panel's real scan (that needs the OVL/RDMA frame IRQ), so
+ * tearing is unchanged.
+ *
+ * refresh_hz (0644): 60 = pace like the panel (default; 1..240 accepted);
+ * 0 = uncapped: flip events are sent straight from atomic_flush and the
+ * commit tail skips its wait-for-vblank (the old behaviour, for measuring
+ * headroom) while the tick itself keeps running at 60 Hz for anything
+ * that waits on vblank counts.  Changes apply from the next commit/tick.
+ *
+ * disable_vblank must not hrtimer_cancel(): the core calls it under
+ * vblank_time_lock, which drm_handle_vblank() in the callback also takes.
+ * Instead the callback checks vblank_on after handling and stops itself.
+ */
+static unsigned int refresh_hz = 60;
+module_param(refresh_hz, uint, 0644);
+MODULE_PARM_DESC(refresh_hz,
+	"Software vblank rate in Hz (60 = panel; 0 = complete flips immediately)");
+
+static u64 geminipda_drm_vblank_period_ns(void)
+{
+	unsigned int hz = READ_ONCE(refresh_hz);
+
+	/* 0 = uncapped flips; the tick itself stays at the panel's 60 Hz. */
+	return div_u64(NSEC_PER_SEC, hz ? clamp(hz, 1U, 240U) : 60U);
+}
+
+/*
+ * Keep the vblank core's frame duration equal to the tick period: with no
+ * hardware counter it derives vblank counts from timestamp deltas divided
+ * by framedur_ns, so a mismatch would make it drop or double-count ticks.
+ */
+static void geminipda_drm_set_period(struct geminipda_drm_device *sdev, u64 period)
+{
+	struct drm_vblank_crtc *vblank = &sdev->dev.vblank[drm_crtc_index(&sdev->crtc)];
+
+	WRITE_ONCE(sdev->vblank_period_ns, period);
+	WRITE_ONCE(vblank->framedur_ns, (int)period);
+}
+
+static enum hrtimer_restart geminipda_drm_vblank_tick(struct hrtimer *timer)
+{
+	struct geminipda_drm_device *sdev =
+		container_of(timer, struct geminipda_drm_device, vblank_timer);
+	u64 period = geminipda_drm_vblank_period_ns();
+
+	if (!READ_ONCE(sdev->vblank_on))
+		return HRTIMER_NORESTART;
+
+	/* Forward first (as real hw latches before the IRQ); see timestamp. */
+	if (period != READ_ONCE(sdev->vblank_period_ns))
+		geminipda_drm_set_period(sdev, period);
+	hrtimer_forward_now(timer, ns_to_ktime(period));
+
+	drm_crtc_handle_vblank(&sdev->crtc);
+
+	return READ_ONCE(sdev->vblank_on) ? HRTIMER_RESTART : HRTIMER_NORESTART;
+}
+
+static int geminipda_drm_enable_vblank(struct drm_crtc *crtc)
+{
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
+	u64 period = geminipda_drm_vblank_period_ns();
+
+	drm_calc_timestamping_constants(crtc, &crtc->mode);
+	geminipda_drm_set_period(sdev, period);
+	WRITE_ONCE(sdev->vblank_on, true);
+	hrtimer_start(&sdev->vblank_timer, ns_to_ktime(period), HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+static void geminipda_drm_disable_vblank(struct drm_crtc *crtc)
+{
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
+
+	WRITE_ONCE(sdev->vblank_on, false);
+	hrtimer_try_to_cancel(&sdev->vblank_timer);
+}
+
+static bool geminipda_drm_get_vblank_timestamp(struct drm_crtc *crtc,
+					       int *max_error,
+					       ktime_t *vblank_time,
+					       bool in_vblank_irq)
+{
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
+	struct drm_vblank_crtc *vblank = &crtc->dev->vblank[drm_crtc_index(crtc)];
+
+	if (!READ_ONCE(vblank->enabled)) {
+		*vblank_time = ktime_get();
+		return true;
+	}
+
+	/* The timer was forwarded before handling: back up one period. */
+	*vblank_time = ktime_sub_ns(READ_ONCE(sdev->vblank_timer.node.expires),
+				    READ_ONCE(sdev->vblank_period_ns));
+	return true;
+}
+
+static void geminipda_drm_crtc_helper_atomic_enable(struct drm_crtc *crtc,
+						    struct drm_atomic_state *state)
+{
+	drm_crtc_vblank_on(crtc);
+}
+
+static void geminipda_drm_crtc_helper_atomic_disable(struct drm_crtc *crtc,
+						     struct drm_atomic_state *state)
+{
+	drm_crtc_vblank_off(crtc);
+}
+
+/*
+ * Runs after the primary plane's atomic_update (the blit), so the flip
+ * event fires on the first tick after the copy is complete.
+ */
+static void geminipda_drm_crtc_helper_atomic_flush(struct drm_crtc *crtc,
+						   struct drm_atomic_state *state)
+{
+	struct drm_pending_vblank_event *event = crtc->state->event;
+
+	if (!event)
+		return;
+	crtc->state->event = NULL;
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (READ_ONCE(refresh_hz) && drm_crtc_vblank_get(crtc) == 0)
+		drm_crtc_arm_vblank_event(crtc, event);
+	else
+		drm_crtc_send_vblank_event(crtc, event);
+	spin_unlock_irq(&crtc->dev->event_lock);
+}
+
+/*
+ * Screen updates are performed by the primary plane's atomic_update
+ * function; disabling clears the screen in the primary plane's
+ * atomic_disable function.  CRTC enable/disable only switch the software
+ * vblank on and off.
  */
 static const struct drm_crtc_helper_funcs geminipda_drm_crtc_helper_funcs = {
 	.mode_valid = geminipda_drm_crtc_helper_mode_valid,
 	.atomic_check = drm_crtc_helper_atomic_check,
+	.atomic_flush = geminipda_drm_crtc_helper_atomic_flush,
+	.atomic_enable = geminipda_drm_crtc_helper_atomic_enable,
+	.atomic_disable = geminipda_drm_crtc_helper_atomic_disable,
 };
 
 static const struct drm_crtc_funcs geminipda_drm_crtc_funcs = {
@@ -516,6 +674,9 @@ static const struct drm_crtc_funcs geminipda_drm_crtc_funcs = {
 	.page_flip = drm_atomic_helper_page_flip,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	.enable_vblank = geminipda_drm_enable_vblank,
+	.disable_vblank = geminipda_drm_disable_vblank,
+	.get_vblank_timestamp = geminipda_drm_get_vblank_timestamp,
 };
 
 static const struct drm_encoder_funcs geminipda_drm_encoder_funcs = {
@@ -540,6 +701,28 @@ static const struct drm_connector_funcs geminipda_drm_connector_funcs = {
 	.destroy = drm_connector_cleanup,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+};
+
+/*
+ * drm_atomic_helper_commit_tail() minus the wait-for-vblank when
+ * refresh_hz == 0 (uncapped; see the software vblank comment).
+ */
+static void geminipda_drm_commit_tail(struct drm_atomic_state *old_state)
+{
+	struct drm_device *dev = old_state->dev;
+
+	drm_atomic_helper_commit_modeset_disables(dev, old_state);
+	drm_atomic_helper_commit_planes(dev, old_state, 0);
+	drm_atomic_helper_commit_modeset_enables(dev, old_state);
+	drm_atomic_helper_fake_vblank(old_state);
+	drm_atomic_helper_commit_hw_done(old_state);
+	if (READ_ONCE(refresh_hz))
+		drm_atomic_helper_wait_for_vblanks(dev, old_state);
+	drm_atomic_helper_cleanup_planes(dev, old_state);
+}
+
+static const struct drm_mode_config_helper_funcs geminipda_drm_mode_config_helper_funcs = {
+	.atomic_commit_tail = geminipda_drm_commit_tail,
 };
 
 static const struct drm_mode_config_funcs geminipda_drm_mode_config_funcs = {
@@ -652,6 +835,7 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 	dev->mode_config.max_height = max_height;
 	dev->mode_config.preferred_depth = format->depth;
 	dev->mode_config.funcs = &geminipda_drm_mode_config_funcs;
+	dev->mode_config.helper_private = &geminipda_drm_mode_config_helper_funcs;
 
 	/* Primary plane */
 	nformats = drm_fb_build_fourcc_list(dev, &format->format, 1,
@@ -702,6 +886,13 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 	if (ret)
 		return ERR_PTR(ret);
 
+	/* Software vblank: one CRTC, timer armed by enable_vblank. */
+	hrtimer_init(&sdev->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	sdev->vblank_timer.function = geminipda_drm_vblank_tick;
+	ret = drm_vblank_init(dev, 1);
+	if (ret)
+		return ERR_PTR(ret);
+
 	drm_mode_config_reset(dev);
 
 	return sdev;
@@ -747,6 +938,8 @@ static int geminipda_drm_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
+	sdev->vblank_on = false;
+	hrtimer_cancel(&sdev->vblank_timer);
 
 	return 0;
 }
@@ -756,6 +949,8 @@ static void geminipda_drm_shutdown(struct platform_device *pdev)
 	struct geminipda_drm_device *sdev = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&sdev->dev);
+	sdev->vblank_on = false;
+	hrtimer_cancel(&sdev->vblank_timer);
 }
 
 static const struct of_device_id geminipda_drm_of_match[] = {
