@@ -377,6 +377,27 @@ static const struct snd_soc_dapm_route mt6797_memif_routes[] = {
 	{"UL_MONO_2_CH1", "ADDA_UL_CH2", "ADDA Capture"},
 };
 
+/*
+ * [gemini 2026-10-03] Since v6.6 the generic mtk_afe_pcm_platform has no
+ * .probe, so each SoC driver must call mtk_afe_add_sub_dai_control()
+ * itself (upstream mt6797 does, via this component).  The delta used to
+ * register mtk_afe_pcm_platform directly, which silently dropped every
+ * sub-DAI widget/control/route (ADDA_DL_CH1/2 DL1_CH1/2, UL*_CH* ...):
+ * DL1 had no backend ("no backend DAIs enabled for Playback_1") and
+ * hw_params failed with -EINVAL.
+ */
+static int mt6797_afe_component_probe(struct snd_soc_component *component)
+{
+	return mtk_afe_add_sub_dai_control(component);
+}
+
+static const struct snd_soc_component_driver mt6797_afe_component = {
+	.name		= AFE_PCM_NAME,
+	.probe		= mt6797_afe_component_probe,
+	.pointer	= mtk_afe_pcm_pointer,
+	.pcm_construct	= mtk_afe_pcm_new,
+};
+
 static const struct snd_soc_component_driver mt6797_afe_pcm_dai_component = {
 	.name = "mt6797-afe-pcm-dai",
 };
@@ -836,7 +857,7 @@ static int mt6797_afe_pcm_dev_probe(struct platform_device *pdev)
 	pm_runtime_get_sync(&pdev->dev);
 
 	/* register component */
-	ret = devm_snd_soc_register_component(dev, &mtk_afe_pcm_platform,
+	ret = devm_snd_soc_register_component(dev, &mt6797_afe_component,
 					      NULL, 0);
 	if (ret) {
 		dev_warn(dev, "err_platform\n");
