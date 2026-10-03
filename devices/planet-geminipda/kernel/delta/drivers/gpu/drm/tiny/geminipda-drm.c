@@ -62,7 +62,6 @@
  * panel) stays excluded — see devices/planet-geminipda/kernel/default.nix.
  */
 
-#include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -91,7 +90,7 @@
 
 #define DRIVER_NAME	"geminipda-drm"
 #define DRIVER_DESC	"Gemini PDA (MT6797) LK framebuffer DRM/KMS driver"
-#define DRIVER_DATE	"20261002"
+#define DRIVER_DATE	"20260910"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -194,42 +193,6 @@ static const uint64_t geminipda_drm_primary_plane_format_modifiers[] = {
 	DRM_FORMAT_MOD_INVALID
 };
 
-/*
- * Make GPU writes visible to the CPU blit.  [2026-10-02, gemini-debian]
- *
- * The scanout copy below reads the framebuffer through the CPU's cached
- * kernel mapping (shmem vmap).  With an accelerated X/Wayland stack the
- * framebuffer is allocated HERE (dumb/GBM on card0) and exported to the
- * Mali (panfrost, via Mesa kmsro), which renders into it with
- * non-coherent DMA.  drm_gem_fb_begin_cpu_access() only syncs IMPORTED
- * objects, so for our own objects nothing invalidated the CPU cache and
- * the blit could copy stale lines: on glass this showed as rubber-band
- * "residue" under X+glamor that vanished with AccelMethod "none".
- * Clean (write back CPU-dirty lines) then invalidate the whole object so
- * the copy sees what the GPU wrote.  Needs a 64-bit DMA mask (set in
- * device_create) so the shmem pages above 4 GiB are not bounced.
- */
-static void geminipda_drm_sync_fb_for_cpu(struct drm_framebuffer *fb)
-{
-	struct device *dmadev = fb->dev->dev;
-	unsigned int i;
-
-	for (i = 0; i < fb->format->num_planes; i++) {
-		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, i);
-		struct sg_table *sgt;
-
-		if (!obj || obj->import_attach)
-			continue;	/* imported: begin_cpu_access synced it */
-
-		sgt = drm_gem_shmem_get_pages_sgt(to_drm_gem_shmem_obj(obj));
-		if (IS_ERR(sgt))
-			continue;
-
-		dma_sync_sgtable_for_device(dmadev, sgt, DMA_TO_DEVICE);
-		dma_sync_sgtable_for_cpu(dmadev, sgt, DMA_FROM_DEVICE);
-	}
-}
-
 static void
 geminipda_drm_primary_plane_helper_atomic_update(struct drm_plane *plane,
 						 struct drm_atomic_state *state)
@@ -253,8 +216,6 @@ geminipda_drm_primary_plane_helper_atomic_update(struct drm_plane *plane,
 
 	if (!drm_dev_enter(dev, &idx))
 		goto out;
-
-	geminipda_drm_sync_fb_for_cpu(fb);
 
 	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
 	drm_atomic_for_each_plane_damage(&iter, &damage) {
@@ -409,15 +370,6 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 		return ERR_CAST(sdev);
 	dev = &sdev->dev;
 	platform_set_drvdata(pdev, sdev);
-
-	/*
-	 * 64-bit DMA mask for the cache maintenance in
-	 * geminipda_drm_sync_fb_for_cpu(): the OF default (32-bit) would
-	 * bounce shmem pages above 4 GiB through swiotlb.
-	 */
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (ret)
-		drm_warn(dev, "no 64-bit DMA mask (%d); GPU frames may show stale pixels\n", ret);
 
 	/* --- Hardware settings ------------------------------------- */
 	ret = geminipda_drm_get_geometry(&fb_base, &fb_size);
