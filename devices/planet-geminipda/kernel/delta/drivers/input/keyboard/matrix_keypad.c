@@ -23,6 +23,22 @@
 #include <linux/of_gpio.h>
 #include <linux/of_platform.h>
 
+/*
+ * Polling-mode scan interval override.  [2026-10-03, gemini-debian]
+ *
+ * The Gemini's keyboard rows sit behind an AW9523B I2C GPIO expander with
+ * no usable interrupt line on this kernel, so the matrix is POLLED; each
+ * scan walks every column over I2C.  The device-tree "poll-interval" made
+ * that ~3,100 I2C interrupts/s on CPU0 at idle (measured 2026-10-03).
+ * 20 ms (50 scans/s) is a normal keyboard scan rate and still well below a
+ * keystroke's press time.  Tunable at runtime without reflashing:
+ *   /sys/module/matrix_keypad/parameters/poll_ms   (0 = use the DT value)
+ */
+static unsigned int poll_ms = 20;
+module_param(poll_ms, uint, 0644);
+MODULE_PARM_DESC(poll_ms,
+	"Polling-mode scan interval in ms (0 = device tree poll-interval)");
+
 struct matrix_keypad {
 	const struct matrix_keypad_platform_data *pdata;
 	struct input_dev *input_dev;
@@ -178,7 +194,8 @@ static void matrix_keypad_scan(struct work_struct *work)
 	if (pdata->poll_interval_ms) {
 		if (!keypad->stopped)
 			schedule_delayed_work(&keypad->work,
-				msecs_to_jiffies(pdata->poll_interval_ms));
+				msecs_to_jiffies(READ_ONCE(poll_ms) ?:
+						 pdata->poll_interval_ms));
 	} else {
 		enable_row_irqs(keypad);
 	}
@@ -561,8 +578,8 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, keypad);
 
 	if (pdata->poll_interval_ms)
-		dev_info(&pdev->dev, "polling mode, interval %u ms\n",
-			 pdata->poll_interval_ms);
+		dev_info(&pdev->dev, "polling mode, interval %u ms (DT %u ms; poll_ms parameter)\n",
+			 poll_ms ?: pdata->poll_interval_ms, pdata->poll_interval_ms);
 
 	return 0;
 
