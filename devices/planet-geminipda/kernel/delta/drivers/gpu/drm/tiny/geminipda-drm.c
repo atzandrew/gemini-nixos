@@ -55,6 +55,25 @@
  *    in the DRM commit worker and pinned it at ~100 % CPU.  [2026-09-10;
  *    rewritten 2026-09-10k]
  *
+ *  - Fast single-pass copy + damage-scoped cache sync.  [2026-10-03,
+ *    gemini-debian Plasma investigation]  perf under KWin showed the
+ *    generic drm_fb_blit() path costing ~20 ms per commit for a small
+ *    window (es2gears ~28 fps on glass): __drm_fb_xfrm ~45 %, its line
+ *    buffer memmove + __memcpy_toio ~35 %, and the whole-object cache
+ *    clean+invalidate of 509bd9e ~20 %.  For XRGB/ARGB8888 sources the
+ *    copy is now one loop per damaged row: 8-byte loads, alpha forced to
+ *    0xff with one OR per two pixels, 8-byte stores straight into the WC
+ *    scanout (memcpy-speed; plain copy of a full frame ≈ 7 ms at the
+ *    measured 2.8 GB/s).  The cache sync from 509bd9e (reverted in
+ *    063585d) is back but limited to the byte range actually copied:
+ *    the GPU renders into our shmem objects with non-coherent DMA while
+ *    the blit reads them through a cached vmap, so stale lines are
+ *    possible in principle (the X "residue" turned out to be X damage,
+ *    not this).  Live switches (/sys/module/geminipda_drm/parameters):
+ *    fast_copy, cache_sync; per-commit stats stat_* (copy time incl.
+ *    sync, pixels copied, full-frame count) for measuring without
+ *    ftrace.  No hardware register is touched (CORE RULE 5).
+ *
  * CORE RULE 5: this driver never initialises the panel.  LK does that.
  * The shadow blit only writes the already-initialised scanout region, so
  * there is no path from here to the "uninitialised panel" flicker.  The
@@ -62,9 +81,12 @@
  * panel) stays excluded — see devices/planet-geminipda/kernel/default.nix.
  */
 
+#include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/scatterlist.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <asm/unaligned.h>
@@ -90,7 +112,7 @@
 
 #define DRIVER_NAME	"geminipda-drm"
 #define DRIVER_DESC	"Gemini PDA (MT6797) LK framebuffer DRM/KMS driver"
-#define DRIVER_DATE	"20260910"
+#define DRIVER_DATE	"20261003"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -118,6 +140,35 @@ static int panel_orientation = DRM_MODE_PANEL_ORIENTATION_LEFT_UP;
 module_param(panel_orientation, int, 0444);
 MODULE_PARM_DESC(panel_orientation,
 	"Panel mounting: 0=normal, 1=upside-down, 2=left-up, 3=right-up");
+
+/* Live A/B switches (see the 2026-10-03 note in the file header). */
+static bool fast_copy = true;
+module_param(fast_copy, bool, 0644);
+MODULE_PARM_DESC(fast_copy,
+	"Single-pass XRGB/ARGB8888 scanout copy (0 = generic drm_fb_blit)");
+
+static bool cache_sync = true;
+module_param(cache_sync, bool, 0644);
+MODULE_PARM_DESC(cache_sync,
+	"Clean+invalidate the CPU cache over the copied range before the blit");
+
+/*
+ * Per-commit statistics, read-only except stat_copy_us_max (write 0 to
+ * reset).  Average copy time over an interval = delta(stat_copy_us_total)
+ * / delta(stat_commits).  "Copy" includes the cache sync.
+ */
+static unsigned long stat_commits;
+module_param(stat_commits, ulong, 0444);
+static unsigned long stat_copy_us_total;
+module_param(stat_copy_us_total, ulong, 0444);
+static unsigned int stat_copy_us_last;
+module_param(stat_copy_us_last, uint, 0444);
+static unsigned int stat_copy_us_max;
+module_param(stat_copy_us_max, uint, 0644);
+static unsigned int stat_px_last;
+module_param(stat_px_last, uint, 0444);
+static unsigned long stat_full_frames;
+module_param(stat_full_frames, ulong, 0444);
 
 struct geminipda_drm_device {
 	struct drm_device dev;
@@ -193,6 +244,109 @@ static const uint64_t geminipda_drm_primary_plane_format_modifiers[] = {
 	DRM_FORMAT_MOD_INVALID
 };
 
+/*
+ * Make GPU writes in [start, start + len) of plane 0's object visible to
+ * the CPU blit.  Our own (non-imported) shmem objects are rendered into
+ * by panfrost via kmsro with non-coherent DMA but read here through a
+ * cached vmap; drm_gem_fb_begin_cpu_access() only syncs IMPORTED objects.
+ * Clean first (keeps CPU-written lines from software-rendering clients
+ * that mmap the dumb buffer), then invalidate.  Only the byte range the
+ * blit reads is touched — 509bd9e did the whole ~9 MB object per commit.
+ *
+ * The ranges are synced with dma_sync_single_range_*() on the segments
+ * of the object's sg mapping; with dma-direct (no IOMMU on this device)
+ * DMA segments == CPU segments, so object offsets map 1:1.
+ */
+static void geminipda_drm_sync_range_for_cpu(struct drm_framebuffer *fb,
+					     size_t start, size_t len)
+{
+	struct device *dmadev = fb->dev->dev;
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	size_t end = start + len, seg_start = 0;
+	unsigned int i;
+
+	if (!obj || obj->import_attach || !len)
+		return;	/* imported: begin_cpu_access synced it */
+
+	sgt = drm_gem_shmem_get_pages_sgt(to_drm_gem_shmem_obj(obj));
+	if (IS_ERR(sgt))
+		return;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		size_t seg_end = seg_start + sg_dma_len(sg);
+
+		if (seg_start >= end)
+			break;
+		if (seg_end > start) {
+			size_t a = max(start, seg_start);
+			size_t b = min(end, seg_end);
+
+			dma_sync_single_range_for_device(dmadev, sg_dma_address(sg),
+							 a - seg_start, b - a,
+							 DMA_TO_DEVICE);
+			dma_sync_single_range_for_cpu(dmadev, sg_dma_address(sg),
+						      a - seg_start, b - a,
+						      DMA_FROM_DEVICE);
+		}
+		seg_start = seg_end;
+	}
+}
+
+/*
+ * One-pass XRGB/ARGB8888 -> scanout ARGB8888 copy of a w x h rectangle:
+ * 8-byte loads from the (cached) shadow mapping, alpha forced to 0xff
+ * for both pixels with one OR, 8-byte stores into the write-combined
+ * scanout.  Pixels are little-endian u32 0xAARRGGBB, so two pixels in a
+ * u64 have their alpha bytes at bits 31:24 and 63:56.
+ */
+#define GEMINIPDA_ALPHA2	0xff000000ff000000ULL
+
+static void geminipda_drm_copy_rect(u8 __iomem *dst, unsigned int dpitch,
+				    const u8 *src, unsigned int spitch,
+				    unsigned int w, unsigned int h)
+{
+	while (h--) {
+		u8 __iomem *d = dst;
+		const u8 *s = src;
+		unsigned int n = w;
+
+		/* Align the destination to 8 bytes (odd start column). */
+		if (n && ((unsigned long)(__force void *)d & 7)) {
+			__raw_writel(get_unaligned((const u32 *)s) | 0xff000000U, d);
+			d += 4;
+			s += 4;
+			n--;
+		}
+		while (n >= 8) {
+			u64 p0 = get_unaligned((const u64 *)(s + 0));
+			u64 p1 = get_unaligned((const u64 *)(s + 8));
+			u64 p2 = get_unaligned((const u64 *)(s + 16));
+			u64 p3 = get_unaligned((const u64 *)(s + 24));
+
+			__raw_writeq(p0 | GEMINIPDA_ALPHA2, d + 0);
+			__raw_writeq(p1 | GEMINIPDA_ALPHA2, d + 8);
+			__raw_writeq(p2 | GEMINIPDA_ALPHA2, d + 16);
+			__raw_writeq(p3 | GEMINIPDA_ALPHA2, d + 24);
+			d += 32;
+			s += 32;
+			n -= 8;
+		}
+		while (n >= 2) {
+			__raw_writeq(get_unaligned((const u64 *)s) | GEMINIPDA_ALPHA2, d);
+			d += 8;
+			s += 8;
+			n -= 2;
+		}
+		if (n)
+			__raw_writel(get_unaligned((const u32 *)s) | 0xff000000U, d);
+
+		dst += dpitch;
+		src += spitch;
+	}
+}
+
 static void
 geminipda_drm_primary_plane_helper_atomic_update(struct drm_plane *plane,
 						 struct drm_atomic_state *state)
@@ -205,6 +359,9 @@ geminipda_drm_primary_plane_helper_atomic_update(struct drm_plane *plane,
 	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(dev);
 	struct drm_atomic_helper_damage_iter iter;
 	struct drm_rect damage;
+	bool fast, synced_all = false;
+	unsigned int px = 0, us;
+	u64 t0;
 	int ret, idx;
 
 	if (!fb)
@@ -217,31 +374,85 @@ geminipda_drm_primary_plane_helper_atomic_update(struct drm_plane *plane,
 	if (!drm_dev_enter(dev, &idx))
 		goto out;
 
+	t0 = ktime_get_ns();
+
+	fast = fast_copy && !shadow_plane_state->data[0].is_iomem &&
+	       (fb->format->format == DRM_FORMAT_XRGB8888 ||
+		fb->format->format == DRM_FORMAT_ARGB8888);
+
 	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
 	drm_atomic_for_each_plane_damage(&iter, &damage) {
 		struct drm_rect dst_clip = plane_state->dst;
-		struct iosys_map dst = IOSYS_MAP_INIT_VADDR_IOMEM(sdev->screen_base);
-		unsigned int offset;
+		unsigned int w, h;
 
 		if (!drm_rect_intersect(&dst_clip, &damage))
 			continue;
 
-		offset = drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip);
-		iosys_map_incr(&dst, offset);
+		w = drm_rect_width(&dst_clip);
+		h = drm_rect_height(&dst_clip);
+		if (!w || !h)
+			continue;
+		px += w * h;
 
-		/*
-		 * fb->format is XRGB8888 (the plane format list is built by
-		 * drm_fb_build_fourcc_list(), which strips alpha from the
-		 * native ARGB8888), while sdev->format is the scanout's
-		 * ARGB8888.  drm_fb_blit() therefore runs the XRGB8888 ->
-		 * ARGB8888 conversion, which fills the alpha byte with 0xff
-		 * during the copy — exactly what the LK/OVL scanout needs (see
-		 * the file header).  Do NOT add a separate per-pixel alpha
-		 * pass here: that pinned the DRM commit worker at 100 % CPU.
-		 */
-		drm_fb_blit(&dst, &sdev->pitch, sdev->format->format,
-			    shadow_plane_state->data, fb, &damage);
+		if (fast) {
+			/*
+			 * The plane is unscaled and full-screen (fixed mode,
+			 * drm_plane_helper_atomic_check), so source and
+			 * destination share coordinates.
+			 */
+			size_t soff = fb->offsets[0] +
+				      (size_t)dst_clip.y1 * fb->pitches[0] +
+				      (size_t)dst_clip.x1 * 4;
+			size_t slen = (size_t)(h - 1) * fb->pitches[0] +
+				      (size_t)w * 4;
+
+			if (cache_sync)
+				geminipda_drm_sync_range_for_cpu(fb, soff, slen);
+
+			geminipda_drm_copy_rect((u8 __iomem *)sdev->screen_base +
+						(size_t)dst_clip.y1 * sdev->pitch +
+						(size_t)dst_clip.x1 * 4,
+						sdev->pitch,
+						(const u8 *)shadow_plane_state->data[0].vaddr + soff,
+						fb->pitches[0], w, h);
+		} else {
+			struct iosys_map dst = IOSYS_MAP_INIT_VADDR_IOMEM(sdev->screen_base);
+			unsigned int offset;
+
+			if (cache_sync && !synced_all) {
+				struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+
+				if (obj)
+					geminipda_drm_sync_range_for_cpu(fb, 0, obj->size);
+				synced_all = true;
+			}
+
+			offset = drm_fb_clip_offset(sdev->pitch, sdev->format, &dst_clip);
+			iosys_map_incr(&dst, offset);
+
+			/*
+			 * Generic path: drm_fb_blit() runs the XRGB8888 ->
+			 * ARGB8888 conversion, which fills alpha with 0xff (see
+			 * the file header).  Do NOT add a separate per-pixel
+			 * alpha pass: that pinned the commit worker at 100 %.
+			 */
+			drm_fb_blit(&dst, &sdev->pitch, sdev->format->format,
+				    shadow_plane_state->data, fb, &damage);
+		}
 	}
+
+	/* Drain the write-combining buffer before the (fake) vblank event. */
+	wmb();
+
+	us = div_u64(ktime_get_ns() - t0, 1000);
+	stat_commits++;
+	stat_copy_us_total += us;
+	stat_copy_us_last = us;
+	if (us > stat_copy_us_max)
+		stat_copy_us_max = us;
+	stat_px_last = px;
+	if (px >= GEMINIPDA_DRM_WIDTH * GEMINIPDA_DRM_HEIGHT)
+		stat_full_frames++;
 
 	drm_dev_exit(idx);
 out:
@@ -370,6 +581,15 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 		return ERR_CAST(sdev);
 	dev = &sdev->dev;
 	platform_set_drvdata(pdev, sdev);
+
+	/*
+	 * 64-bit DMA mask for geminipda_drm_sync_range_for_cpu(): RAM runs
+	 * to 0x140000000, and the OF default (32-bit) would bounce shmem
+	 * pages above 4 GiB through swiotlb (from 509bd9e).
+	 */
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret)
+		drm_warn(dev, "no 64-bit DMA mask (%d); GPU frames may show stale pixels\n", ret);
 
 	/* --- Hardware settings ------------------------------------- */
 	ret = geminipda_drm_get_geometry(&fb_base, &fb_size);
