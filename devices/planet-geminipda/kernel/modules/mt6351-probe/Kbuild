@@ -1,0 +1,4 @@
+# Kbuild for the READ-ONLY MT6351 probe (built by ./default.nix:
+#   nix build .#packages.aarch64-linux.mt6351-probe).
+# Manual: make -C <kernel-build-dir> ARCH=arm64 M=$PWD KBUILD_MODPOST_WARN=1 modules
+obj-m := mt6351-probe.o

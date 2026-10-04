@@ -1,0 +1,3 @@
+# Kbuild for the MT6351 fuel-gauge power_supply (dev module; built by ./default.nix:
+#   nix build .#packages.aarch64-linux.mt6351-gauge).
+obj-m := mt6351-gauge.o

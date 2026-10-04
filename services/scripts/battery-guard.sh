@@ -45,6 +45,29 @@
 # failed (I2C glitch) and must not trigger a poweroff. Poweroff requires
 # two consecutive CRIT samples.
 
+# --- MT6351 fuel gauge mode (2026-10-03) ---------------------------------
+# When /sys/class/power_supply/mt6351-battery exists (mt6351-gauge.ko, see
+# devices/planet-geminipda/kernel/modules/mt6351-gauge and claude/power.md),
+# the guard uses IT instead of the BQ25896 for the battery decisions:
+#   - voltage_now comes from the MT6351 AUXADC, which works at any battery
+#     level. The BQ25896 VBAT ADC returns code 0 (2.304 V) below ~3.56 V
+#     loaded, i.e. the old BQ-only guard went BLIND exactly when the
+#     battery was low.
+#   - capacity is the coulomb-counted state of charge.
+# On battery:
+#   WARN  capacity <= GAUGE_WARN_PCT (10) or VBAT < GAUGE_WARN_MV (3450)
+#         -> journal + desktop notification
+#   CRIT  VBAT < GAUGE_CRIT_MV (3400, loaded; vendor Android also shut
+#         down at 3.4 V) or (capacity == 0 and VBAT < GAUGE_CAP0_MV 3500),
+#         two consecutive samples -> notify + systemctl poweroff.
+#   (Loaded thresholds: this pack has ~0.28 Ohm, so 3.40 V at ~1 A is a
+#   resting ~3.68 V = a few percent left, not empty.)
+# Also persists the gauge's learned charge_full to
+# /var/lib/gemini-gauge/charge_full and restores it when the gauge appears.
+# NOTE (G1): systemctl poweroff does not yet truly power the unit off
+# (~0.5 W keeps flowing), but it is still ~8x less drain than running.
+# Without the gauge the original BQ logic below runs unchanged.
+
 set -u
 
 PSY_GLOB='/sys/class/power_supply/bq25890-charger-*'
@@ -56,10 +79,21 @@ WARN_LOW_MV=${BATTERY_GUARD_WARN_LOW_MV:-3650}
 CRIT_MV=${BATTERY_GUARD_CRIT_MV:-3500}
 ALERT_COOLDOWN_S=${BATTERY_GUARD_ALERT_COOLDOWN_S:-300}
 STUCK_CHARGE_MIN=${BATTERY_GUARD_STUCK_CHARGE_MIN:-15}
+GAUGE=/sys/class/power_supply/mt6351-battery
+G_WARN_PCT=${BATTERY_GUARD_GAUGE_WARN_PCT:-10}
+G_WARN_MV=${BATTERY_GUARD_GAUGE_WARN_MV:-3450}
+G_CRIT_MV=${BATTERY_GUARD_GAUGE_CRIT_MV:-3400}
+G_CAP0_MV=${BATTERY_GUARD_GAUGE_CAP0_MV:-3500}
+FCC_SAVE=/var/lib/gemini-gauge/charge_full
+g_seen=0
+g_fcc_last=""
+g_dis_since=0
+CAP=?
+SRC=bq
 
 mkdir -p "$RUNDIR"
 if [ ! -s "$HIST" ]; then
-    echo 'ts,online,status,charge_type,vbat_mv,ibat_uA,temp_10c,guard' > "$HIST"
+    echo 'ts,online,status,charge_type,vbat_mv,ibat_uA,temp_10c,guard,source,capacity' > "$HIST"
 fi
 
 last_alert_ts=0
@@ -71,14 +105,125 @@ now() { date '+%s'; }
 stamp() { date '+%F %T'; }
 log() { echo "[$(stamp)] $*" | logger -t battery-guard -p daemon.info; }
 
-# alert LEVEL MSG — rate-limited (ALERT_COOLDOWN_S)
+# notify_desktop MSG — critical notification on every logged-in graphical
+# session (any freedesktop notification daemon; best effort, never blocks)
+notify_desktop() {
+    local b uid u
+    for b in /run/user/[0-9]*/bus; do
+        [ -S "$b" ] || continue
+        uid=${b#/run/user/}; uid=${uid%/bus}
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        u=$(id -nu "$uid" 2>/dev/null) || continue
+        if command -v notify-send >/dev/null 2>&1; then
+            timeout 5 runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$b" \
+                notify-send -u critical -a battery-guard "Battery" "$1" >/dev/null 2>&1 && continue
+        fi
+        if command -v gdbus >/dev/null 2>&1; then
+            timeout 5 runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$b" \
+                gdbus call --session --dest org.freedesktop.Notifications \
+                --object-path /org/freedesktop/Notifications \
+                --method org.freedesktop.Notifications.Notify battery-guard 0 battery-caution \
+                "Battery" "$1" '[]' '{"urgency": <byte 2>}' 0 >/dev/null 2>&1
+        fi
+    done
+}
+
+# alert LEVEL MSG — rate-limited (ALERT_COOLDOWN_S); WARN/CRIT also notify
 alert() {
     local t
     t=$(now)
     if [ "$t" -ge $((last_alert_ts + ALERT_COOLDOWN_S)) ]; then
         log "ALERT $1: $2"
         last_alert_ts=$t
+        case "$1" in WARN|CRIT) notify_desktop "$2" ;; esac
     fi
+}
+
+# gauge_poll — battery decisions from the MT6351 gauge (see header).
+# Sets ONLINE STATUS CHGT VBAT_MV IBAT TEMP CAP GUARD; may power off.
+gauge_poll() {
+    local gst v f
+    SRC=gauge
+    if [ "$g_seen" = 0 ]; then
+        g_seen=1
+        if [ -s "$FCC_SAVE" ]; then
+            f=$(cat "$FCC_SAVE")
+            if echo "$f" > "$GAUGE/charge_full" 2>/dev/null; then
+                log "gauge: restored charge_full ${f} uAh"
+            else
+                log "gauge: could not restore charge_full ${f} uAh (out of range?)"
+            fi
+        fi
+        log "gauge mode: using $GAUGE (warn <=${G_WARN_PCT}% or <${G_WARN_MV}mV, crit <${G_CRIT_MV}mV or 0% & <${G_CAP0_MV}mV)"
+    fi
+    f=$(cat "$GAUGE/charge_full" 2>/dev/null || echo "")
+    if [ -n "$f" ] && [ "$f" != "$g_fcc_last" ]; then
+        mkdir -p "${FCC_SAVE%/*}" && echo "$f" > "$FCC_SAVE"
+        [ -n "$g_fcc_last" ] && log "gauge: charge_full ${g_fcc_last} -> ${f} uAh (saved)"
+        g_fcc_last=$f
+    fi
+
+    gst=$(cat "$GAUGE/status" 2>/dev/null || echo Unknown)
+    CAP=$(cat "$GAUGE/capacity" 2>/dev/null || echo "?")
+    v=$(cat "$GAUGE/voltage_now" 2>/dev/null || echo "")
+    IBAT=$(cat "$GAUGE/current_avg" 2>/dev/null || echo "?")
+    STATUS=$gst
+    case "$v" in (*[!0-9]*|'') VBAT_MV=? ;; (*) VBAT_MV=$((v / 1000)) ;; esac
+    case "$CAP" in (*[!0-9]*|'') CAP=? ;; esac
+    if read_psy; then
+        ONLINE=$(cat "$PSY/online" 2>/dev/null || echo "?")
+        CHGT=$(cat "$PSY/charge_type" 2>/dev/null || echo "?")
+        TEMP=$(cat "$PSY/temp" 2>/dev/null || echo "?")
+        case "$TEMP" in (*[!0-9]*|'') TEMP=? ;; esac
+    else
+        [ "$gst" = Discharging ] && ONLINE=0 || ONLINE=1
+    fi
+
+    if [ "$ONLINE" = 1 ]; then
+        crit_strikes=0
+        if [ "$gst" = Discharging ]; then
+            # brief dips under a load spike are normal; complain after 2 min
+            [ "$g_dis_since" -eq 0 ] && g_dis_since=$t
+            if [ $((t - g_dis_since)) -ge 120 ]; then
+                GUARD=NOTCHARGING
+                alert WARN "USB present but the battery has been discharging for 2+ min (load above charger input?) — ${CAP}%, ${VBAT_MV} mV"
+            fi
+        else
+            g_dis_since=0
+        fi
+        return
+    fi
+
+    if [ "$VBAT_MV" = "?" ] || [ "$VBAT_MV" -lt 2500 ]; then
+        GUARD=READERR
+        alert ERROR "gauge VBAT read failed (${v:-empty}) — capacity ${CAP}%"
+        [ "$CAP" = 0 ] || return
+        crit_strikes=$((crit_strikes + 1))
+    elif [ "$VBAT_MV" -lt "$G_CRIT_MV" ] || { [ "$CAP" = 0 ] && [ "$VBAT_MV" -lt "$G_CAP0_MV" ]; }; then
+        crit_strikes=$((crit_strikes + 1))
+    else
+        crit_strikes=0
+        if { [ "$CAP" != "?" ] && [ "$CAP" -le "$G_WARN_PCT" ]; } || [ "$VBAT_MV" -lt "$G_WARN_MV" ]; then
+            GUARD=LOW
+            alert WARN "battery low: ${CAP}% (${VBAT_MV} mV under load) — connect the charger"
+        fi
+        return
+    fi
+
+    GUARD=CRITICAL
+    if [ "$crit_strikes" -ge 2 ]; then
+        log "CRITICAL (gauge): ${CAP}%, VBAT ${VBAT_MV} mV on battery — powering off in 10 s"
+        notify_desktop "Battery empty (${CAP}%, ${VBAT_MV} mV) — powering off in 10 s. Connect the charger!"
+        write_state
+        sleep 10
+        if [ "$(cat "${PSY:-/nonexistent}/online" 2>/dev/null || echo 0)" = 1 ]; then
+            log "charger connected during the countdown — poweroff cancelled"
+            crit_strikes=0
+            return
+        fi
+        exec systemctl poweroff
+    fi
+    alert CRIT "battery critical: ${CAP}%, ${VBAT_MV} mV — will power off on the next sample unless the charger is connected"
 }
 
 read_psy() {
@@ -100,6 +245,8 @@ vbat_mv=${VBAT_MV:-?}
 ibat_uA=${IBAT:-?}
 temp_10c=${TEMP:-?}
 guard=${GUARD:-?}
+source=${SRC:-?}
+capacity=${CAP:-?}
 EOF
 }
 
@@ -108,7 +255,7 @@ rotate_hist() {
     sz=$(stat -c %s "$HIST" 2>/dev/null || echo 0)
     if [ "$sz" -gt 5242880 ]; then
         mv "$HIST" "$HIST.1"
-        echo 'ts,online,status,vbat_mv,ibat_uA,temp_10c,guard' > "$HIST"
+        echo 'ts,online,status,charge_type,vbat_mv,ibat_uA,temp_10c,guard,source,capacity' > "$HIST"
     fi
 }
 
@@ -117,9 +264,11 @@ log "battery-guard started (poll=${POLL_S}s warn<${WARN_LOW_MV}mV crit<${CRIT_MV
 while :; do
     t=$(now)
     GUARD=OK
-    ONLINE=?; STATUS=?; VBAT_MV=?; IBAT=?; TEMP=?
+    ONLINE=?; STATUS=?; VBAT_MV=?; IBAT=?; TEMP=?; CAP=?; SRC=bq
 
-    if ! read_psy; then
+    if [ -e "$GAUGE/capacity" ]; then
+        gauge_poll
+    elif ! read_psy; then
         GUARD=NOSUPPLY
         alert ERROR "no bq25890-charger power supply under /sys/class/power_supply — charger driver did not probe (check dmesg)"
     else
@@ -209,7 +358,7 @@ while :; do
         prev_guard=$GUARD
     fi
     write_state
-    echo "$(date '+%F %T'),${ONLINE},${STATUS},${CHGT:-?},${VBAT_MV},${IBAT},${TEMP},${GUARD}" >> "$HIST"
+    echo "$(date '+%F %T'),${ONLINE},${STATUS},${CHGT:-?},${VBAT_MV},${IBAT},${TEMP},${GUARD},${SRC},${CAP}" >> "$HIST"
     rotate_hist
     sleep "$POLL_S"
 done

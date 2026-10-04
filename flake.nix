@@ -271,6 +271,16 @@
         # stress test (docs/gemini-exodus.md; in the rootfs via
         # services/gemini-pda.nix).
         gemini-exodus = gemini-exodus;
+        # READ-ONLY MT6351 fuel-gauge/AUXADC register probe module
+        # (claude/power.md step 0). Light build: kernel derivation +
+        # modules_prepare + one module, no full kernel rebuild.
+        mt6351-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-probe {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
+        # MT6351 fuel gauge as a power_supply (development module, step 2+).
+        mt6351-gauge = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
       };
 
       # x86_64 host builds of the Rust apps — the nested dev loop runs on
