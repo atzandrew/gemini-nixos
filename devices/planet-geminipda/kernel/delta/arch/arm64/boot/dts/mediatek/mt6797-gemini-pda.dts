@@ -1127,7 +1127,7 @@
 		 * mt2701_compat matches the vendor layout: clk_div_bits=12,
 		 * pad_tune_reg=PAD_TUNE0, async_fifo, data_tune.
 		 */
-		compatible = "mediatek,mt2701-mmc";
+		compatible = "mediatek,mt6797-mmc", "mediatek,mt2701-mmc";
 		reg = <0 0x11230000 0 0x1000>;
 		/*
 		 * Vendor DTB: <0 0x4f 0x08> = SPI 79 level-LOW, inverted to
@@ -1164,8 +1164,39 @@
 		pinctrl-0 = <&msdc0_pins_default>;
 		pinctrl-1 = <&msdc0_pins_uhs>;
 		bus-width = <8>;
+		/*
+		 * 2026-10-04: 192 MHz (msdcpll_d2, mtk-sd mode 1) failed sustained
+		 * reads in attempt 2; a 100 MHz cap (96 MHz) passed 3 x 1 GiB
+		 * (logs/emmc-hs200c-96mhz-*). Attempt 2e: 200 MHz again (192 MHz)
+		 * with mediatek,latch-ck below. The cmdline can't set clocks or
+		 * driver parameters: CONFIG_CMDLINE_FORCE=y. Back out: 100000000.
+		 */
 		max-frequency = <200000000>;
+		/*
+		 * INT_DAT_LATCH_CK_SEL (PATCH_BIT0[9:7]) for HS200, applied by
+		 * mtk-sd during tuning only. Vendor 3.18 autok.c
+		 * execute_online_tuning_hs200() starts it at AUTOK_LATCH_CK_VALUE 1
+		 * and raises it until multi-block reads pass
+		 * (autok_execute_tuning_latch_ck); mainline defaults to 0 and tunes
+		 * with single-block CMD21 only -- which passed at 192 MHz while
+		 * sustained multi-block reads failed. 2026-10-04.
+		 */
+		mediatek,latch-ck = <1>;
 		cap-mmc-highspeed;
+		/*
+		 * HS200, attempt 2 (2026-10-04). Attempt 1 (mt2701 compatible +
+		 * mmc-hs200-1_8v) tuned and ran at 192 MHz (read 71 / write 104 MB/s)
+		 * but a 1 GiB write + read-back hit AUTO_CMD23 cmd_error=-84 (CRC),
+		 * then I/O errors; reverted to HS52 (48 MHz, 42 MB/s).
+		 * Attempt 2 uses "mediatek,mt6797-mmc" (kernel delta mtk-sd.c): the
+		 * vendor 3.18 controller settings (HS200 resp/CRC latch 3, separate
+		 * CMD/DAT tuning, CKGEN 0, PATCH_BIT1 TA 0, EMMC50 CRC_STS_SEL 0) and
+		 * pads (TDSEL 0xcccc; LK already had vendor DRV 1 / SMT / RDSEL,
+		 * logs/emmc-pads-hs52.txt). mt2701 stays as a fallback compatible.
+		 * Every setting is an mtk_sd.mt6797_* parameter (default in mtk-sd.c).
+		 * See docs/emmc-hs200.md. Verify with bin/emmc-check.sh before trusting.
+		 */
+		mmc-hs200-1_8v;
 		/*
 		 * vmmc = eMMC VCC (PMIC VEMC 3.0V), vqmmc = I/O rail (PMIC
 		 * VIO18 1.8V, modelled by the existing fixed 1.8V stub). Both
