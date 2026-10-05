@@ -733,6 +733,14 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c6_pins_a>;
 	clock-frequency = <400000>;
+	/*
+	 * 2026-10-04 (docs/cpu-dvfs.md step 1b): vendor marks this bus
+	 * "mediatek,appm_used"; its controller packs the WRRD read length
+	 * into TRANSFER_LEN[12:8] (no TRANSFER_LEN_AUX). Our i2c-mt65xx
+	 * delta keys the mt6797_appm_compat variant on this property.
+	 * Without it every DA9214 register read failed / read 0x00.
+	 */
+	mediatek,appm_used;
 	status = "okay";
 };
 

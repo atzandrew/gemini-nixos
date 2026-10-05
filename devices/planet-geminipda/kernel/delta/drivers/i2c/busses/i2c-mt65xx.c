@@ -467,6 +467,31 @@ static const struct mtk_i2c_compatible mt8173_compat = {
 	.max_dma_support = 33,
 };
 
+/*
+ * MT6797 i2c6 (0x1100e000, the "APPM" bus with the DA9214 VPROC bucks) is a
+ * different controller variant: it has no TRANSFER_LEN_AUX register; the
+ * read length of a combined write-then-read (WRRD) goes into
+ * TRANSFER_LEN[12:8]. Vendor 3.18 drivers/i2c/busses/i2c-mtk.c:
+ * mt6797_compat.idvfs_i2c = 1, and for nodes with "mediatek,appm_used"
+ * mtk_i2c_do_transfer() writes (len & 0xff) | ((aux_len << 8) & 0x1f00)
+ * instead of the AUX register. With mt8173_compat (aux_len_reg = 1) every
+ * register read on this bus failed or returned 0x00 (2026-10-04,
+ * docs/cpu-dvfs.md step 1b). Selected in probe by the DT property.
+ * Gemini PDA.
+ */
+static const struct mtk_i2c_compatible mt6797_appm_compat = {
+	.regs = mt_i2c_regs_v1,
+	.pmic_i2c = 0,
+	.dcm = 1,
+	.auto_restart = 1,
+	.aux_len_reg = 0,
+	.timing_adjust = 0,
+	.dma_sync = 0,
+	.ltiming_adjust = 0,
+	.apdma_sync = 0,
+	.max_dma_support = 33,
+};
+
 static const struct mtk_i2c_compatible mt8183_compat = {
 	.quirks = &mt8183_i2c_quirks,
 	.regs = mt_i2c_regs_v2,
@@ -1410,6 +1435,13 @@ static int mtk_i2c_probe(struct platform_device *pdev)
 	init_completion(&i2c->msg_complete);
 
 	i2c->dev_comp = of_device_get_match_data(&pdev->dev);
+	/* Gemini PDA: MT6797 APPM controller (i2c6), see mt6797_appm_compat */
+	if (i2c->dev_comp == &mt8173_compat &&
+	    of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6797-i2c") &&
+	    of_property_read_bool(pdev->dev.of_node, "mediatek,appm_used")) {
+		i2c->dev_comp = &mt6797_appm_compat;
+		dev_info(&pdev->dev, "mt6797 APPM variant: WRRD read length in TRANSFER_LEN[12:8]\n");
+	}
 	i2c->adap.dev.of_node = pdev->dev.of_node;
 	i2c->dev = &pdev->dev;
 	i2c->adap.dev.parent = &pdev->dev;

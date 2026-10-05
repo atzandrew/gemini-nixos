@@ -1,9 +1,9 @@
 # CPU clocks and voltages (DVFS) on the Gemini (MT6797X)
 
-Started 2026-10-04. Status: **step 1 (read-only survey) ready to run** —
-probe module, `bin/cpu-clocks.sh` and `bin/cpumhz` written and
-compile-checked; nothing has been written to any clock or voltage
-register yet.
+Started 2026-10-04. Status: **step 1 survey DONE (2026-10-04 19:12)** —
+clocks, PLLs, VSRAM and the speed bin are known; the DA9214 bucks can't be
+read reliably yet (step 1b, `bin/da9214-read.sh`). Nothing has been
+written to any clock or voltage register.
 
 ## Where we start
 
@@ -251,8 +251,89 @@ scp 'atzero@192.168.0.139:cpu-clocks-*.txt' logs/
 If stage B or C hangs the device: hold power ~10 s, boot, fetch the
 partial report, and rerun with `STAGES=A` (or `STAGES=AB`).
 
+## Step 1 results (2026-10-04 19:12, `logs/cpu-clocks-20261004-191254.txt`)
+
+| Cluster | Measured (cpumhz) | PLL registers | Vendor table for this chip (SB) |
+|---|---|---|---|
+| LL cpu0-3 | 841-893 MHz | VCO 1794 /2 = **897 MHz** | idx 9 = 897 @ 1000 mV; max 1547 @ 1200 |
+| L cpu4-7 | 1271 MHz | VCO 1274 /1 = **1274 MHz** | not a table point (1209 @ 1000 / 1352 @ 1040); max 2002 @ 1200 |
+| CCI | — | VCO 1260 /2 = **630 MHz** | between 611 @ 1000 and 676 @ 1040 |
+| B cpu8-9 | 743-748 MHz | SMC: VCO 1500 /2 = **750 MHz** | below OPP13 (845 @ 880); max **2587** (TT) @ 1200 |
+
+- **Speed bin: level 1 "SB", TT segment (function code 4), A72 date code
+  0119** -> the MT6797X/Helio X27 tables: LL max 1547, L max 2002, A72
+  2587 / 2431 MHz at OPP0/1 (TT override), CCI max 988.
+- cpumhz matches the PLL decode within ~0.5 % (cpu1 841 = noise, best-of-7
+  still disturbed); the old shell-loop ratio CPU0/CPU4 (1.47) matches
+  1274/897 (1.42). Headroom: LL 1.7x, L 1.6x, A72 3.4x.
+- Muxes: all clusters on their ARMPLL (MUXSEL 0x55); CKDIV 0x8 = LL/L/CCI
+  code 0 (= /1, vendor default case; probe decode fixed), B code 8 (/1).
+- VSRAM_L = 1100 mV (all 8 CPULDOs vosel 11, enable 0xff). Vendor rule
+  VSRAM = VPROC + 100 -> **VPROC1 is probably 1000 mV** (not yet read).
+  A72 SRAM LDO = 1100 mV.
+- CSPM: bus CG on, PCM **not kicked** (FSM 0x48490) — the vendor DVFS
+  firmware is not running, as expected. SW_RSV = 0xbabebabe (untouched).
+  MCU semaphore 3 free; taken on the first try and released cleanly.
+- MCU FHCTL: HP_EN = 0 (no hopping). Its CFG/DSSC registers read
+  differently between the two loads (e.g. FHCTL0 CFG 0x00ff00ff then 0),
+  and ARMCAXPLL0_CON0 bit21 flipped — treat FHCTL and CON0 upper bits as
+  unreliable reads; CON1 (the frequency) was identical both times and
+  matches the measurement.
+- Sync DCM 0x00070707 (div 7 = ~490-560 MHz class); MP2 0.
+- `thermal_zone0` exists (type not yet logged; cpu-clocks.sh now prints it).
+- **DA9214: reads unusable.** i2cget byte-data on i2c-2 failed ~1/3 of
+  the time and returned 0x00 otherwise, including BUCKB_CONT bit0 = 0
+  while the A72s run on that buck — so the zeros are wrong. Writes ACK
+  (cl2-up.sh). Until VPROC1 can be read, no frequency is raised.
+
+## Step 1b — DA9214 reads (2026-10-04 19:16, `logs/da9214-read-20261004-191647.txt`)
+
+`bin/da9214-read.sh`, 10 reads each of 0x5e/0x5d/0xd7/0xd9:
+
+- A (i2cget byte-data) and B (i2ctransfer w1+r1, repeated START): the same
+  pattern — 0x00 or FAIL, alternating. Both are a single combined
+  write-then-read (the driver's WRRD mode).
+- C (send-byte, then receive-byte): always returns **the register address
+  just written** (0x5e -> 0x5e, 0xd7 -> 0xd7) — a stale FIFO echo, not
+  chip data.
+- Nothing in dmesg. Other buses read fine with the same driver (BQ25896,
+  touch), so it is specific to i2c6.
+
+**Cause (vendor i2c-mtk.c):** i2c6 is the "APPM" controller
+(`mediatek,appm_used`, also driven by the CSPM in Android). Its variant
+(`mt6797_compat.idvfs_i2c = 1`) has **no TRANSFER_LEN_AUX register**: for
+WRRD the read length goes into TRANSFER_LEN[12:8]. Our delta maps every
+`mediatek,mt6797-i2c` to mt8173_compat (`aux_len_reg = 1`), so on i2c6 the
+read length was written to a register that doesn't exist and the read
+phase got length 0. Writes (single message) are unaffected — hence
+cl2-up.sh's i2cset works. The vendor also takes the CSPM semaphore
+(SEMA_I2C_DRV) around i2c6 transfers; with the CSPM idle that is moot.
+Method C's echo is not explained by this (plain reads are set up the same
+way in both drivers); recheck it after the fix.
+
+**Fix (written 19:20, compile-checked, not built):** i2c-mt65xx delta gets
+`mt6797_appm_compat` (= mt8173 but `aux_len_reg = 0`, i.e. mainline's
+packed `len | aux_len << 8` path), selected in probe when the node is
+`mediatek,mt6797-i2c` **and** has `mediatek,appm_used`; DTS `&i2c6` gains
+`mediatek,appm_used;`. Only i2c6 changes. Logs
+`mt6797 APPM variant: WRRD read length in TRANSFER_LEN[12:8]` at probe.
+Boot-only flash.
+
+Test: Dragon backup → flash boot → check the probe line in dmesg → wait
+for the A72s (cl2-up.sh must still bring them up: its i2cset writes are
+single-message) → `da9214-read.sh`: expect A and B to agree, 10/10, with
+0x5e bit0 = 1. Fallback: `gemini-backup/boot-hs200-192-20261004.img`.
+
 ## Log
 
 - 2026-10-04 ~19:00: vendor DVFS extracted (this doc). Survey tools
   written; probe compile-checked (clang arm64, W=1, our config: no
   warnings); cpumhz built (static aarch64, 4.8 KB). Not yet run.
+- 2026-10-04 19:12: **survey run** (above). Probe ckdiv decode fixed (code
+  0 = /1); cpu-clocks.sh logs thermal zone type/temp. Next: step 1b
+  (DA9214 read method), then the first write: VPROC1/VSRAM only.
+- 2026-10-04 19:16: step 1b run: DA9214 combined reads broken on i2c6,
+  separate reads echo the address. Cause found in the vendor I2C driver
+  (APPM controller packs the WRRD read length; no AUX register). Fix
+  written in the i2c-mt65xx delta + DTS (`mediatek,appm_used`); compiles
+  clean (W=1), DTB contains the property. Not yet built/flashed.
