@@ -277,6 +277,12 @@
         mt6351-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-probe {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # READ-ONLY MT6797 CPU clock/voltage probe (docs/cpu-dvfs.md step 1):
+        # ARM PLLs under the vendor 0x1001A semaphore (mcu=1), CPULDO VSRAM,
+        # CSPM state, A72 PLL via SMC (smc_b=1). Light build like mt6351-probe.
+        mt6797-dvfs-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-dvfs-probe {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # MT6351 fuel gauge as a power_supply (development module, step 2+).
         mt6351-gauge = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };

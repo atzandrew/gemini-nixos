@@ -1,0 +1,4 @@
+# Kbuild for the READ-ONLY MT6797 CPU DVFS probe (built by ./default.nix:
+#   nix build .#packages.aarch64-linux.mt6797-dvfs-probe).
+# Manual: make -C <kernel-build-dir> ARCH=arm64 M=$PWD KBUILD_MODPOST_WARN=1 modules
+obj-m := mt6797-dvfs-probe.o
