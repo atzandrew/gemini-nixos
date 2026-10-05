@@ -1519,12 +1519,25 @@
 		 * is the PMIC-level hardware reset (cannot be prevented in
 		 * software) — the driver reports momentary presses only.
 		 */
+		/*
+		 * MT6351 RTC (drivers/rtc/rtc-mt6351.c, added 2026-10-05):
+		 * time-of-day only, over the pwrap regmap. Gives rtc0 so the
+		 * clock is right at boot (RTC_HCTOSYS) and NTP time is
+		 * written back (RTC_SYSTOHC). No alarm/IRQ yet.
+		 */
+		mt6351_rtc: mt6351-rtc {
+			compatible = "mediatek,mt6351-rtc";
+		};
+
 		mt6351_keys: mt6351-keys {
 			compatible = "mediatek,mt6351-keys";
 
+			/* tap = Esc; hold ~0.8 s = KEY_POWER (Plasma's Leave
+			 * screen), added 2026-10-05; driver param longpress_ms */
 			esc-on {
 				mediatek,keybit = <1>;
 				linux,keycodes = <KEY_ESC>;
+				mediatek,longpress-keycode = <KEY_POWER>;
 			};
 
 			/* intended future sleep button (KEY_SLEEP is inert

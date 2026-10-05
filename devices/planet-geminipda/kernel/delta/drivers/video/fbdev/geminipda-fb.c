@@ -153,10 +153,37 @@ static void geminipda_fb_copyarea(struct fb_info *info,
 	sys_copyarea(info, area);
 }
 
+/*
+ * The boot logo (fb_show_logo) is blitted as an 8-bit image through a
+ * temporary truecolor palette that fbmem builds from the red/green/blue
+ * fields only, so every logo pixel lands with alpha 0 = transparent on
+ * LK's alpha-enabled OVL layer (the logo was invisible and left a blank
+ * band above the console text; 2026-10-05). Font glyphs (depth 1) use
+ * our opaque pseudo_palette and are fine. Force the alpha byte opaque
+ * over any non-1-bit image after blitting it.
+ */
 static void geminipda_fb_imageblit(struct fb_info *info,
 				   const struct fb_image *image)
 {
+	u32 x, y, w, h;
+
 	sys_imageblit(info, image);
+
+	if (image->depth == 1)
+		return;
+
+	x = image->dx;
+	y = image->dy;
+	w = min_t(u32, image->width, info->var.xres_virtual - min(x, info->var.xres_virtual));
+	h = min_t(u32, image->height, info->var.yres_virtual - min(y, info->var.yres_virtual));
+	for (; h; h--, y++) {
+		u32 *p = (u32 *)((u8 __force *)info->screen_base +
+				 y * info->fix.line_length) + x;
+		u32 i;
+
+		for (i = 0; i < w; i++)
+			p[i] |= 0xff000000U;
+	}
 }
 
 /*

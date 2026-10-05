@@ -47,8 +47,30 @@
 struct mt6351_key {
 	u32 bit;		/* TOPSTATUS bit (1 = PWRKEY_DEB ...) */
 	u32 keycode;		/* Linux key code from DT */
-	bool pressed;		/* current reported state */
+	u32 long_keycode;	/* optional long-press code (0 = none) */
+	bool pressed;		/* current physical state */
+	bool long_fired;	/* long-press code already sent */
+	unsigned long down_at;	/* jiffies at press */
 };
+
+/*
+ * Long press (2026-10-05): a key with "mediatek,longpress-keycode" in DT
+ * sends that code (e.g. KEY_POWER on Esc/On -> Plasma's Leave screen)
+ * once it has been held longpress_ms. A shorter press sends its normal
+ * code as a tap on RELEASE, so such a key has no hold/auto-repeat.
+ * longpress_ms=0 restores the plain immediate press/release behaviour.
+ * The 8-10 s PMIC hardware reset still happens regardless.
+ */
+static unsigned int longpress_ms = 800;
+module_param(longpress_ms, uint, 0644);
+MODULE_PARM_DESC(longpress_ms, "hold time for the long-press code (0 = disabled)");
+
+static void mt6351_key_tap(struct input_dev *input, u32 code)
+{
+	input_report_key(input, code, 1);
+	input_sync(input);
+	input_report_key(input, code, 0);
+}
 
 struct mt6351_keys {
 	struct device *dev;
@@ -70,11 +92,29 @@ static void mt6351_keys_poll(struct work_struct *work)
 	for (i = 0; i < d->nkeys; i++) {
 		struct mt6351_key *k = &d->keys[i];
 		bool pressed = !(val & BIT(k->bit));	/* active-low */
+		unsigned int lp = READ_ONCE(longpress_ms);
 
-		if (pressed != k->pressed) {
-			input_report_key(d->input, k->keycode, pressed);
-			k->pressed = pressed;
+		if (!k->long_keycode || !lp) {
+			/* plain key: report state changes immediately */
+			if (pressed != k->pressed) {
+				input_report_key(d->input, k->keycode, pressed);
+				k->pressed = pressed;
+			}
+			continue;
 		}
+
+		if (pressed && !k->pressed) {
+			k->down_at = jiffies;
+			k->long_fired = false;
+		} else if (pressed && !k->long_fired &&
+			   time_after_eq(jiffies, k->down_at +
+					 msecs_to_jiffies(lp))) {
+			mt6351_key_tap(d->input, k->long_keycode);
+			k->long_fired = true;
+		} else if (!pressed && k->pressed && !k->long_fired) {
+			mt6351_key_tap(d->input, k->keycode);
+		}
+		k->pressed = pressed;
 	}
 	input_sync(d->input);
 
@@ -116,6 +156,9 @@ static int mt6351_keys_probe(struct platform_device *pdev)
 				 "linux,keycodes; skipping\n", child);
 			continue;
 		}
+		d->keys[i].long_keycode = 0;
+		of_property_read_u32(child, "mediatek,longpress-keycode",
+				     &d->keys[i].long_keycode);
 		i++;
 	}
 	if (i == 0) {
@@ -140,6 +183,12 @@ static int mt6351_keys_probe(struct platform_device *pdev)
 	__set_bit(EV_KEY, input->evbit);
 	for (i = 0; i < d->nkeys; i++) {
 		__set_bit(d->keys[i].keycode, input->keybit);
+		if (d->keys[i].long_keycode) {
+			__set_bit(d->keys[i].long_keycode, input->keybit);
+			dev_info(dev, "key bit %u: long press (%u ms) -> KEY_%u\n",
+				 d->keys[i].bit, longpress_ms,
+				 d->keys[i].long_keycode);
+		}
 		dev_info(dev, "key bit %u -> KEY_%u (%s)\n",
 			 d->keys[i].bit, d->keys[i].keycode,
 			 d->keys[i].bit == 1 ? "ESC/On" : "side");

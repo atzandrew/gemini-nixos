@@ -150,6 +150,12 @@ struct bq25890_device {
 static DEFINE_IDR(bq25890_id);
 static DEFINE_MUTEX(bq25890_id_mutex);
 
+/* Gemini: register the voltage-derived Battery supply (bq25890-battery-N)?
+ * Off since the MT6351 fuel gauge provides the real battery (2026-10-04). */
+static bool battery_supply;
+module_param(battery_supply, bool, 0444);
+MODULE_PARM_DESC(battery_supply, "register the voltage-derived bq25890-battery-N supply (default off: MT6351 gauge is the battery)");
+
 static const struct regmap_range bq25890_readonly_reg_ranges[] = {
 	regmap_reg_range(0x0b, 0x0c),
 	regmap_reg_range(0x0e, 0x13),
@@ -1359,7 +1365,16 @@ static int bq25890_power_supply_init(struct bq25890_device *bq)
 	 * desc above is TYPE_USB). Registered after the charger so the
 	 * framework links it as a consumer of the charger's "supplied_to"
 	 * only if a future fuel gauge appears; today bq25890_supplies_changed
-	 * keeps it in sync explicitly. */
+	 * keeps it in sync explicitly.
+	 *
+	 * [2026-10-04] OFF by default: the real fuel gauge is the MT6351
+	 * coulomb counter (mt6351-gauge, "mt6351-battery"); this
+	 * voltage-derived battery made UPower/Plasma show two batteries.
+	 * bq25890_charger.battery_supply=1 on the kernel command line
+	 * brings it back (e.g. if the gauge module is not installed). */
+	if (!battery_supply)
+		return 0;
+
 	snprintf(bq->battery_name, sizeof(bq->battery_name),
 		 "bq25890-battery-%d", bq->id);
 	bq->battery_desc = bq25890_battery_supply_desc;
