@@ -471,10 +471,16 @@ static int mt6797_power_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/* RTC writes happen here, while interrupts are still on. */
+	/*
+	 * RTC writes happen here, while interrupts are still on.
+	 * NOT SYS_OFF_PRIO_PLATFORM: that priority uses ONE static handler
+	 * slot (kernel/reboot.c alloc_sys_off_handler), so taking it here
+	 * made register_platform_power_off() below fail with -EBUSY and the
+	 * whole driver (restart + poweroff) unbind (on glass 2026-10-05).
+	 */
 	ret = devm_register_sys_off_handler(&pdev->dev,
 					    SYS_OFF_MODE_POWER_OFF_PREPARE,
-					    SYS_OFF_PRIO_PLATFORM,
+					    SYS_OFF_PRIO_DEFAULT,
 					    mt6797_power_off_prepare, p);
 	if (ret)
 		dev_warn(&pdev->dev,

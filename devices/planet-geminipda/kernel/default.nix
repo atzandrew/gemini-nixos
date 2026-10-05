@@ -190,6 +190,15 @@ mobile-nixos.kernel-builder {
   isCompressed = "gz";
   buildDTBs = true;
 
+  # Boot logo (2026-10-05): the builder by default copies the Mobile
+  # NixOS logo over drivers/video/logo/logo_linux_clut224.ppm and seds
+  # fbmem.c to centre it (both axes, count forced to 1). Centring pushes
+  # the console text below mid-screen; the replacement hid our own
+  # logo. Keep the delta's logo (delta/drivers/video/logo/) and the
+  # stock top-left placement (fbcon=logo-count:1 is on the cmdline).
+  enableLinuxLogoReplacement = false;
+  enableCenteredLinuxLogo = false;
+
   # The bring-up config has 1018 =m entries (panfrost, pwm-mtk-disp,
   # usb configfs, ...). Build the module tree so stage-2 can use them;
   # stage-1 itself stays non-modular (16 MiB boot partition, docs R1).

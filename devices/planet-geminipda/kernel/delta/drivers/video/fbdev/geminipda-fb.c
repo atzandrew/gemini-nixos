@@ -172,6 +172,9 @@ static void geminipda_fb_imageblit(struct fb_info *info,
 	if (image->depth == 1)
 		return;
 
+	pr_info("geminipda-fb: image blit depth %u at %u,%u size %ux%u (logo?)\n",
+		image->depth, image->dx, image->dy, image->width,
+		image->height);
 	x = image->dx;
 	y = image->dy;
 	w = min_t(u32, image->width, info->var.xres_virtual - min(x, info->var.xres_virtual));

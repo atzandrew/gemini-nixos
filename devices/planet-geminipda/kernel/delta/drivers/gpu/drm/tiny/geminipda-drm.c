@@ -85,6 +85,7 @@
  * panel) stays excluded — see devices/planet-geminipda/kernel/default.nix.
  */
 
+#include <linux/backlight.h>
 #include <linux/dma-mapping.h>
 #include <linux/hrtimer.h>
 #include <linux/init.h>
@@ -620,16 +621,47 @@ static bool geminipda_drm_get_vblank_timestamp(struct drm_crtc *crtc,
 	return true;
 }
 
+/*
+ * Display "off" (DPMS / KWin screen blanking, 2026-10-05): the panel
+ * itself must stay powered (only LK can initialise it again, CORE RULE
+ * 5), so CRTC disable used to leave the LCD backlight lit behind a black
+ * frame. Blank the backlight instead (backlight_disable(): pwm-backlight
+ * drives 0 while keeping the user's brightness setting) and unblank it
+ * on enable. The backlight is looked up by its sysfs name ("backlight",
+ * the DT pwm-backlight node) when needed, so no DT link is required.
+ */
+static bool blank_backlight = true;
+module_param(blank_backlight, bool, 0644);
+MODULE_PARM_DESC(blank_backlight, "switch the LCD backlight off while the display is off (default on)");
+
+static void geminipda_drm_set_backlight(bool on)
+{
+	struct backlight_device *bd;
+
+	bd = backlight_device_get_by_name("backlight");
+	if (!bd)
+		return;
+	if (on)
+		backlight_enable(bd);
+	else
+		backlight_disable(bd);
+	put_device(&bd->dev);
+}
+
 static void geminipda_drm_crtc_helper_atomic_enable(struct drm_crtc *crtc,
 						    struct drm_atomic_state *state)
 {
 	drm_crtc_vblank_on(crtc);
+	/* always unblank: the param may have changed while off */
+	geminipda_drm_set_backlight(true);
 }
 
 static void geminipda_drm_crtc_helper_atomic_disable(struct drm_crtc *crtc,
 						     struct drm_atomic_state *state)
 {
 	drm_crtc_vblank_off(crtc);
+	if (READ_ONCE(blank_backlight))
+		geminipda_drm_set_backlight(false);
 }
 
 /*
