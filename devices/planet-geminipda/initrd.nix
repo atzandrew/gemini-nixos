@@ -85,6 +85,25 @@ let
     doCheck = false;
   })).bin;
 
+  # Graphical charging screen (charger-ui/charger-ui.c, used by charger.sh):
+  # static musl binary, stb_image + stb_truetype, no runtime libraries.
+  # Assets (background PNG + Nunito) are plain files under /share/charger,
+  # so new art only needs an initrd rebuild. See charger-ui/README.md.
+  chargerUi = pkgs.pkgsStatic.stdenv.mkDerivation {
+    pname = "charger-ui";
+    version = "1";
+    src = ./charger-ui;
+    dontConfigure = true;
+    buildPhase = ''
+      runHook preBuild
+      $CC -O2 -Wall -s -o charger-ui charger-ui.c -lm
+      runHook postBuild
+    '';
+    installPhase = ''
+      install -Dm755 charger-ui $out/bin/charger-ui
+    '';
+  };
+
   # The applets the init script uses. `sh` is busybox ash; the shebang
   # in /init is `#!/bin/busybox sh`.
   applets = [
@@ -157,6 +176,16 @@ let
             echo "==> leaving charger mode: continuing normal boot"
         fi
     fi
+
+    # ---- console back on (2026-10-05) --------------------------------------
+    # The kernel boots with loglevel=1 (CONFIG_CMDLINE) so a charger boot
+    # shows no Linux text before the charging screen. Past the charger
+    # decision, restore the normal console level and replay what the kernel
+    # held back, so a normal boot's screen looks as it did before (just a
+    # moment later). loglevel=1 rather than quiet: systemd reads "quiet"
+    # and would hide its boot status too.
+    echo 7 > /proc/sys/kernel/printk 2>/dev/null
+    dmesg > /dev/tty0 2>/dev/null
 
     echo "==> waiting for eMMC block devices"
     i=0
@@ -415,6 +444,13 @@ pkgs.runCommand "gemini-minimal-initrd" {
   # charger mode: the screen script + the gauge module (optional)
   cp ${./charger.sh} root/charger.sh
   chmod 444 root/charger.sh
+  # graphical screen: renderer + background + font
+  cp ${chargerUi}/bin/charger-ui root/bin/charger-ui
+  chmod 555 root/bin/charger-ui
+  mkdir -p root/share/charger
+  cp ${./charger-ui/bg.png} root/share/charger/bg.png
+  cp ${./charger-ui/Nunito-Regular.ttf} root/share/charger/Nunito-Regular.ttf
+  chmod 444 root/share/charger/*
   ${lib.optionalString (gaugeModule != null) ''
     mkdir -p root/lib/modules
     cp ${gaugeModule}/mt6351-gauge.ko root/lib/modules/mt6351-gauge.ko

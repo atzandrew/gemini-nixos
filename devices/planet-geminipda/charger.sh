@@ -30,6 +30,8 @@ CHG_IINLIM=2500000        # BQ input current limit (uA); Debian's udev rule isn'
 CHG_BL_TIMEOUT=15         # s without a key before the backlight goes off
 CHG_MIN_START_PCT=3       # below this a start needs a second long-press
 CHG_POLL=1                # s per loop
+CHG_UI=${CHG_UI:-/bin/charger-ui}   # graphical screen (charger-ui.c); text screen if missing/failing
+CHG_UI_ON=0
 
 chg_log() { echo "<6>gemini-charger: $*" > /dev/kmsg 2>/dev/null; echo "==> charger: $*"; }
 
@@ -180,9 +182,23 @@ chg_stop_readers() {
     pkill -x dd 2>/dev/null; sleep 1; pkill -x dd 2>/dev/null
 }
 
+# chg_ui ARGS... — graphical frame; on failure fall back to the text screen
+chg_ui() {
+    [ "$CHG_UI_ON" = 1 ] || return 1
+    "$CHG_UI" "$@"; rc=$?
+    [ $rc = 0 ] && return 0
+    chg_log "charger-ui failed (exit $rc): text screen"
+    CHG_UI_ON=0
+    "$CHG_UI" --text-mode 2>/dev/null
+    chg_out "\033[0m\033[?25l\033[2J"
+    frame=""
+    return 1
+}
+
 chg_leave() {   # restore the console for the normal boot
     chg_stop_readers
     chg_bl on
+    [ "$CHG_UI_ON" = 1 ] && "$CHG_UI" --text-mode 2>/dev/null
     chg_out "\033[0m\033[2J\033[H\033[?25h"
     [ -n "$CHG_SAVED_PRINTK" ] && echo "$CHG_SAVED_PRINTK" > /proc/sys/kernel/printk 2>/dev/null
 }
@@ -190,8 +206,10 @@ chg_leave() {   # restore the console for the normal boot
 chg_poweroff() {
     chg_log "charger removed: powering off"
     chg_bl on
-    chg_out "\033[2J"
-    chg_center 16 "Charger removed - switching off" 1
+    if ! chg_ui --pct "${cap:--1}" --line "Charger removed - switching off"; then
+        chg_out "\033[2J"
+        chg_center 16 "Charger removed - switching off" 1
+    fi
     sleep 2
     chg_stop_readers
     sync
@@ -238,10 +256,16 @@ charger_main() {
 
     chg_start_readers
     chg_bl on
-    chg_out "\033[0m\033[?25l\033[2J"
+    chg_ui_full=0
+    if [ -x "$CHG_UI" ]; then
+        CHG_UI_ON=1; chg_ui_full=1        # first frame: whole screen + KD_GRAPHICS
+    else
+        chg_out "\033[0m\033[?25l\033[2J"
+    fi
 
     now=$(cut -d. -f1 /proc/uptime)
     last=0; lit_at=$now; lit=1; off_n=0; force_until=0; msg=""; msg_until=0; frame=""
+    logkey=""; logged_at=0
     while :; do
         now=$(cut -d. -f1 /proc/uptime)
 
@@ -270,10 +294,20 @@ EOF
             cap=""; st=$(chg_read "$CHG/status"); ua=""; uv=$(chg_read "$CHG/voltage_now")
         fi
         [ "$st" = Full ] && cap=100
+        bqst=$(chg_read "$CHG/status"); bqtype=$(chg_read "$CHG/charge_type")
+        lim=$(chg_read "$CHG/input_current_limit")
+        ima=""; [ -n "$ua" ] && ima=$((ua / 1000))
+
+        # -- history in the kernel log (read it in Debian after continuing:
+        #    journalctl -k -b | grep gemini-charger): every 60 s + on change
+        k="$st|$online|$bqst|$bqtype"
+        if [ "$k" != "$logkey" ] || [ $((now - logged_at)) -ge 60 ]; then
+            chg_log "cap=${cap:-?}% gauge=$st I=${ima:-?}mA V=$(( ${uv:-0} / 1000 ))mV bq=$bqst/$bqtype online=$online iinlim=$(( ${lim:-0} / 1000 ))mA"
+            logkey=$k; logged_at=$now
+        fi
 
         if [ "$online" = 1 ]; then
             off_n=0
-            lim=$(chg_read "$CHG/input_current_limit")
             [ -n "$lim" ] && [ "$lim" != "$CHG_IINLIM" ] && echo "$CHG_IINLIM" > "$CHG/input_current_limit" 2>/dev/null
         else
             off_n=$((off_n + 1))
@@ -286,12 +320,12 @@ EOF
         # -- start request
         if [ $start = 1 ]; then
             if [ -n "$cap" ] && [ "$cap" -lt "$CHG_MIN_START_PCT" ] && [ "$now" -gt "$force_until" ]; then
-                msg="Battery very low - keep charging (hold Esc/On again to start anyway)"
+                msg="Battery very low - hold power again to boot anyway"
                 msg_until=$((now + 10)); force_until=$((now + 10))
                 chg_log "start refused at ${cap}%"
             else
                 chg_log "long-press: continuing normal boot (${cap:-?}%, $st)"
-                chg_out "\033[2J"; chg_center 16 "Starting..." 1
+                chg_ui --pct "${cap:--1}" --line "Starting..." || { chg_out "\033[2J"; chg_center 16 "Starting..." 1; }
                 chg_leave; return
             fi
         fi
@@ -304,20 +338,50 @@ EOF
 
         # -- draw (only when something visible changed)
         if [ $lit = 1 ]; then
-            ima=""; [ -n "$ua" ] && ima=$((ua / 1000))
+            # Near full the BQ stops (termination) and the cell carries a
+            # little board load, which the gauge can call Not charging or
+            # Discharging: show that as "Charged". "Charger too weak" only for
+            # a real drain below 95 %.
             case "$st" in
-                Full) stxt="Fully charged" ;; Charging) stxt="Charging" ;;
-                "Not charging") stxt="Not charging" ;; Discharging) stxt="Charger too weak" ;;
+                Full) stxt="Fully charged" ;;
+                Charging) stxt="Charging" ;;
+                "Not charging"|Discharging)
+                    if [ -n "$cap" ] && [ "$cap" -ge 95 ]; then stxt="Charged"
+                    elif [ "$st" = Discharging ] && [ -n "$ima" ] && [ "$ima" -lt -300 ]; then stxt="Charger too weak"
+                    else stxt="Charging paused"; fi ;;
                 *) stxt=${st:-Unknown} ;;
             esac
+            dbg="gauge: ${st:-?} ${ima:-?} mA   |   charger: $bqst / $bqtype, limit $(( ${lim:-0} / 1000 )) mA"
             detail=""
             if [ -n "$ima" ]; then
                 sign="+"; a=$ima; [ $a -lt 0 ] && { sign="-"; a=$((-a)); }
                 detail=$(printf '%s%d.%02d A' "$sign" $((a / 1000)) $(( (a % 1000) / 10 )))
             fi
             [ -n "$uv" ] && detail="$detail   $(printf '%d.%02d V' $((uv / 1000000)) $(( (uv % 1000000) / 10000 )))"
-            new="$cap|$stxt|$((${ima:-0} / 50))|$msg"
-            if [ "$new" != "$frame" ]; then
+            # bottom line of the graphical screen
+            line=$stxt
+            if [ "$st" = Charging ] && [ -n "$ima" ] && [ "$ima" -gt 0 ]; then
+                if [ "$ima" -ge 1000 ]; then
+                    line=$(printf 'Charging at %d.%d A' $((ima / 1000)) $(( (ima % 1000) / 100 )))
+                else
+                    line="Charging at $(( (ima + 25) / 50 * 50 )) mA"
+                fi
+            fi
+            [ -n "$msg" ] && line=$msg
+
+            if [ "$CHG_UI_ON" = 1 ]; then
+                new="ui|$cap|$line"
+                if [ "$new" != "$frame" ]; then
+                    if [ $chg_ui_full = 1 ]; then
+                        chg_ui --full --pct "${cap:--1}" --line "$line" && chg_ui_full=0
+                    else
+                        chg_ui --pct "${cap:--1}" --line "$line"
+                    fi
+                    [ "$CHG_UI_ON" = 1 ] && frame=$new
+                fi
+            fi
+            new="$cap|$stxt|$((${ima:-0} / 50))|$msg|$st|$bqst|$bqtype"
+            if [ "$CHG_UI_ON" != 1 ] && [ "$new" != "$frame" ]; then
                 frame=$new
                 if [ -n "$cap" ]; then
                     fc=42; [ "$cap" -lt 30 ] && fc=43; [ "$cap" -lt 15 ] && fc=41
@@ -329,7 +393,8 @@ EOF
                 chg_center 24 "$stxt" 1
                 chg_center 26 "$detail"
                 chg_center 29 "$msg" 33
-                chg_center 32 "Hold Esc/On to start   |   Unplug to switch off" 2
+                chg_center 31 "Hold Esc/On to start   |   Unplug to switch off" 2
+                chg_center 33 "$dbg" 2          # development readout
             fi
         fi
 

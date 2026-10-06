@@ -538,7 +538,7 @@ CONFIG_STACKPROTECTOR_PER_TASK=y
 # Boot options
 #
 # CONFIG_ARM64_ACPI_PARKING_PROTOCOL is not set
-CONFIG_CMDLINE="console=tty0 console=ttyS0,921600n1 earlycon maxcpus=8 nokaslr fbcon=rotate:3 fbcon=font:TER16x32 fbcon=logo-count:1 g_ether.dev_addr=42:00:15:19:82:01 g_ether.host_addr=42:00:15:19:82:00 clk_ignore_unused pd_ignore_unused regulator_ignore_unused consoleblank=0"
+CONFIG_CMDLINE="console=tty0 console=ttyS0,921600n1 earlycon maxcpus=8 nokaslr fbcon=rotate:3 fbcon=font:TER16x32 fbcon=logo-count:1 g_ether.dev_addr=42:00:15:19:82:01 g_ether.host_addr=42:00:15:19:82:00 clk_ignore_unused pd_ignore_unused regulator_ignore_unused consoleblank=0 loglevel=1"
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 CONFIG_CMDLINE_FORCE=y
 CONFIG_EFI_STUB=y
