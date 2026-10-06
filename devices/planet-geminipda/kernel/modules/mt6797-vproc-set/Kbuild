@@ -1,0 +1,2 @@
+# Kbuild for the VPROC1 set test module (nix: .#packages.aarch64-linux.mt6797-vproc-set)
+obj-m := mt6797-vproc-set.o

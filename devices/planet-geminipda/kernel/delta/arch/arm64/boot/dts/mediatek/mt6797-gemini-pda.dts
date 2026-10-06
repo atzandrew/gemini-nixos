@@ -20,6 +20,7 @@
 /dts-v1/;
 #include "mt6797.dtsi"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/clock/mt6797-mcumixedsys.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/phy/phy.h>
 #include <dt-bindings/power/mt6797-power.h>
@@ -786,6 +787,19 @@
 	 * with maxcpus=8; this onlines cpu8/9 once VPROC2 exists.
 	 * Reset 11 = SWSYSRST PWRAP_SPI_CTL_RST.
 	 */
+	/*
+	 * CPU clocks (2026-10-06, docs/cpu-dvfs.md): ARM PLLs + muxes +
+	 * dividers of the A53 clusters and the CCI. Read-only driver for now
+	 * (drivers/clk/mediatek/clk-mt6797-mcu.c). The CSPM block is only used
+	 * for the vendor HW semaphore guarding 0x1001Axxx.
+	 */
+	mcumixedsys: clock-controller@1001a000 {
+		compatible = "mediatek,mt6797-mcumixedsys";
+		reg = <0 0x1001a000 0 0x1000>, <0 0x11015000 0 0x1000>;
+		reg-names = "mcumixed", "cspm";
+		#clock-cells = <1>;
+	};
+
 	cl2-power {
 		compatible = "mediatek,mt6797-cl2-power";
 		reg = <0 0x10006000 0 0x1000>, <0 0x10222000 0 0x1000>;

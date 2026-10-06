@@ -424,3 +424,26 @@ cl2-up.sh, the timer and sramldo-smc.
   (service+timer), the sramldo-smc load; new udev rule
   99-gemini-a72-workqueue.rules sets the workqueue cpumask 300 when cpu9
   comes online. cl2-up.sh / cl2-down.sh / mt6797-cl2-on marked superseded.
+- 2026-10-06 16:15: **first voltage change: VPROC1 1.000 -> 1.040 V** via the
+  da9211 regulator (test module `mt6797-vproc-set`, uv=1040000; VSRAM_L stays
+  1.10 V, still >= VPROC1). dmesg `VPROC1 1000000 -> 1040000 uV ret 0`,
+  sysfs vproc1 1040000. Stable: 8 busy loops 60 s, normal use + a game. Not
+  persistent (LK sets 1.00 V each boot) — cpufreq will own it. Note:
+  `i2cget 0x68` now says "Device or resource busy" (da9211 owns the
+  address; use sysfs or `-f`). Next: MCUMIXED PLL clock driver, read-only first.
+- 2026-10-06 16:57: **CPU clock driver v1 (read-only) works** (boot-only
+  flash `boot-mcuclk-20261006.img`; fallback
+  `gemini-backup/boot-cl2power-20261006.img`).
+  `drivers/clk/mediatek/clk-mt6797-mcu.c` (`CONFIG_COMMON_CLK_MT6797_MCU`,
+  DT `mcumixedsys: clock-controller@1001a000`, ids in
+  `dt-bindings/clock/mt6797-mcumixedsys.h`): armpll_{ll,l,cci} ->
+  cpu_*_sel -> cpu_{ll,l,cci}, every read under the vendor HW semaphore.
+  clk_summary: cpu_ll 897000000, cpu_l 1274000000, cpu_cci 629999328 Hz —
+  identical to the survey/cpumhz. Note: CSPM POWERON_CONFIG_EN read 0 at
+  this boot (bus CG off; the 10-04 survey saw 1), the driver enabled it
+  with the vendor key 0x0b160001 before using the semaphore. (The clk
+  Makefile delta was delivered as Makefile.gemini — tool can't write
+  "Makefile" — and renamed by the user.)
+  Next: write ops (PLL DDS/posdiv, mux to MAINPLL during a change, ckdiv,
+  vendor ordering), then the CPULDO regulator, then OPP tables +
+  mediatek-cpufreq.
