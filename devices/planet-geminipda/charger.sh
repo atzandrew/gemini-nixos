@@ -185,9 +185,14 @@ chg_stop_readers() {
 # chg_ui ARGS... — graphical frame; on failure fall back to the text screen
 chg_ui() {
     [ "$CHG_UI_ON" = 1 ] || return 1
-    "$CHG_UI" "$@"; rc=$?
-    [ $rc = 0 ] && return 0
-    chg_log "charger-ui failed (exit $rc): text screen"
+    "$CHG_UI" "$@" 2> "$CHG_RUN/chg-ui.err"; rc=$?
+    if [ $rc = 0 ]; then
+        [ "$1" = --full ] && chg_log "charger-ui: first frame drawn"
+        return 0
+    fi
+    # the renderer's own error text goes to the kernel log too (stderr would
+    # only reach the serial console from here)
+    chg_log "charger-ui failed (exit $rc): $(tr '\n' ' ' < "$CHG_RUN/chg-ui.err") -> text screen"
     CHG_UI_ON=0
     "$CHG_UI" --text-mode 2>/dev/null
     chg_out "\033[0m\033[?25l\033[2J"

@@ -283,9 +283,19 @@ static int blit(const char *dev, int rot, const struct rect *rs, int n)
 		fprintf(stderr, "charger-ui: fb %dx%d rot %d = logical %dx%d (layout %dx%d)\n",
 			pw, ph, rot, lw, lh, L.w, L.h);
 	size_t len = fx.smem_len ? fx.smem_len : (size_t)fx.line_length * v.yres_virtual;
-	uint32_t *fb = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (fb == MAP_FAILED) { fprintf(stderr, "charger-ui: mmap: %s\n", strerror(errno)); close(fd); return -1; }
-	fb += v.yoffset * stride + v.xoffset;
+	uint32_t *map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), *fb = NULL;
+	uint32_t *rowbuf = NULL;
+	off_t base = ((off_t)v.yoffset * stride + v.xoffset) * 4;
+	if (map == MAP_FAILED) {
+		/* fallback: write() each row segment (geminipda-fb has fb_sys_write) */
+		fprintf(stderr, "charger-ui: mmap: %s (using write)\n", strerror(errno));
+		map = NULL;
+		rowbuf = malloc(sizeof(*rowbuf) * pw);
+		if (!rowbuf) { close(fd); return -1; }
+	} else {
+		fb = map + v.yoffset * stride + v.xoffset;
+	}
+	int werr = 0;
 
 	for (int k = 0; k < n; k++) {
 		struct rect r = rs[k];
@@ -303,7 +313,7 @@ static int blit(const char *dev, int rot, const struct rect *rs, int n)
 		/* walk in physical scanout order: sequential writes per panel row
 		 * (fbdev memory is usually write-combined; strided writes are slow) */
 		for (int py = qy0; py < qy1; py++) {
-			uint32_t *row = fb + py * stride;
+			uint32_t *row = fb ? fb + py * stride : rowbuf - qx0;
 			for (int px = qx0; px < qx1; px++) {
 				int x, y;   /* logical pixel shown at (px, py) */
 				switch (rot) {
@@ -314,11 +324,18 @@ static int blit(const char *dev, int rot, const struct rect *rs, int n)
 				}
 				row[px] = pack(frame[y * L.w + x], &v);
 			}
+			if (!fb) {
+				size_t nb = (size_t)(qx1 - qx0) * 4;
+				off_t off = base + ((off_t)py * stride + qx0) * 4;
+				if (pwrite(fd, rowbuf, nb, off) != (ssize_t)nb && !werr++)
+					fprintf(stderr, "charger-ui: write fb: %s\n", strerror(errno));
+			}
 		}
 	}
-	munmap(fb - (v.yoffset * stride + v.xoffset), len);
+	if (map) munmap(map, len);
+	free(rowbuf);
 	close(fd);
-	return 0;
+	return werr ? -1 : 0;
 }
 
 int main(int argc, char **argv)
