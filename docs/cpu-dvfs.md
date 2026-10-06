@@ -406,3 +406,21 @@ cl2-up.sh, the timer and sramldo-smc.
   psci.c (latch order/window) and fixed in a test module; settled, load
   and 4 boot-time runs all pass (section above). WDT handling in
   cl2-up.sh found wrong; module leaves the WDT to mtk_wdt.
+- 2026-10-06 15:30-15:41: **in-kernel A72 bring-up works** (boot-only flash
+  `boot-cl2power-20261006.img`; fallback `gemini-backup/boot-chargerui-20261006.img`).
+  `CONFIG_REGULATOR_DA9211=y` (DT `dlg,da9214` on i2c6: BUCKA `vproc1`
+  always-on 0.77-1.20 V, BUCKB `vproc2` 0.80-1.20 V; driver accepted the
+  chip, "No IRQ configured" is expected), `mtk_wdt` delta with mt6797 toprgu
+  data (SWSYSRST as reset controller, `#reset-cells`), and
+  `drivers/soc/mediatek/mt6797-cl2-power.c` (`CONFIG_MTK_MT6797_CL2_POWER`;
+  DT `cl2-power`: spm/mcucfg2 regs, `vproc-supply`, `resets = <&watchdog 11>`,
+  `cpus`). 3 boots: VPROC2 on at 1.000 V, latch window ~1.3 ms, power-on
+  ~1.8 ms, cpu8 ~3.5 ms, cpu9 ~2.4 ms, **cpu9 online at 8.0-9.6 s monotonic,
+  before greetd (13 s)**. Both rails visible in /sys/class/regulator.
+  Leftover: `vproc_fixed` placeholder regulator ("vproc", regulator.3) —
+  remove with the DVFS work. Not handled yet: re-powering the cluster after
+  BOTH A72s are offlined (keep one online).
+  Cleanup: gemini-debian stops shipping cl2-up/cl2-down, gemini-a72-up
+  (service+timer), the sramldo-smc load; new udev rule
+  99-gemini-a72-workqueue.rules sets the workqueue cpumask 300 when cpu9
+  comes online. cl2-up.sh / cl2-down.sh / mt6797-cl2-on marked superseded.

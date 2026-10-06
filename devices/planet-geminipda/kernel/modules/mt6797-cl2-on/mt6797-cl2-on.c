@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * SUPERSEDED 2026-10-06 by the built-in driver
+ * kernel/delta/drivers/soc/mediatek/mt6797-cl2-power.c (same sequence,
+ * regulator + reset APIs). Kept as the test record; it refuses to run when
+ * the A72s are already online (and 0x68 is owned by da9211 now).
+ *
  * mt6797-cl2-on.c — bring the A72 cluster (cpu8/cpu9) online from the
  * kernel, in the VENDOR order, with tight timing. Test vehicle for
  * docs/cpu-dvfs.md "A72 bring-up" (option B), replacing cl2-up.sh.

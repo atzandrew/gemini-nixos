@@ -1,4 +1,12 @@
 #!/bin/bash
+# !!! SUPERSEDED 2026-10-06 — DO NOT RUN on a kernel with mt6797-cl2-power.
+# The kernel now powers the A72 cluster itself (DA9214 under da9211-regulator
+# + drivers/soc/mediatek/mt6797-cl2-power.c, vendor order; docs/cpu-dvfs.md).
+# This script switched the A72 rail on outside the PMIC-wrapper SPI reset
+# latch and held the latch for tens of ms (the old boot-time wedge), its WDT
+# "arm" was 20/64 s and its "disarm" turned the watchdog off. It also writes
+# the DA9214 over i2c-dev behind the regulator driver's back (page register!).
+# Kept for reference only; no longer shipped in the Debian image.
 # cl2-down.sh — power DOWN the A72 cluster (cpu8/cpu9) on the gemini 6.6
 # kernel, returning the box to its cold-boot power state: cluster off,
 # B_EXT_BUCK_ISO re-asserted (0x10006290 bit1), MP2_CPUSYS_PWR_CON bit0
