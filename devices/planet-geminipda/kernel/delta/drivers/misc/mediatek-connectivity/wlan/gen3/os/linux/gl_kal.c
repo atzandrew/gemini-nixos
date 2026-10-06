@@ -611,8 +611,9 @@ VOID kalUpdateMACAddress(IN P_GLUE_INFO_T prGlueInfo, IN PUINT_8 pucMacAddr)
 	ASSERT(prGlueInfo);
 	ASSERT(pucMacAddr);
 
+	/* 6.6: dev_addr is const; eth_hw_addr_set() keeps the kernel's shadow copy in sync (dev_addr_check WARN otherwise) */
 	if (UNEQUAL_MAC_ADDR(prGlueInfo->prDevHandler->dev_addr, pucMacAddr))
-		memcpy(prGlueInfo->prDevHandler->dev_addr, pucMacAddr, PARAM_MAC_ADDR_LEN);
+		eth_hw_addr_set(prGlueInfo->prDevHandler, pucMacAddr);
 
 }
 

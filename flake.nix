@@ -129,6 +129,9 @@
       # module wires into mobile.outputs.initrd.
       initrd = (import ./devices/planet-geminipda/initrd.nix) {
         inherit (eval) pkgs;
+        gaugeModule = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
       };
 
       # Mesa 26.2.2 + the T880 polygon-list delta (thin override of the

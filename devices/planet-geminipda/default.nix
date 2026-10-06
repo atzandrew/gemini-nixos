@@ -7,7 +7,14 @@
 let
   # Minimal busybox initrd (docs R1). See initrd.nix for the rationale;
   # this is the ramdisk the stock LK copies to 0x45000000.
-  minimalInitrd = pkgs.callPackage ./initrd.nix { };
+  # gaugeModule: mt6351-gauge.ko for the initrd's charger-mode screen
+  # (charger.sh). Built from the same kernel derivation as
+  # mobile.boot.stage-1.kernel below, so vermagic matches.
+  minimalInitrd = pkgs.callPackage ./initrd.nix {
+    gaugeModule = pkgs.callPackage ./kernel/modules/mt6351-gauge {
+      kernel = pkgs.callPackage ./kernel { };
+    };
+  };
 in
 {
   imports = [

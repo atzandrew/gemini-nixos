@@ -2147,7 +2147,8 @@ bailout:
 				DBGLOG(INIT, WARN, "set MAC addr fail 0x%x\n", rStatus);
 				prGlueInfo->u4ReadyFlag = 0;
 			} else {
-				ether_addr_copy(prGlueInfo->prDevHandler->dev_addr, MacAddr.sa_data);
+				/* 6.6: dev_addr is const; eth_hw_addr_set() keeps the kernel's shadow copy in sync (dev_addr_check WARN otherwise) */
+				eth_hw_addr_set(prGlueInfo->prDevHandler, MacAddr.sa_data);
 				ether_addr_copy(prGlueInfo->prDevHandler->perm_addr,
 				       prGlueInfo->prDevHandler->dev_addr);
 

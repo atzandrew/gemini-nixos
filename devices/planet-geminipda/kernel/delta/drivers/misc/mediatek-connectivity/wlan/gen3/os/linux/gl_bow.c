@@ -1054,7 +1054,8 @@ BOOLEAN kalInitBowDevice(IN P_GLUE_INFO_T prGlueInfo, IN const char *prDevName)
 		/* 1.2 fill hardware address */
 		COPY_MAC_ADDR(rMacAddr, prAdapter->rMyMacAddr);
 		rMacAddr[0] |= 0x2;	/* change to local administrated address */
-		ether_addr_copy(prGlueInfo->rBowInfo.prDevHandler->dev_addr, rMacAddr);
+		/* 6.6: dev_addr is const; eth_hw_addr_set() keeps the kernel's shadow copy in sync (dev_addr_check WARN otherwise) */
+		eth_hw_addr_set(prGlueInfo->rBowInfo.prDevHandler, rMacAddr);
 		ether_addr_copy(prGlueInfo->rBowInfo.prDevHandler->perm_addr,
 		       prGlueInfo->rBowInfo.prDevHandler->dev_addr);
 

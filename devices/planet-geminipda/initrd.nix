@@ -41,13 +41,23 @@
 # rule the host-side bin/ scripts use). Everything else (udev,
 # networking, GPU, ...) happens in stage-2 (the NixOS systemd system).
 #
+# CHARGER MODE (2026-10-05): a charger plugged into a switched-off
+# Gemini makes LK boot this image in its off-mode-charging mode
+# (/chosen atag,boot mode 8). /init then sources charger.sh, which shows
+# the battery state on the console instead of booting the OS: long-press
+# Esc/On continues the normal boot below, unplugging powers off. It needs
+# the mt6351-gauge module (gaugeModule, built from the same kernel
+# derivation, so vermagic matches) for the battery %; without it the
+# screen falls back to charger data. See charger.sh and the project doc
+# claude/charger-mode.md.
+#
 # BUILD NOTE: this deliberately does NOT use nixpkgs makeInitrd, which
 # archives the *nix-store closure* of its inputs (a static busybox
 # still drags in the whole glibc package via its derivation
 # references, ~12 MiB). Instead it stages a flat tree of plain file
 # copies and makes the cpio directly — the same approach as the
 # verified bring-up script. The output contains no store paths.
-{ pkgs, ... }:
+{ pkgs, gaugeModule ? null, ... }:
 let
   lib = pkgs.lib;
 
@@ -105,6 +115,18 @@ let
     "dd"
     "cmp"
     "basename"
+    # charger mode (charger.sh)
+    "od"
+    "tr"
+    "cut"
+    "wc"
+    "insmod"
+    "poweroff"
+    "kill"
+    "pkill"
+    "sync"
+    "stty"
+    "printf"
   ];
 
   init = pkgs.writeText "gemini-initrd-init" ''
@@ -123,6 +145,18 @@ let
     mount -t devtmpfs devtmpfs /dev 2>/dev/null
     mkdir -p /dev/pts /newroot /tmp
     mount -t devpts devpts /dev/pts 2>/dev/null
+
+    # ---- charger mode (LK off-mode charging: atag,boot mode 8) ------------
+    # Shows the charging screen and only returns when the normal boot
+    # should continue (long-press Esc/On). Unplugging powers off inside it.
+    if [ -f /charger.sh ]; then
+        . /charger.sh
+        if charger_mode_detect; then
+            echo "==> charger boot detected"
+            charger_main
+            echo "==> leaving charger mode: continuing normal boot"
+        fi
+    fi
 
     echo "==> waiting for eMMC block devices"
     i=0
@@ -377,6 +411,15 @@ pkgs.runCommand "gemini-minimal-initrd" {
 
   cp $initScript root/init
   chmod 555 root/init
+
+  # charger mode: the screen script + the gauge module (optional)
+  cp ${./charger.sh} root/charger.sh
+  chmod 444 root/charger.sh
+  ${lib.optionalString (gaugeModule != null) ''
+    mkdir -p root/lib/modules
+    cp ${gaugeModule}/mt6351-gauge.ko root/lib/modules/mt6351-gauge.ko
+    chmod 444 root/lib/modules/mt6351-gauge.ko
+  ''}
 
   (cd root && find . -print0 | cpio --quiet -o -H newc -R +0:+0 --reproducible --null | gzip -9n > $out/initrd)
   ln -s initrd $out/initrd.gz
