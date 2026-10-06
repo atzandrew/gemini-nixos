@@ -8,3 +8,4 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
 obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
 obj-$(CONFIG_MTK_SVS) += mtk-svs.o
 obj-$(CONFIG_MTK_CONSYS_SPIKE) += mtk-consys-spike.o
+obj-$(CONFIG_MTK_MT6797_CL2_POWER) += mt6797-cl2-power.o

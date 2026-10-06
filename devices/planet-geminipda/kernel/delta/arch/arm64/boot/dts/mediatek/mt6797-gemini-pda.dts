@@ -742,6 +742,59 @@
 	 */
 	mediatek,appm_used;
 	status = "okay";
+
+	/*
+	 * DA9214 dual buck (2026-10-06, docs/cpu-dvfs.md): mainline
+	 * da9211-regulator. BUCKA = VPROC1 (A53 LL+L clusters + CCI, LK leaves
+	 * 1.000 V), BUCKB = VPROC2 (A72 cluster, off at boot; switched on by
+	 * the cl2-power node below). Ranges = vendor OPP bounds (0.77-1.20 V)
+	 * so the core never forces a voltage at registration (min != max).
+	 * BUCKA must never be switched off.
+	 */
+	da9214: regulator@68 {
+		compatible = "dlg,da9214";
+		reg = <0x68>;
+
+		regulators {
+			vproc1: BUCKA {
+				regulator-name = "vproc1";
+				regulator-min-microvolt = <770000>;
+				regulator-max-microvolt = <1200000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			vproc2: BUCKB {
+				regulator-name = "vproc2";
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1200000>;
+			};
+		};
+	};
+};
+
+/* TOPRGU SWSYSRST as a reset controller (mtk_wdt delta, mt6797 data). */
+&watchdog {
+	#reset-cells = <1>;
+};
+
+/ {
+	/*
+	 * A72 cluster (cpu8/9) power-on, vendor order (psci.c
+	 * cpu_power_on_buck): drivers/soc/mediatek/mt6797-cl2-power.c.
+	 * Replaces cl2-up.sh / gemini-a72-up / sramldo-smc. The kernel boots
+	 * with maxcpus=8; this onlines cpu8/9 once VPROC2 exists.
+	 * Reset 11 = SWSYSRST PWRAP_SPI_CTL_RST.
+	 */
+	cl2-power {
+		compatible = "mediatek,mt6797-cl2-power";
+		reg = <0 0x10006000 0 0x1000>, <0 0x10222000 0 0x1000>;
+		reg-names = "spm", "mcucfg2";
+		vproc-supply = <&vproc2>;
+		resets = <&watchdog 11>;
+		reset-names = "pwrap-spi";
+		cpus = <&cpu8>, <&cpu9>;
+	};
 };
 
 /* i2c7: RT5735 VPROC buck regulator */

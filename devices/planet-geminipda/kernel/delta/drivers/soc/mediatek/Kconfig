@@ -102,4 +102,14 @@ config MTK_CONSYS_SPIKE
 	  firmware (Gate G2b). The firmware blobs must be built in via
 	  CONFIG_EXTRA_FIRMWARE. Not a production driver.
 
+config MTK_MT6797_CL2_POWER
+	bool "MediaTek MT6797 A72 cluster (cpu8/9) power-on"
+	depends on ARCH_MEDIATEK && SMP && HOTPLUG_CPU
+	depends on REGULATOR && RESET_CONTROLLER && HAVE_ARM_SMCCC
+	help
+	  Powers the MT6797 A72 cluster from its external buck (VPROC2) in the
+	  vendor order (PMIC-wrapper SPI reset latched around the rail
+	  switch-on, EXT_BUCK_ISO clear, SRAM LDO via SMC) and brings its CPUs
+	  online. Needed when the kernel boots with maxcpus=8 (Gemini PDA).
+
 endmenu
