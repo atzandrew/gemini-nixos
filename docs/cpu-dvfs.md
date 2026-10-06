@@ -171,48 +171,40 @@ A72 (B) on VPROC2, OPP 0 / 6 / 9 / 13 (full tables in mt_cpufreq.c):
 `DEFAULT_B_FREQ_IDX` = 13 (the A72s start at ~793-845 MHz), which fits
 the benchmark (A72 ~ CPU4).
 
-## Approach
+## Approach (revised 2026-10-04 19:50: follow mainline conventions)
 
-**Recommended: a board-local driver, developed as a loadable module first.**
+Not aiming for upstream, but every piece follows mainline conventions so
+governor, thermal (cpufreq cooling), cpuidle/energy model and kernel bumps
+come for free. No all-in-one board driver. Pieces, each testable alone
+(read-only first via standard sysfs/debugfs), developed as modules where
+possible (only DTS changes need a boot flash):
 
-- Mainline-style (cpufreq-dt / mediatek-cpufreq + DTS OPP tables) would
-  need: a clock driver for the MCUMIXED ARM PLLs/mux/divider that honours
-  the HW semaphore; the DA9214 under the mainline da9211 regulator driver
-  (which would also own BUCKB, the A72 rail that `cl2-up.sh` drives over
-  i2c-dev — a conflict to solve first); a regulator for CPULDO with VSRAM
-  tracking; mediatek-cpufreq platform data for a shared VPROC1 plus the
-  CCI rule; and the A72 iDVFS SMCs don't fit the clk framework at all.
-  That is the right end state if this is ever upstreamed, but it is five
-  new pieces before the first measurement.
-- A single board-local `mt6797-cpufreq` (kernel delta, like the mtk-sd
-  change) does the vendor sequence explicitly: per-cluster OPP table
-  chosen by the eFuse bin, VPROC1 = max rule, VSRAM tracking, semaphore-
-  protected PLL writes, every step logged, every knob a parameter.
-- **Test vehicle: a module, not a boot image.** Each experiment is an
-  `insmod` that performs one logged step. If the device hangs, a power
-  cycle runs the boot chain's own clock setup again — Linux persists
-  nothing, no flash is needed, and the known-good boot image is never
-  touched. (Caveat to check: the DA9214 is an external chip and may keep a
-  voltage we set across a warm reset until preloader/LK set it again.
-  We only ever raise it first, so that is the safe direction; the survey
-  run after a reboot shows what the boot chain leaves.) Only a proven driver goes into the boot image (then
-  the usual Dragon backup / boot-only flash / fallback loop applies).
-- Not planned: porting the CSPM firmware blob (opaque; hard to debug).
+1. **DA9214 under mainline `da9211-regulator`** (`dlg,da9214` on i2c6),
+   after the APPM I2C fix (step 1b) is confirmed. Catch: it would own BUCKB
+   (A72 rail) that `cl2-up.sh` toggles via i2c-dev — move the A72 bring-up
+   into the kernel (vendor did it in PSCI CPU_ON, `cpu_power_on_buck`) or
+   keep BUCKB untouched (always-on / no consumer) first.
+2. **Clock driver for MCUMIXED** (ARMCAXPLL0-2, MUXSEL, CKDIV) with the
+   vendor HW-semaphore lock inside the regmap/accessors. `clk_summary` then
+   shows every cluster clock.
+3. **Small regulator driver for CPULDO** (VSRAM_L).
+4. **DTS OPP tables** (speed bin SB/TT, sign-off voltages) + MT6797
+   platform data in `mediatek-cpufreq` (intermediate clock = MAINPLL, the
+   vendor switch trick; `sram-supply` tracking +100 mV / <= 300 mV; shared
+   VPROC1 aggregated by the regulator core). CCI via the mainline
+   `mtk-cci-devfreq` link.
+5. **A72 last:** small clock provider wrapping the iDVFS SMCs + VPROC2;
+   only after a temperature sensor is wired up (no thermal driver today).
 
-Order: **L cluster first** (CPU4-7; A53, highest A53 table, already the
-faster cluster). First write = VPROC1 (+VSRAM_L) up only, no frequency
-change (more margin, nothing else). Then one L OPP step at the voltage
-already set. LL follows on the same rail. The A72s last (ATF SMCs + the
-`cl2-up.sh` DA9214/bus-safety sequence, which stays untouched), and only
-after there is a temperature reading: the vendor ran the A72s at
-2.1-2.5 GHz with thermal throttling and a power budget (PPM); we have
-neither.
+Throwaway test modules are still fine for one-off measurements (e.g. "does
+a VBUCKA_A write take effect"), never as the driver.
 
-Battery: today every core sits at its LK clock and voltage even when idle.
-A real governor (schedutil) would drop idle clusters to the bottom OPPs
-(221-325 MHz at ~0.78 V), which should lower idle drain, while a fixed
-higher clock without a governor would raise it. So the battery win comes
-with step 5 (governor), and cpuidle on top of that.
+The A72 5-minute delay is a port workaround, not SoC behaviour (Android
+brings the cluster up in the kernel's CPU_ON path). Revisit after the I2C
+fix — the hang it guards against is not yet explained.
+
+Battery: a governor (schedutil) drops idle clusters to the bottom OPPs
+(~0.78 V), the actual battery win; cpuidle on top.
 
 ## Step 1 — read-only survey (tools)
 
@@ -324,6 +316,58 @@ for the A72s (cl2-up.sh must still bring them up: its i2cset writes are
 single-message) → `da9214-read.sh`: expect A and B to agree, 10/10, with
 0x5e bit0 = 1. Fallback: `gemini-backup/boot-hs200-192-20261004.img`.
 
+## A72 bring-up: root cause of the old "wedge" + in-kernel fix (2026-10-06)
+
+Vendor reference: gemian/gemini-linux-kernel-3.18 `arch/arm64/kernel/psci.c`
+`cpu_power_on_buck()` + `cpu_psci_cpu_boot()`.
+
+| Step | Vendor (kernel, before PSCI CPU_ON) | cl2-up.sh (userspace) |
+|---|---|---|
+| 1 | SPM 0x10006218 \|= bit0 | DA9214 BUCKB on (i2cset) |
+| 2 | dummy read 0x102224a0 | SPM 0x218 |
+| 3 | SWSYSRST 0x10007018 key\|bit11 = **PWRAP_SPI_CTL_RST latch** | latch |
+| 4 | DA9214 page 0 + BUCKB on, 1 ms | — |
+| 5 | EXT_BUCK_ISO 0x10006290 &= ~3 | ISO clear |
+| 6 | unlatch | unlatch |
+| 7 | 240 us, SRAM LDO SMC 1.1 V, 240 us | SRAM LDO SMC, 0.1 s |
+| 8 | CPU_ON (+ MP2 sync DCM, iDVFS init) | sysfs online |
+
+Root cause (confirmed by test): cl2-up.sh switched the A72 rail on OUTSIDE
+the PMIC-wrapper (pwrap) SPI reset latch and then held the latch for tens
+of ms across devmem process launches while the kernel kept using the
+MT6351. Explains "wedge while boot is busy" (RCU stalls, eMMC/I2C
+timeouts). The "SCP contends i2c6" theory was wrong: vendor i2c-mtk only
+arbitrates i2c0/i2c1 with the SCP; i2c6 is shared with the (idle) CSPM.
+Vendor also brings the A72s up late (HPS hotplug after drivers), but in
+the kernel.
+
+Also found: cl2-up.sh's WDT "arm" writes LENGTH = 20 << 5 = 20/64 s, and
+its "disarm" writes MODE = key only = WDT OFF for the rest of the boot
+(the old reboot trap). The mainline mtk_wdt driver already owns the WDT
+(CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED; LK leaves MODE 0x5D, LENGTH 0xF800
+= 31 s) — do not touch it.
+
+**Test module `devices/planet-geminipda/kernel/modules/mt6797-cl2-on/`**
+(flake `mt6797-cl2-on`): vendor order, register steps IRQs-off, I2C
+inside the window, add_cpu(8/9), WDT untouched (default wdt=0), logs
+"cl2-on:". Results:
+- settled system: latch 1.38 ms (I2C 375 us), power-on 1.9 ms,
+  add_cpu(8) 25 ms, add_cpu(9) 4 ms -> 0-9.
+- full load (8 busy loops + continuous power_supply reads = pwrap traffic):
+  OK, add_cpu(8) 58 ms; no stall/pwrap/mmc/i2c errors.
+- **at boot** (systemd `cl2-on-test.service`, ~3 s after kernel start),
+  4/4 boots OK: latch 1.36-2.03 ms, A72 online at ~3 s, no errors;
+  graphical.target 21.1-21.7 s userspace (24.7 s on 2026-10-04 with the
+  A72s off until ~5 min).
+- gemini-a72-up.timer is DISABLED on the device during these tests;
+  `cl2-on-test.service` (insmod /home/atzero/mt6797-cl2-on.ko wdt=0) is
+  the interim bring-up.
+
+Next: in-kernel, mainline-shaped: DA9214 under da9211-regulator owning
+both bucks + a small MT6797 platform driver for the SPM/latch/SRAM-LDO
+steps that onlines cpu8/9 once its regulator is up; then retire
+cl2-up.sh, the timer and sramldo-smc.
+
 ## Log
 
 - 2026-10-04 ~19:00: vendor DVFS extracted (this doc). Survey tools
@@ -337,3 +381,28 @@ single-message) → `da9214-read.sh`: expect A and B to agree, 10/10, with
   (APPM controller packs the WRRD read length; no AUX register). Fix
   written in the i2c-mt65xx delta + DTS (`mediatek,appm_used`); compiles
   clean (W=1), DTB contains the property. Not yet built/flashed.
+- 2026-10-04 19:53: da9214-read.sh after the APPM I2C fix build: results
+  identical to before (A/B 0x00/FAIL, C echoes the address;
+  `logs/da9214-read-20261004-195351.txt`). Not yet confirmed that the new
+  boot image was running: first check `dmesg | grep "APPM variant"` and
+  `uname -v` (build date). If the line is there, the length packing alone
+  is not the cause — next suspects: vendor push-pull/HS mode for this bus
+  (I2C_PUSHPULL_FLAG, 3.4 MHz), and the method-C FIFO echo.
+- 2026-10-06 13:33: **APPM I2C fix confirmed** (charger-ui boot image;
+  `logs/da9214-read-20261006-133318.txt`). (The 10-04 "no change" run was on
+  the old image; and `find /proc/device-tree` never searched anything —
+  it is a symlink, use `ls /proc/device-tree/<node>/`.) Methods A and B now
+  agree 10/10: 0x5d BUCKA_CONT 0x01, 0x5e BUCKB_CONT 0x01 (EN, VSEL A, no
+  GPI), **0xd7 VPROC1 = 0x46 = 1000 mV, 0xd9 VPROC2 = 0x46 = 1000 mV**.
+  Method C (receive-byte) still echoes the address — unused, ignore.
+  Consequences: VSRAM_L 1100 = VPROC1 + 100 (vendor rule holds). LK runs
+  L at 1274 MHz and CCI at 630 MHz on 1000 mV, slightly below the SB
+  sign-off (1209 / 611 at 1000; 1352 / 676 at 1040), so the first write
+  should be VPROC1 -> 1040 mV + VSRAM_L -> 1140 (margin at current clocks;
+  also the voltage for L 1352). A72 at 750 MHz on 1000 mV has margin.
+  Next (mainline-shaped plan): piece 1, DA9214 under da9211-regulator —
+  first decide BUCKB ownership vs cl2-up.sh.
+- 2026-10-06 13:57-14:32: A72 bring-up root-caused against the vendor
+  psci.c (latch order/window) and fixed in a test module; settled, load
+  and 4 boot-time runs all pass (section above). WDT handling in
+  cl2-up.sh found wrong; module leaves the WDT to mtk_wdt.

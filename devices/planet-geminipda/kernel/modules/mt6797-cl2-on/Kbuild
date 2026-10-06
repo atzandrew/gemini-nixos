@@ -1,0 +1,2 @@
+# Kbuild for the A72 power-on test module (nix: .#packages.aarch64-linux.mt6797-cl2-on)
+obj-m := mt6797-cl2-on.o

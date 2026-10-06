@@ -286,6 +286,11 @@
         mt6797-dvfs-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-dvfs-probe {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # A72 cluster power-on in the vendor order (test module for moving
+        # cl2-up.sh into the kernel; docs/cpu-dvfs.md).
+        mt6797-cl2-on = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cl2-on {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # MT6351 fuel gauge as a power_supply (development module, step 2+).
         mt6351-gauge = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
