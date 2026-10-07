@@ -1,0 +1,71 @@
+diff --git a/devices/planet-geminipda/kernel/config b/devices/planet-geminipda/kernel/config
+index 5cf4a81..262f7a1 100644
+--- a/devices/planet-geminipda/kernel/config
++++ b/devices/planet-geminipda/kernel/config
+@@ -538,7 +538,7 @@ CONFIG_STACKPROTECTOR_PER_TASK=y
+ # Boot options
+ #
+ # CONFIG_ARM64_ACPI_PARKING_PROTOCOL is not set
+-CONFIG_CMDLINE="console=tty0 console=ttyS0,921600n1 earlycon maxcpus=8 nokaslr fbcon=rotate:3 fbcon=font:TER16x32 fbcon=logo-count:1 g_ether.dev_addr=42:00:15:19:82:01 g_ether.host_addr=42:00:15:19:82:00 clk_ignore_unused pd_ignore_unused regulator_ignore_unused consoleblank=0 loglevel=1"
++CONFIG_CMDLINE="console=tty0 console=ttyS0,921600n1 earlycon maxcpus=8 nokaslr fbcon=rotate:3 fbcon=font:TER16x32 fbcon=logo-count:1 g_ether.dev_addr=42:00:15:19:82:01 g_ether.host_addr=42:00:15:19:82:00 clk_ignore_unused regulator_ignore_unused consoleblank=0 loglevel=1"
+ # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
+ CONFIG_CMDLINE_FORCE=y
+ CONFIG_EFI_STUB=y
+diff --git a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 8145ec6..8fbc793 100644
+--- a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -78,6 +78,8 @@
+ 	 */
+ 	geminipda-fb {
+ 		compatible = "planet,geminipda-fb";
++		/* scanout runs in MM; holding it keeps genpd from switching it off */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 	};
+ 
+ 	/*
+@@ -90,6 +92,8 @@
+ 	 */
+ 	geminipda-drm {
+ 		compatible = "planet,geminipda-drm";
++		/* scanout runs in MM; holding it keeps genpd from switching it off */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 	};
+ 
+ 	reserved-memory {
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/pmdomain/mediatek/mtk-scpsys.c b/devices/planet-geminipda/kernel/delta/drivers/pmdomain/mediatek/mtk-scpsys.c
+index 2593415..a83c328 100644
+--- a/devices/planet-geminipda/kernel/delta/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/devices/planet-geminipda/kernel/delta/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -26,6 +26,7 @@
+ #define MTK_SCPD_ACTIVE_WAKEUP		BIT(0)
+ #define MTK_SCPD_FWAIT_SRAM		BIT(1)
+ #define MTK_SCPD_KEEP_DEFAULT_OFF	BIT(2)
++#define MTK_SCPD_ALWAYS_ON		BIT(3)
+ #define MTK_SCPD_CAPS(_scpd, _x)	((_scpd)->data->caps & (_x))
+ 
+ #define SPM_VDE_PWR_CON			0x0210
+@@ -526,6 +527,8 @@ static struct scp *init_scp(struct platform_device *pdev,
+ 		genpd->power_on = scpsys_power_on;
+ 		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ACTIVE_WAKEUP))
+ 			genpd->flags |= GENPD_FLAG_ACTIVE_WAKEUP;
++		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ALWAYS_ON))
++			genpd->flags |= GENPD_FLAG_ALWAYS_ON;
+ 	}
+ 
+ 	return scp;
+@@ -841,6 +844,14 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
+ 		.sram_pdn_bits = 0,
+ 		.sram_pdn_ack_bits = 0,
+ 		.clk_id = {CLK_MFG},
++		/*
++		 * Kept on: the Mali node has no power-domains yet and the MFG
++		 * sub-domains behind this one are powered by gpu-poweron.sh, so
++		 * genpd's late "power off unused domains" pass (active since
++		 * pd_ignore_unused left the cmdline) would cut power under a
++		 * running GPU. Drop this once panfrost owns the MFG domains.
++		 */
++		.caps = MTK_SCPD_ALWAYS_ON,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MJC] = {
+ 		.name = "mjc",

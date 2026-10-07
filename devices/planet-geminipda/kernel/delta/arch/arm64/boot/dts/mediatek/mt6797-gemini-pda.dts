@@ -78,6 +78,8 @@
 	 */
 	geminipda-fb {
 		compatible = "planet,geminipda-fb";
+		/* scanout runs in MM; holding it keeps genpd from switching it off */
+		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
 	};
 
 	/*
@@ -90,6 +92,8 @@
 	 */
 	geminipda-drm {
 		compatible = "planet,geminipda-drm";
+		/* scanout runs in MM; holding it keeps genpd from switching it off */
+		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
 	};
 
 	reserved-memory {

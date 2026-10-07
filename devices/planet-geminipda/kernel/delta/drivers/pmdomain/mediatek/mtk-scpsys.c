@@ -26,6 +26,7 @@
 #define MTK_SCPD_ACTIVE_WAKEUP		BIT(0)
 #define MTK_SCPD_FWAIT_SRAM		BIT(1)
 #define MTK_SCPD_KEEP_DEFAULT_OFF	BIT(2)
+#define MTK_SCPD_ALWAYS_ON		BIT(3)
 #define MTK_SCPD_CAPS(_scpd, _x)	((_scpd)->data->caps & (_x))
 
 #define SPM_VDE_PWR_CON			0x0210
@@ -526,6 +527,8 @@ static struct scp *init_scp(struct platform_device *pdev,
 		genpd->power_on = scpsys_power_on;
 		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ACTIVE_WAKEUP))
 			genpd->flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ALWAYS_ON))
+			genpd->flags |= GENPD_FLAG_ALWAYS_ON;
 	}
 
 	return scp;
@@ -841,6 +844,14 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
 		.sram_pdn_bits = 0,
 		.sram_pdn_ack_bits = 0,
 		.clk_id = {CLK_MFG},
+		/*
+		 * Kept on: the Mali node has no power-domains yet and the MFG
+		 * sub-domains behind this one are powered by gpu-poweron.sh, so
+		 * genpd's late "power off unused domains" pass (active since
+		 * pd_ignore_unused left the cmdline) would cut power under a
+		 * running GPU. Drop this once panfrost owns the MFG domains.
+		 */
+		.caps = MTK_SCPD_ALWAYS_ON,
 	},
 	[MT6797_POWER_DOMAIN_MJC] = {
 		.name = "mjc",
