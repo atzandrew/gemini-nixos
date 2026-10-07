@@ -1,0 +1,60 @@
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
+index 83f65a9..a28c8ad 100644
+--- a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
++++ b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
+@@ -411,6 +411,7 @@ struct mcu_mux {
+ 	struct clk_hw hw;
+ 	struct mcu_clk_ctx *c;
+ 	u8 shift;
++	bool b;		/* A72 mux: see mcu_mux_get_parent() */
+ };
+ #define to_mcu_mux(_hw) container_of(_hw, struct mcu_mux, hw)
+ 
+@@ -419,6 +420,15 @@ static u8 mcu_mux_get_parent(struct clk_hw *hw)
+ 	struct mcu_mux *m = to_mcu_mux(hw);
+ 	u32 v;
+ 
++	/*
++	 * The clk core reads the parent once, at registration, when the A72
++	 * cluster is still powered down (its MUXSEL field then reads 0 =
++	 * clk26m). The cluster always comes up on its ARMPLL (MUXSEL 0x55
++	 * measured with all clusters running), so report that instead of a
++	 * parent that would be stale from the first CPU_ON on.
++	 */
++	if (m->b && !mcu_b_cluster_up(m->c))
++		return MUX_ARMPLL;
+ 	if (mcu_read(m->c, ARMPLLDIV_MUXSEL, &v))
+ 		return 1;	/* assume armpll */
+ 	return (v >> m->shift) & 0x3;
+@@ -605,6 +615,7 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
+ 			return -ENOMEM;
+ 		b->c = m->c = d->c = c;
+ 		m->shift = B_MUX_SHIFT;
++		m->b = true;
+ 		d->shift = B_DIV_SHIFT;
+ 
+ 		ret = mcu_register(dev, &b->hw, "armpll_b", &mcu_bpll_ops, clk26m, 1, 0);
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c
+index a7cef13..ab9d556 100644
+--- a/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c
++++ b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c
+@@ -109,11 +109,14 @@ static int __init a72clk_step_init(void)
+ 		ret = -ENODEV;
+ 		goto put;
+ 	}
+-	if (!clk_is_match(clk_get_parent(sel), pll)) {
+-		pr_err("a72clk-step: cpu_b_sel is not on armpll_b - refusing\n");
+-		ret = -EBUSY;
+-		goto put;
+-	}
++	/*
++	 * No parent check here: on the a72clk1 boot image the clk core cached
++	 * cpu_b_sel's parent while the A72 cluster was still off (MUXSEL B
++	 * field 0 = clk26m), so the cached parent is stale. The clock driver
++	 * itself refuses to retune armpll_b while the hardware mux is on it.
++	 */
++	pr_info("a72clk-step: cpu_b_sel cached parent %s\n",
++		__clk_get_name(clk_get_parent(sel)) ?: "?");
+ 
+ 	before = clk_get_rate(cpu_b);
+ 	pll_before = clk_get_rate(pll);

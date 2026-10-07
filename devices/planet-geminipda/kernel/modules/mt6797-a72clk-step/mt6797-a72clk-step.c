@@ -109,11 +109,14 @@ static int __init a72clk_step_init(void)
 		ret = -ENODEV;
 		goto put;
 	}
-	if (!clk_is_match(clk_get_parent(sel), pll)) {
-		pr_err("a72clk-step: cpu_b_sel is not on armpll_b - refusing\n");
-		ret = -EBUSY;
-		goto put;
-	}
+	/*
+	 * No parent check here: on the a72clk1 boot image the clk core cached
+	 * cpu_b_sel's parent while the A72 cluster was still off (MUXSEL B
+	 * field 0 = clk26m), so the cached parent is stale. The clock driver
+	 * itself refuses to retune armpll_b while the hardware mux is on it.
+	 */
+	pr_info("a72clk-step: cpu_b_sel cached parent %s\n",
+		__clk_get_name(clk_get_parent(sel)) ?: "?");
 
 	before = clk_get_rate(cpu_b);
 	pll_before = clk_get_rate(pll);

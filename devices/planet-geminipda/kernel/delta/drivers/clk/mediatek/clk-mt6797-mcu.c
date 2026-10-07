@@ -411,6 +411,7 @@ struct mcu_mux {
 	struct clk_hw hw;
 	struct mcu_clk_ctx *c;
 	u8 shift;
+	bool b;		/* A72 mux: see mcu_mux_get_parent() */
 };
 #define to_mcu_mux(_hw) container_of(_hw, struct mcu_mux, hw)
 
@@ -419,6 +420,15 @@ static u8 mcu_mux_get_parent(struct clk_hw *hw)
 	struct mcu_mux *m = to_mcu_mux(hw);
 	u32 v;
 
+	/*
+	 * The clk core reads the parent once, at registration, when the A72
+	 * cluster is still powered down (its MUXSEL field then reads 0 =
+	 * clk26m). The cluster always comes up on its ARMPLL (MUXSEL 0x55
+	 * measured with all clusters running), so report that instead of a
+	 * parent that would be stale from the first CPU_ON on.
+	 */
+	if (m->b && !mcu_b_cluster_up(m->c))
+		return MUX_ARMPLL;
 	if (mcu_read(m->c, ARMPLLDIV_MUXSEL, &v))
 		return 1;	/* assume armpll */
 	return (v >> m->shift) & 0x3;
@@ -605,6 +615,7 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 			return -ENOMEM;
 		b->c = m->c = d->c = c;
 		m->shift = B_MUX_SHIFT;
+		m->b = true;
 		d->shift = B_DIV_SHIFT;
 
 		ret = mcu_register(dev, &b->hw, "armpll_b", &mcu_bpll_ops, clk26m, 1, 0);
