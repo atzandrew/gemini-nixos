@@ -34,3 +34,5 @@ pkgs/gemshell/target/
 # device's host key. This is a deliberate trade for a single-user lab
 # device; keys/README.md states the consequences and when to reverse it.
 # Do not add a `keys/` or `*.key` rule here.
+spm-fw/
+spm-fw.tgz
