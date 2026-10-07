@@ -490,3 +490,27 @@ cl2-up.sh, the timer and sramldo-smc.
   mt6797-vproc-set v2 moves VSRAM_L with VPROC1 (VPROC+100 mV clamped
   1.00..1.20 V; SRAM first going up, VPROC first going down; window now
   1.00..1.15 V).
+- 2026-10-06 21:40: **cpufreq for the A53 clusters** (awaiting test). Mainline
+  `mediatek-cpufreq` (delta copy) + `mt6797_platform_data`: min_volt_shift
+  100 mV, max_volt_shift 275 mV (vendor steps 275 so the 25 mV SRAM grid
+  can't pass 300), proc_max 1.20 V, sram 1.00..1.20 V, no ccifreq. Delta
+  changes to the mainline driver: CPUs without `operating-points-v2` are
+  skipped (cpu8/9), and init returns -ENODEV quietly for them;
+  `cpufreq-dt-platdev` blocklists mediatek,mt6797. DT: every cpu0-7 node
+  gets clocks <cpu_X_sel>, <MAINPLL> ("cpu", "intermediate"), proc-supply
+  vproc1, sram-supply vsram_l, operating-points-v2 cluster0_opp / cluster1_opp
+  (opp-shared). Shared VPROC1/VSRAM_L: each cluster is a separate consumer
+  and the regulator core takes the max; each consumer keeps
+  SRAM >= PROC and SRAM - PROC <= 275 mV (+25 mV grid) at every step, so the
+  aggregate does too, even with both clusters changing at once.
+  Tables (SB): LL 624/715/806/897/1014/1118, L 650/832/962/1092/1209/1352
+  MHz; voltages floored at 1.00 V because the CCI stays at LK's 630 MHz
+  (LK runs it at 1.00 V; SB says 611 @ 1.00, 676 @ 1.04) — floor goes when
+  the CCI scales. LL includes 1118 @ 1.07 V because mediatek-cpufreq needs
+  an OPP >= the intermediate rate (MAINPLL 1092) to pick the intermediate
+  voltage; LL transitions therefore pass through 1.07 V (vendor avoided
+  this with FHCTL hopping for LL/L/CCI; options later: FHCTL, or clk26m as
+  intermediate). Clock driver: posdiv now /1 >= 1092 MHz, /2 below, never
+  /4 (vendor tables exactly), so PLL >= 546 MHz; CKDIV for lower OPPs later.
+  The test modules (vproc-set, cpuclk-step) must not be used with cpufreq
+  running — they'd fight it.

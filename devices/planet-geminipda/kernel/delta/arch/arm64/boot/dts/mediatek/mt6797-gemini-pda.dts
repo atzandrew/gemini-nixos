@@ -413,6 +413,143 @@
 &cpu9 { clock-frequency = <0x88601c00>; };
 
 /*
+ * CPU DVFS for the A53 clusters (2026-10-06, docs/cpu-dvfs.md):
+ * mainline mediatek-cpufreq ("mediatek,mt6797" platform data) with
+ *   cpu          = cpu_X_sel (clk-mt6797-mcu mux),
+ *   intermediate = MAINPLL 1092 MHz (vendor _cpu_clock_switch trick),
+ *   proc         = VPROC1 (DA9214 BUCKA, shared by LL, L and CCI),
+ *   sram         = VSRAM_L (CPULDO), tracked +100 mV / <= 300 mV.
+ * OPPs = vendor speed bin SB (level 1) sign-off voltages, unadjusted by EEM.
+ * Limits for now:
+ *  - L tops out at 1352 MHz (tested), LL at 1118 MHz (LL needs an OPP at
+ *    or above 1092 MHz for the intermediate clock; 1118 @ 1.07 V is the SB
+ *    point). Higher SB points get added after soak tests.
+ *  - CCI stays at LK's 630 MHz (not scaled yet); LK runs it at 1.00 V, so
+ *    no OPP asks for less than 1.00 V until the CCI scales with the
+ *    clusters (the real SB value is in the comment).
+ *  - Lowest points need CKDIV (/2); the clock driver doesn't do that yet,
+ *    so LL >= 624 and L >= 650 MHz.
+ *  - cpu8/9 (A72): no OPP table, left at 750 MHz (iDVFS via ATF, and no
+ *    thermal sensor yet).
+ */
+&cpu0 {
+	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster0_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu1 {
+	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster0_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu2 {
+	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster0_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu3 {
+	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster0_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu4 {
+	clocks = <&mcumixedsys CLK_MCU_L_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster1_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu5 {
+	clocks = <&mcumixedsys CLK_MCU_L_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster1_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu6 {
+	clocks = <&mcumixedsys CLK_MCU_L_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster1_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+&cpu7 {
+	clocks = <&mcumixedsys CLK_MCU_L_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster1_opp>;
+	proc-supply = <&vproc1>;
+	sram-supply = <&vsram_l>;
+};
+
+/ {
+	cluster0_opp: opp-table-cluster0 {	/* LL, cpu0-3 */
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-624000000 {
+			opp-hz = /bits/ 64 <624000000>;
+			opp-microvolt = <1000000>;	/* SB 900 mV, CCI floor */
+		};
+		opp-715000000 {
+			opp-hz = /bits/ 64 <715000000>;
+			opp-microvolt = <1000000>;	/* SB 940 mV, CCI floor */
+		};
+		opp-806000000 {
+			opp-hz = /bits/ 64 <806000000>;
+			opp-microvolt = <1000000>;	/* SB 970 mV, CCI floor */
+		};
+		opp-897000000 {
+			opp-hz = /bits/ 64 <897000000>;
+			opp-microvolt = <1000000>;
+		};
+		opp-1014000000 {
+			opp-hz = /bits/ 64 <1014000000>;
+			opp-microvolt = <1040000>;
+		};
+		opp-1118000000 {
+			opp-hz = /bits/ 64 <1118000000>;
+			opp-microvolt = <1070000>;
+		};
+	};
+
+	cluster1_opp: opp-table-cluster1 {	/* L, cpu4-7 */
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-650000000 {
+			opp-hz = /bits/ 64 <650000000>;
+			opp-microvolt = <1000000>;	/* SB 850 mV, CCI floor */
+		};
+		opp-832000000 {
+			opp-hz = /bits/ 64 <832000000>;
+			opp-microvolt = <1000000>;	/* SB 900 mV, CCI floor */
+		};
+		opp-962000000 {
+			opp-hz = /bits/ 64 <962000000>;
+			opp-microvolt = <1000000>;	/* SB 940 mV, CCI floor */
+		};
+		opp-1092000000 {
+			opp-hz = /bits/ 64 <1092000000>;
+			opp-microvolt = <1000000>;	/* SB 970 mV, CCI floor */
+		};
+		opp-1209000000 {
+			opp-hz = /bits/ 64 <1209000000>;
+			opp-microvolt = <1000000>;
+		};
+		opp-1352000000 {
+			opp-hz = /bits/ 64 <1352000000>;
+			opp-microvolt = <1040000>;
+		};
+	};
+};
+
+/*
  * UART0 serial console.
  * Vendor DTS: UART0 RX=GPIO97, TX=GPIO98 (confirmed from aw9523/uart DTS).
  * The mainline uart0_pins_a uses GPIO234/235 (wrong for Gemini).

@@ -45,9 +45,10 @@
  *
  * PLL WRITE (vendor adjust_armpll_dds): CON1 = (CON1 & ~(26:24 | 20:0)) |
  * posdiv << 24 | DDS | CHG(bit31), then 20 us PLL settle before anyone may
- * switch back. DDS = (VCO << 14) / 26 MHz. posdiv is the smallest of
- * /1,/2,/4 that keeps the VCO >= 1 GHz (matches every vendor A53/CCI table:
- * e.g. L 1092 MHz /1, 962 MHz /2). Writing posdiv and DDS in one go is fine
+ * switch back. DDS = (VCO << 14) / 26 MHz. posdiv is /1 down to 1092 MHz
+ * and /2 below (exactly the vendor SB/FY A53 tables: LL 1118 /1, 1014 /2;
+ * L 1092 /1, 962 /2). The vendor never uses /4, so neither do we: the
+ * lowest PLL rate is 546 MHz; lower OPPs need CKDIV (/2, /4), not done yet. Writing posdiv and DDS in one go is fine
  * because the cluster is not on the PLL while it changes (the vendor's
  * separate adjust_posdiv() also switches to MAINPLL around its write).
  * CKDIV (the cpu_X divider) stays read-only: every OPP >= 559 MHz is /1.
@@ -76,7 +77,8 @@
 #define MUX_UNIVPLL		3
 #define MISC_CFG_MASK		GENMASK(5, 4)
 #define PLL_SETTLE_US		20	/* vendor PLL_SETTLE_TIME */
-#define VCO_MIN_HZ		1000000000UL
+#define VCO_MIN_HZ		1092000000UL	/* lowest vendor /1 rate */
+#define PLL_MIN_HZ		(VCO_MIN_HZ / 2)
 
 #define CSPM_POWERON_CONFIG_EN	0x000
 #define CSPM_SEMA3_M0		0x440
@@ -197,12 +199,7 @@ static unsigned long mcu_pll_recalc_rate(struct clk_hw *hw, unsigned long parent
 
 static unsigned int mcu_pll_posdiv_shift(unsigned long rate)
 {
-	unsigned int shift;
-
-	for (shift = 0; shift < 2; shift++)
-		if (((u64)rate << shift) >= VCO_MIN_HZ)
-			break;
-	return shift;	/* 0, 1 or 2 = /1, /2, /4 */
+	return rate >= VCO_MIN_HZ ? 0 : 1;	/* /1 or /2 */
 }
 
 static u32 mcu_pll_dds(unsigned long rate, unsigned int shift, unsigned long parent)
@@ -218,7 +215,7 @@ static unsigned long mcu_pll_dds_rate(u32 dds, unsigned int shift, unsigned long
 static int mcu_pll_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
 {
 	struct mcu_pll *p = to_mcu_pll(hw);
-	unsigned long rate = clamp(req->rate, VCO_MIN_HZ >> 2, pll_max_hz[p->idx]);
+	unsigned long rate = clamp(req->rate, PLL_MIN_HZ, pll_max_hz[p->idx]);
 	unsigned int shift = mcu_pll_posdiv_shift(rate);
 
 	if (!req->best_parent_rate)
@@ -237,7 +234,7 @@ static int mcu_pll_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long
 	u32 muxsel, con1 = 0, dds;
 	int ret;
 
-	if (rate > pll_max_hz[p->idx] || rate < (VCO_MIN_HZ >> 2) || !parent_rate)
+	if (rate > pll_max_hz[p->idx] || rate < PLL_MIN_HZ || !parent_rate)
 		return -EINVAL;
 	shift = mcu_pll_posdiv_shift(rate);
 	dds = mcu_pll_dds(rate, shift, parent_rate);
