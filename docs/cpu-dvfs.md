@@ -514,3 +514,12 @@ cl2-up.sh, the timer and sramldo-smc.
   /4 (vendor tables exactly), so PLL >= 546 MHz; CKDIV for lower OPPs later.
   The test modules (vproc-set, cpuclk-step) must not be used with cpufreq
   running — they'd fight it.
+- 2026-10-06 21:50: first cpufreq boot: `mtk-cpufreq: failed to initialize
+  dvfs info for cpu0`, error -2. Cause: `dev_pm_opp_of_get_sharing_cpus()`
+  walks every possible CPU of an opp-shared table and returns -ENOENT for
+  one without `operating-points-v2` (cpu8/9). Mainline DTs give every CPU
+  an OPP table, so: cpu8/9 get `cluster2_opp` (vendor A72 SB-0119 table,
+  TT top 2587/2431 MHz; descriptive only) and mediatek-cpufreq now skips
+  CPUs without a `clocks` property instead of without an OPP table. (Also:
+  an earlier flash of this step put the previous image on by mistake —
+  check `ls /proc/device-tree/cpus/cpu@0/` after flashing.)

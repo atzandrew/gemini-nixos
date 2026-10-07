@@ -578,7 +578,7 @@ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
 
 	info = mtk_cpu_dvfs_info_lookup(policy->cpu);
 	if (!info) {
-		/* Gemini PDA: expected for CPUs skipped in probe (no OPP table) */
+		/* Gemini PDA: expected for CPUs skipped in probe (no cpu clock) */
 		pr_debug("dvfs info for cpu%d is not initialized.\n",
 			 policy->cpu);
 		return -ENODEV;
@@ -638,22 +638,24 @@ static int mtk_cpufreq_probe(struct platform_device *pdev)
 
 	for_each_possible_cpu(cpu) {
 		struct device_node *cpu_np;
-		bool has_opp;
+		bool has_clk;
 
 		info = mtk_cpu_dvfs_info_lookup(cpu);
 		if (info)
 			continue;
 
 		/*
-		 * Gemini PDA (MT6797): CPUs without an OPP table are left alone
+		 * Gemini PDA (MT6797): CPUs without a "cpu" clock are left alone
 		 * (the A72 cluster's clock is behind ATF; it gets its own
-		 * provider later). Mainline handles every possible CPU.
+		 * provider later). Every CPU still needs an OPP table: the OPP
+		 * core's opp-shared lookup walks all possible CPUs.
+		 * Mainline handles every possible CPU.
 		 */
 		cpu_np = of_cpu_device_node_get(cpu);
-		has_opp = cpu_np && of_property_present(cpu_np, "operating-points-v2");
+		has_clk = cpu_np && of_property_present(cpu_np, "clocks");
 		of_node_put(cpu_np);
-		if (!has_opp) {
-			dev_info(&pdev->dev, "cpu%d: no OPP table, not scaled\n", cpu);
+		if (!has_clk) {
+			dev_info(&pdev->dev, "cpu%d: no cpu clock, not scaled\n", cpu);
 			continue;
 		}
 
