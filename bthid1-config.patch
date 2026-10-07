@@ -1,0 +1,24 @@
+diff --git a/devices/planet-geminipda/kernel/config b/devices/planet-geminipda/kernel/config
+index 92b30f1..2efae57 100644
+--- a/devices/planet-geminipda/kernel/config
++++ b/devices/planet-geminipda/kernel/config
+@@ -3492,7 +3492,7 @@ CONFIG_INPUT_MISC=y
+ # CONFIG_INPUT_REGULATOR_HAPTIC is not set
+ # CONFIG_INPUT_TPS65219_PWRBUTTON is not set
+ # CONFIG_INPUT_AXP20X_PEK is not set
+-# CONFIG_INPUT_UINPUT is not set
++CONFIG_INPUT_UINPUT=y
+ # CONFIG_INPUT_PCF8574 is not set
+ # CONFIG_INPUT_PWM_BEEPER is not set
+ # CONFIG_INPUT_PWM_VIBRA is not set
+@@ -6613,8 +6613,8 @@ CONFIG_SND_SOC_MT6359=m
+ CONFIG_HID_SUPPORT=y
+ CONFIG_HID=y
+ # CONFIG_HID_BATTERY_STRENGTH is not set
+-# CONFIG_HIDRAW is not set
+-# CONFIG_UHID is not set
++CONFIG_HIDRAW=y
++CONFIG_UHID=y
+ CONFIG_HID_GENERIC=y
+ 
+ #
