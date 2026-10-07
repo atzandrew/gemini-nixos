@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * clk-mt6797-mcu.c — MT6797 MCUMIXEDSYS CPU clocks (A53 clusters + CCI).
- * Gemini PDA, 2026-10-06. Version 1: READ-ONLY (rates/parents are read
- * from hardware; no set ops). docs/cpu-dvfs.md.
+ * Gemini PDA, 2026-10-06. docs/cpu-dvfs.md.
+ *   v1: read-only.
+ *   v2: write support in the mainline MediaTek-cpufreq shape: the cpu_X_sel
+ *       mux can be reparented (to "mainpll" = the intermediate clock), and
+ *       armpll_X accepts set_rate ONLY while its cluster is not running from
+ *       it. The caller does: mux -> mainpll, set armpll rate, mux -> armpll,
+ *       which is the vendor's non-hybrid adjust_armpll_dds() order and what
+ *       drivers/cpufreq/mediatek-cpufreq.c does with "cpu"/"intermediate".
+ *       Voltage is NOT this driver's business (OPP / cpufreq / the caller);
+ *       the only guard here is a per-cluster ceiling = the SB speed-bin max.
  *
  * Per cluster (LL = cpu0-3, L = cpu4-7, CCI = MCSI bus):
  *
@@ -27,6 +35,22 @@
  *
  * The CSPM block is mapped, not requested (shared with nothing in Linux
  * today, but owned by the vendor DVFS processor).
+ *
+ * MUX SWITCH (vendor _cpu_clock_switch): TOPCKGEN CLK_MISC_CFG_0[5:4] = 3
+ * before any cluster runs from MAINPLL/UNIVPLL, = 0 when back on ARMPLL.
+ * Those bits are shared by all four clusters (B = A72 too), so unlike the
+ * vendor (which only ever had one cluster off-PLL at a time) they are cleared
+ * only when NO cluster field still selects MAINPLL/UNIVPLL. TOPCKGEN belongs
+ * to clk-mt6797, so that one word is mapped, not requested ("misc-cfg").
+ *
+ * PLL WRITE (vendor adjust_armpll_dds): CON1 = (CON1 & ~(26:24 | 20:0)) |
+ * posdiv << 24 | DDS | CHG(bit31), then 20 us PLL settle before anyone may
+ * switch back. DDS = (VCO << 14) / 26 MHz. posdiv is the smallest of
+ * /1,/2,/4 that keeps the VCO >= 1 GHz (matches every vendor A53/CCI table:
+ * e.g. L 1092 MHz /1, 962 MHz /2). Writing posdiv and DDS in one go is fine
+ * because the cluster is not on the PLL while it changes (the vendor's
+ * separate adjust_posdiv() also switches to MAINPLL around its write).
+ * CKDIV (the cpu_X divider) stays read-only: every OPP >= 559 MHz is /1.
  */
 
 #include <linux/clk-provider.h>
@@ -44,6 +68,16 @@
 #define ARMPLLDIV_MUXSEL	0x270
 #define ARMPLLDIV_CKDIV		0x274
 
+#define CON1_CHG		BIT(31)
+#define CON1_POSDIV		GENMASK(26, 24)
+#define CON1_DDS		GENMASK(20, 0)
+#define MUX_ARMPLL		1
+#define MUX_MAINPLL		2
+#define MUX_UNIVPLL		3
+#define MISC_CFG_MASK		GENMASK(5, 4)
+#define PLL_SETTLE_US		20	/* vendor PLL_SETTLE_TIME */
+#define VCO_MIN_HZ		1000000000UL
+
 #define CSPM_POWERON_CONFIG_EN	0x000
 #define CSPM_SEMA3_M0		0x440
 #define CSPM_CG_KEY_EN		0x0b160001
@@ -52,36 +86,92 @@
 struct mcu_clk_ctx {
 	void __iomem *base;
 	void __iomem *cspm;
+	void __iomem *misc_cfg;		/* TOPCKGEN CLK_MISC_CFG_0, one word */
 	spinlock_t lock;
 };
 
-static struct mcu_clk_ctx *mcu_ctx;
+/* SB speed-bin maximum per cluster (vendor *_SB OPP0), Hz */
+static const unsigned long pll_max_hz[3] = { 1547000000, 2002000000, 988000000 };
+
+static const char * const pll_names[3] = { "armpll_ll", "armpll_l", "armpll_cci" };
+static const char * const sel_names[3] = { "cpu_ll_sel", "cpu_l_sel", "cpu_cci_sel" };
+static const char * const out_names[3] = { "cpu_ll", "cpu_l", "cpu_cci" };
+static const u8 mux_shift[3] = { 2, 4, 6 };
+static const u8 div_shift[3] = { 5, 10, 15 };
+
+static int mcu_sema_get(struct mcu_clk_ctx *c)
+{
+	int i;
+
+	for (i = 0; i < SEMA_TRIES; i++) {
+		writel(0x1, c->cspm + CSPM_SEMA3_M0);
+		if (readl(c->cspm + CSPM_SEMA3_M0) & 0x1)
+			return 0;
+		udelay(10);
+	}
+	return -ETIMEDOUT;
+}
+
+static void mcu_sema_put(struct mcu_clk_ctx *c)
+{
+	if (readl(c->cspm + CSPM_SEMA3_M0) & 0x1)
+		writel(0x1, c->cspm + CSPM_SEMA3_M0);
+}
 
 /* vendor mt6797_0x1001AXXX_reg_read(), without the BUG_ON on timeout */
 static int mcu_read(struct mcu_clk_ctx *c, u32 off, u32 *val)
 {
 	unsigned long flags;
-	int i, ret = -ETIMEDOUT;
+	int ret;
 
 	spin_lock_irqsave(&c->lock, flags);
-	for (i = 0; i < SEMA_TRIES; i++) {
-		writel(0x1, c->cspm + CSPM_SEMA3_M0);
-		if (readl(c->cspm + CSPM_SEMA3_M0) & 0x1) {
-			ret = 0;
-			break;
-		}
-		udelay(10);
-	}
+	ret = mcu_sema_get(c);
 	if (!ret) {
 		ndelay(200);	/* vendor: "DE workaround, for first read after sequential write" */
 		*val = readl(c->base + off);
-		if (readl(c->cspm + CSPM_SEMA3_M0) & 0x1)
-			writel(0x1, c->cspm + CSPM_SEMA3_M0);
+		mcu_sema_put(c);
 	}
 	spin_unlock_irqrestore(&c->lock, flags);
 	if (ret)
 		pr_warn_ratelimited("clk-mt6797-mcu: HW semaphore timeout reading 0x%03x\n", off);
 	return ret;
+}
+
+/*
+ * Read-modify-write under ONE semaphore hold (the vendor's
+ * cpufreq_write_mask_armpll() takes it twice). Caller holds c->lock.
+ * Returns the value written in *out (if non-NULL).
+ */
+static int mcu_rmw_locked(struct mcu_clk_ctx *c, u32 off, u32 mask, u32 val, u32 *out)
+{
+	u32 v;
+	int ret = mcu_sema_get(c);
+
+	if (ret) {
+		pr_err("clk-mt6797-mcu: HW semaphore timeout writing 0x%03x\n", off);
+		return ret;
+	}
+	ndelay(200);
+	v = (readl(c->base + off) & ~mask) | (val & mask);
+	writel(v, c->base + off);
+	ndelay(200);	/* vendor mt6797_0x1001AXXX_reg_write() */
+	mcu_sema_put(c);
+	if (out)
+		*out = v;
+	return 0;
+}
+
+static bool muxsel_off_pll(u32 muxsel)
+{
+	int shift;
+
+	for (shift = 0; shift <= 6; shift += 2) {	/* B, LL, L, CCI */
+		u32 f = (muxsel >> shift) & 0x3;
+
+		if (f == MUX_MAINPLL || f == MUX_UNIVPLL)
+			return true;
+	}
+	return false;
 }
 
 /* ---- PLL ---------------------------------------------------------------- */
@@ -105,8 +195,83 @@ static unsigned long mcu_pll_recalc_rate(struct clk_hw *hw, unsigned long parent
 	return (unsigned long)(vco >> ((con1 >> 24) & 0x7));
 }
 
+static unsigned int mcu_pll_posdiv_shift(unsigned long rate)
+{
+	unsigned int shift;
+
+	for (shift = 0; shift < 2; shift++)
+		if (((u64)rate << shift) >= VCO_MIN_HZ)
+			break;
+	return shift;	/* 0, 1 or 2 = /1, /2, /4 */
+}
+
+static u32 mcu_pll_dds(unsigned long rate, unsigned int shift, unsigned long parent)
+{
+	return (u32)div_u64((u64)rate << (14 + shift), parent) & CON1_DDS;
+}
+
+static unsigned long mcu_pll_dds_rate(u32 dds, unsigned int shift, unsigned long parent)
+{
+	return (unsigned long)((((u64)parent * dds) >> 14) >> shift);
+}
+
+static int mcu_pll_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
+{
+	struct mcu_pll *p = to_mcu_pll(hw);
+	unsigned long rate = clamp(req->rate, VCO_MIN_HZ >> 2, pll_max_hz[p->idx]);
+	unsigned int shift = mcu_pll_posdiv_shift(rate);
+
+	if (!req->best_parent_rate)
+		return -EINVAL;
+	req->rate = mcu_pll_dds_rate(mcu_pll_dds(rate, shift, req->best_parent_rate),
+				     shift, req->best_parent_rate);
+	return 0;
+}
+
+static int mcu_pll_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long parent_rate)
+{
+	struct mcu_pll *p = to_mcu_pll(hw);
+	struct mcu_clk_ctx *c = p->c;
+	unsigned int shift;
+	unsigned long flags;
+	u32 muxsel, con1 = 0, dds;
+	int ret;
+
+	if (rate > pll_max_hz[p->idx] || rate < (VCO_MIN_HZ >> 2) || !parent_rate)
+		return -EINVAL;
+	shift = mcu_pll_posdiv_shift(rate);
+	dds = mcu_pll_dds(rate, shift, parent_rate);
+
+	spin_lock_irqsave(&c->lock, flags);
+	/* refuse to retune a PLL its cluster is running from */
+	ret = mcu_sema_get(c);
+	if (!ret) {
+		ndelay(200);
+		muxsel = readl(c->base + ARMPLLDIV_MUXSEL);
+		mcu_sema_put(c);
+		if (((muxsel >> mux_shift[p->idx]) & 0x3) == MUX_ARMPLL)
+			ret = -EBUSY;
+	}
+	if (!ret)
+		ret = mcu_rmw_locked(c, ARMCAXPLL_CON1(p->idx),
+				     CON1_CHG | CON1_POSDIV | CON1_DDS,
+				     CON1_CHG | (shift << 24) | dds, &con1);
+	spin_unlock_irqrestore(&c->lock, flags);
+	if (ret) {
+		pr_err("clk-mt6797-mcu: %s -> %lu Hz refused: %d\n",
+		       clk_hw_get_name(hw), rate, ret);
+		return ret;
+	}
+	udelay(PLL_SETTLE_US);	/* before anyone switches the cluster back */
+	pr_info("clk-mt6797-mcu: %s -> %lu Hz (CON1 0x%08x, /%u)\n",
+		clk_hw_get_name(hw), rate, con1, 1u << shift);
+	return 0;
+}
+
 static const struct clk_ops mcu_pll_ops = {
 	.recalc_rate = mcu_pll_recalc_rate,
+	.determine_rate = mcu_pll_determine_rate,
+	.set_rate = mcu_pll_set_rate,
 };
 
 /* ---- mux (source select) ------------------------------------------------ */
@@ -128,8 +293,36 @@ static u8 mcu_mux_get_parent(struct clk_hw *hw)
 	return (v >> m->shift) & 0x3;
 }
 
+static int mcu_mux_set_parent(struct clk_hw *hw, u8 index)
+{
+	struct mcu_mux *m = to_mcu_mux(hw);
+	struct mcu_clk_ctx *c = m->c;
+	bool off_pll = index == MUX_MAINPLL || index == MUX_UNIVPLL;
+	unsigned long flags;
+	u32 muxsel;
+	int ret;
+
+	if (index > MUX_UNIVPLL)
+		return -EINVAL;
+
+	spin_lock_irqsave(&c->lock, flags);
+	if (off_pll)	/* vendor: CLK_MISC_CFG_0[5:4] = 3 BEFORE the switch */
+		writel(readl(c->misc_cfg) | MISC_CFG_MASK, c->misc_cfg);
+	ret = mcu_rmw_locked(c, ARMPLLDIV_MUXSEL, 0x3 << m->shift, index << m->shift, &muxsel);
+	if (!ret && !muxsel_off_pll(muxsel))	/* = 0 AFTER, once nobody needs it */
+		writel(readl(c->misc_cfg) & ~MISC_CFG_MASK, c->misc_cfg);
+	spin_unlock_irqrestore(&c->lock, flags);
+
+	if (ret)
+		return ret;
+	pr_info("clk-mt6797-mcu: %s -> %s (MUXSEL 0x%08x)\n", clk_hw_get_name(hw),
+		clk_hw_get_name(clk_hw_get_parent_by_index(hw, index)) ?: "?", muxsel);
+	return 0;
+}
+
 static const struct clk_ops mcu_mux_ops = {
 	.get_parent = mcu_mux_get_parent,
+	.set_parent = mcu_mux_set_parent,
 	.determine_rate = __clk_mux_determine_rate,
 };
 
@@ -169,21 +362,17 @@ static const struct clk_ops mcu_div_ops = {
 
 /* ---- registration ------------------------------------------------------- */
 
-static const char * const pll_names[3] = { "armpll_ll", "armpll_l", "armpll_cci" };
-static const char * const sel_names[3] = { "cpu_ll_sel", "cpu_l_sel", "cpu_cci_sel" };
-static const char * const out_names[3] = { "cpu_ll", "cpu_l", "cpu_cci" };
-static const u8 mux_shift[3] = { 2, 4, 6 };
-static const u8 div_shift[3] = { 5, 10, 15 };
 
 static int mcu_register(struct device *dev, struct clk_hw *hw, const char *name,
-			const struct clk_ops *ops, const char * const *parents, u8 nparents)
+			const struct clk_ops *ops, const char * const *parents, u8 nparents,
+			unsigned long flags)
 {
 	struct clk_init_data init = {
 		.name = name,
 		.ops = ops,
 		.parent_names = parents,
 		.num_parents = nparents,
-		.flags = CLK_GET_RATE_NOCACHE,
+		.flags = CLK_GET_RATE_NOCACHE | flags,
 	};
 
 	hw->init = &init;
@@ -215,6 +404,12 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 	c->cspm = devm_ioremap(dev, res->start, resource_size(res));	/* not requested */
 	if (!c->cspm)
 		return -ENOMEM;
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "misc-cfg");
+	if (!res)
+		return dev_err_probe(dev, -EINVAL, "no misc-cfg (TOPCKGEN CLK_MISC_CFG_0)\n");
+	c->misc_cfg = devm_ioremap(dev, res->start, 4);	/* topckgen's: not requested */
+	if (!c->misc_cfg)
+		return -ENOMEM;
 
 	v = readl(c->cspm + CSPM_POWERON_CONFIG_EN);
 	if (!(v & 1)) {
@@ -236,7 +431,7 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 		m->shift = mux_shift[i];
 		d->shift = div_shift[i];
 
-		ret = mcu_register(dev, &p->hw, pll_names[i], &mcu_pll_ops, clk26m, 1);
+		ret = mcu_register(dev, &p->hw, pll_names[i], &mcu_pll_ops, clk26m, 1, 0);
 		if (ret)
 			return ret;
 
@@ -244,11 +439,12 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 		mux_parents[i][1] = pll_names[i];
 		mux_parents[i][2] = "mainpll";
 		mux_parents[i][3] = "univpll";
-		ret = mcu_register(dev, &m->hw, sel_names[i], &mcu_mux_ops, mux_parents[i], 4);
+		ret = mcu_register(dev, &m->hw, sel_names[i], &mcu_mux_ops, mux_parents[i], 4,
+				   CLK_SET_RATE_NO_REPARENT);
 		if (ret)
 			return ret;
 
-		ret = mcu_register(dev, &d->hw, out_names[i], &mcu_div_ops, &sel_names[i], 1);
+		ret = mcu_register(dev, &d->hw, out_names[i], &mcu_div_ops, &sel_names[i], 1, 0);
 		if (ret)
 			return ret;
 
@@ -260,8 +456,8 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
 	if (ret)
 		return ret;
-	mcu_ctx = c;
-
+	if (!mcu_read(c, ARMPLLDIV_MUXSEL, &v))
+		dev_info(dev, "MUXSEL 0x%08x CLK_MISC_CFG_0 0x%08x\n", v, readl(c->misc_cfg));
 	for (i = 0; i < 3; i++)
 		dev_info(dev, "%s: %lu Hz (%s %lu Hz)\n", out_names[i],
 			 clk_hw_get_rate(data->hws[CLK_MCU_LL + i]), pll_names[i],

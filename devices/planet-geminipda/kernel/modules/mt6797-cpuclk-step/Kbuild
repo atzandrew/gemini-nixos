@@ -1,0 +1,2 @@
+# Kbuild for the L-cluster clock step test module (nix: .#packages.aarch64-linux.mt6797-cpuclk-step)
+obj-m := mt6797-cpuclk-step.o

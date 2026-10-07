@@ -272,19 +272,6 @@
 	};
 
 	/*
-	 * Fixed-voltage vproc workaround for Phase 3 bring-up.
-	 * Replace with richtek,rt5735 driver once RT5735 patch is tested.
-	 */
-	vproc_fixed: regulator-vproc-fixed {
-		compatible = "regulator-fixed";
-		regulator-name = "vproc";
-		regulator-min-microvolt = <1000000>;
-		regulator-max-microvolt = <1000000>;
-		regulator-always-on;
-		regulator-boot-on;
-	};
-
-	/*
 	 * Gemini PDA physical keyboard matrix.
 	 *
 	 * 8 rows (P0_0..P0_7 of AW9523B) × 7 columns (P1_0..P1_6).
@@ -789,15 +776,34 @@
 	 */
 	/*
 	 * CPU clocks (2026-10-06, docs/cpu-dvfs.md): ARM PLLs + muxes +
-	 * dividers of the A53 clusters and the CCI. Read-only driver for now
+	 * dividers of the A53 clusters and the CCI
 	 * (drivers/clk/mediatek/clk-mt6797-mcu.c). The CSPM block is only used
-	 * for the vendor HW semaphore guarding 0x1001Axxx.
+	 * for the vendor HW semaphore guarding 0x1001Axxx; "misc-cfg" is the
+	 * one TOPCKGEN word (CLK_MISC_CFG_0) the vendor flips around a switch
+	 * to MAINPLL/UNIVPLL.
 	 */
 	mcumixedsys: clock-controller@1001a000 {
 		compatible = "mediatek,mt6797-mcumixedsys";
-		reg = <0 0x1001a000 0 0x1000>, <0 0x11015000 0 0x1000>;
-		reg-names = "mcumixed", "cspm";
+		reg = <0 0x1001a000 0 0x1000>, <0 0x11015000 0 0x1000>,
+		      <0 0x10000104 0 0x4>;
+		reg-names = "mcumixed", "cspm", "misc-cfg";
 		#clock-cells = <1>;
+	};
+
+	/*
+	 * VSRAM_L: the A53/CCI SRAM LDOs in INFRACFG_AO (vendor CPULDO_CTRL_*;
+	 * drivers/regulator/mt6797-cpuldo-regulator.c). LK leaves 1.10 V.
+	 * Range = vendor MIN/MAX_VSRAM_VOLT. Must track VPROC1:
+	 * VSRAM >= VPROC1 and VSRAM - VPROC1 <= 300 mV (normally +100 mV).
+	 */
+	vsram_l: regulator-vsram-l {
+		compatible = "mediatek,mt6797-cpuldo";
+		mediatek,infracfg = <&infrasys>;
+		regulator-name = "vsram_l";
+		regulator-min-microvolt = <1000000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+		regulator-boot-on;
 	};
 
 	cl2-power {
@@ -821,7 +827,8 @@
 	/*
 	 * RT5735 VPROC regulator at 0x1c.
 	 * Enabled once fan53555 RT5735 patch is tested on hardware.
-	 * Fixed regulator (vproc_fixed) is the Phase 3 substitute.
+	 * (The old fixed "vproc" placeholder is gone: the CPU rails are the
+	 * DA9214 on i2c6 + vsram_l, docs/cpu-dvfs.md.)
 	 */
 	vproc: regulator@1c {
 		compatible = "richtek,rt5735";

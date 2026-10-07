@@ -447,3 +447,46 @@ cl2-up.sh, the timer and sramldo-smc.
   Next: write ops (PLL DDS/posdiv, mux to MAINPLL during a change, ckdiv,
   vendor ordering), then the CPULDO regulator, then OPP tables +
   mediatek-cpufreq.
+- 2026-10-06 17:10: **CPU clock driver v2 (write support), awaiting test.**
+  Shape = mainline `mediatek-cpufreq` ("cpu" = cpu_X_sel mux,
+  "intermediate" = apmixedsys mainpll): `cpu_X_sel` gets `.set_parent`
+  (vendor `_cpu_clock_switch`: TOPCKGEN CLK_MISC_CFG_0[5:4]=3 before going
+  to MAINPLL/UNIVPLL, cleared after returning — but only once no cluster
+  incl. B still selects MAINPLL/UNIVPLL, since those bits are shared);
+  `armpll_X` gets `.determine_rate/.set_rate` (vendor `adjust_armpll_dds`:
+  CON1 posdiv+DDS+CHG in one semaphore-held RMW, 20 us settle) and refuses
+  with -EBUSY while its own cluster runs from it, so a retune can only
+  happen in the mux->mainpll / set_rate / mux->armpll sequence. posdiv =
+  smallest /1,/2,/4 keeping VCO >= 1 GHz (matches the vendor tables);
+  ceiling per cluster = SB max (LL 1547, L 2002, CCI 988 MHz); CKDIV stays
+  read-only (every OPP >= 559 MHz is /1). No voltage logic in the clk
+  driver. DT: mcumixedsys gets a third reg `misc-cfg` = <0x10000104 4>
+  (mapped, not requested — topckgen owns the page).
+  Test module `mt6797-cpuclk-step` (mhz=1209|1274|1352, L cluster only):
+  refuses unless VPROC1 >= the SB voltage (1352 needs 1.04 V -> load
+  `mt6797-vproc-set uv=1040000` first), then does the three clk calls.
+- 2026-10-06 17:30: **first frequency step works: L cluster 1274 -> 1352
+  MHz** (clk driver v2, boot-only flash `boot-mcuclk2-20261006.img`;
+  fallback `gemini-backup/boot-mcuclk-20261006.img`). VPROC1 1.04 V first
+  (mt6797-vproc-set), then `mt6797-cpuclk-step mhz=1352`: dmesg
+  `cpu_l_sel -> mainpll (MUXSEL 0x65)`, `armpll_l -> 1352000000 Hz (CON1
+  0xc00d0000, /1)`, `cpu_l_sel -> armpll_l (MUXSEL 0x55)`; clk_summary
+  armpll_l/cpu_l_sel/cpu_l 1352000000; cpumhz cpu4-7 1340-1349. 5 min of 4
+  busy loops on cpu4-7 + ~30 min use, no errors (the boot ended with an
+  accidental power-key press, not a crash). Probe: MUXSEL 0x54 at 0.24 s
+  (B field 0 = A72 not yet powered; 1 after cl2-power), CLK_MISC_CFG_0
+  0xffff0000 (bits 5:4 clear). Note: a reboot returns to 1274 MHz / 1.00 V
+  (LK).
+- 2026-10-06 20:45: **VSRAM_L regulator** (awaiting test):
+  `drivers/regulator/mt6797-cpuldo-regulator.c`
+  (`CONFIG_REGULATOR_MT6797_CPULDO`, DT `vsram_l: regulator-vsram-l`,
+  compatible `mediatek,mt6797-cpuldo`, `mediatek,infracfg = <&infrasys>`
+  syscon regmap). Selectors 3..15 = 0.90..1.20 V (25 mV), DT 1.00..1.20 V;
+  writes the vosel replicated to all 8 LDOs in CTRL_1 and CTRL_2 (vendor
+  format, LK leaves 0x0b0b0b0b), forces CTRL_0[7:0]=0xff; settle = vendor
+  (up 12.5 mV/us, down 3.125 mV/us, +5 us, min 25 us). No tracking in the
+  driver (mainline puts that in mediatek-cpufreq's sram-supply logic).
+  The unused fixed "vproc" placeholder regulator is removed.
+  mt6797-vproc-set v2 moves VSRAM_L with VPROC1 (VPROC+100 mV clamped
+  1.00..1.20 V; SRAM first going up, VPROC first going down; window now
+  1.00..1.15 V).

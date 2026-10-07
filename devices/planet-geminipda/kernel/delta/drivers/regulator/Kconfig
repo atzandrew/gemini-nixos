@@ -851,6 +851,16 @@ config REGULATOR_MT6351
 	  needed by the MT6797 CONSYS connectivity block. All other MT6351
 	  rails are left as configured by the bootloader.
 
+config REGULATOR_MT6797_CPULDO
+	bool "MediaTek MT6797 CPU SRAM LDO (VSRAM_L)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF
+	select MFD_SYSCON
+	help
+	  The eight INFRACFG_AO-controlled SRAM LDOs of the MT6797 A53
+	  clusters and CCI (VSRAM_L), as one regulator for cpufreq's
+	  "sram-supply" voltage tracking. Gemini PDA.
+
 config REGULATOR_MT6357
 	tristate "MediaTek MT6357 PMIC"
 	depends on MFD_MT6397

@@ -9,106 +9,107 @@
  * 611 MHz. 1.04 V adds margin at today's clocks and is the voltage for the
  * next L step (1352 MHz). No clock is changed here.
  *
- * Safety rules enforced (vendor mt_cpufreq.c set_cur_volt_extbuck):
- *  - target within [1000, 1100] mV (test window; vendor table 770-1200);
- *  - VSRAM_L (CPULDO, INFRACFG_AO 0x10001F9C) must stay >= VPROC1 and
- *    <= VPROC1 + 300 mV; LK leaves VSRAM_L at 1100 mV, so up to 1100 mV is
- *    fine without touching the SRAM rail (that gets its own driver later);
- *  - the regulator core aggregates consumer requests; nothing else consumes
- *    vproc1 today (always-on, no cpufreq yet).
+ * v2 (2026-10-06, with the vsram_l regulator driver): VSRAM_L follows
+ * VPROC1 through its own regulator, vendor set_cur_volt_extbuck() order:
+ *   VSRAM_L target = clamp(VPROC1 + 100 mV, 1.00 V, 1.20 V)
+ *   going up:   VSRAM_L first, then VPROC1
+ *   going down: VPROC1 first, then VSRAM_L
+ * so VSRAM >= VPROC and VSRAM - VPROC <= 300 mV hold at every step (one step
+ * suffices inside the 1.00-1.15 V test window). This is the same rule
+ * mediatek-cpufreq's sram-supply tracking will apply later.
  *
- * Usage (root):  insmod mt6797-vproc-set.ko uv=1040000   # set 1.04 V
- *                rmmod mt6797_vproc_set                  # voltage STAYS
- *                insmod mt6797-vproc-set.ko uv=1000000   # back to LK's 1.00 V
- * The module keeps its regulator handle while loaded; rmmod drops the
- * request but the DA9214 keeps the last value (the core doesn't revert).
- * Logs "vproc-set:" with before/after (regulator readback = DA9214 0xD7).
+ * Usage (root):  insmod mt6797-vproc-set.ko uv=1040000   # 1.04 V / 1.14 V
+ *                rmmod mt6797_vproc_set                  # voltages STAY
+ *                insmod mt6797-vproc-set.ko uv=1000000   # LK's 1.00 / 1.10 V
+ * Logs "vproc-set:" with before/after of both rails.
  */
 
-#include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/regulator/consumer.h>
 
 static int uv = 1040000;
 module_param(uv, int, 0444);
-MODULE_PARM_DESC(uv, "VPROC1 target in microvolts (1000000..1100000)");
+MODULE_PARM_DESC(uv, "VPROC1 target in microvolts (1000000..1150000)");
 
-#define INFRACFG_AO_PHYS	0x10001000UL
-#define CPULDO_CTRL_0		0xf98
-#define CPULDO_CTRL_1		0xf9c
+#define UV_MIN		1000000
+#define UV_MAX		1150000
+#define SRAM_DIFF	100000
+#define SRAM_MAX_DIFF	300000
+#define SRAM_MIN	1000000
+#define SRAM_MAX	1200000
 
-static struct regulator *vproc1;
+static struct regulator *vproc1, *vsram;
 
-static int vsram_l_uv(void)
+static bool rule_ok(int proc, int sram)
 {
-	void __iomem *b = ioremap(INFRACFG_AO_PHYS, 0x1000);
-	u32 en, v;
-	int sel;
-
-	if (!b)
-		return -ENOMEM;
-	en = readl(b + CPULDO_CTRL_0) & 0xff;
-	v = readl(b + CPULDO_CTRL_1);
-	iounmap(b);
-	if (en != 0xff)
-		return -ENODEV;
-	sel = v & 0xf;
-	switch (sel) {	/* vendor get_cur_volt_sram_l() */
-	case 0: return 1050000;
-	case 1: return 600000;
-	case 2: return 700000;
-	default: return 900000 + (sel - 3) * 25000;
-	}
+	return sram >= proc && sram - proc <= SRAM_MAX_DIFF;
 }
 
 static int __init vproc_set_init(void)
 {
-	int before, after, vsram, ret;
+	int proc0, sram0, proc1, sram1, sram_t, ret;
 
-	if (uv < 1000000 || uv > 1100000) {
-		pr_err("vproc-set: uv=%d outside the 1.00-1.10 V test window\n", uv);
+	if (uv < UV_MIN || uv > UV_MAX) {
+		pr_err("vproc-set: uv=%d outside the %d-%d uV test window\n", uv, UV_MIN, UV_MAX);
 		return -EINVAL;
 	}
-	vsram = vsram_l_uv();
-	if (vsram < 0) {
-		pr_err("vproc-set: cannot read VSRAM_L (%d) - refusing\n", vsram);
-		return vsram;
-	}
-	if (uv > vsram || vsram - uv > 300000) {
-		pr_err("vproc-set: VSRAM_L %d uV vs target %d uV breaks the vendor rule - refusing\n",
-		       vsram, uv);
-		return -EINVAL;
-	}
+	sram_t = clamp(uv + SRAM_DIFF, SRAM_MIN, SRAM_MAX);
 
 	vproc1 = regulator_get(NULL, "vproc1");
 	if (IS_ERR(vproc1)) {
-		ret = PTR_ERR(vproc1);
-		pr_err("vproc-set: no vproc1 regulator: %d\n", ret);
-		return ret;
+		pr_err("vproc-set: no vproc1 regulator: %ld\n", PTR_ERR(vproc1));
+		return PTR_ERR(vproc1);
+	}
+	vsram = regulator_get(NULL, "vsram_l");
+	if (IS_ERR(vsram)) {
+		pr_err("vproc-set: no vsram_l regulator: %ld\n", PTR_ERR(vsram));
+		regulator_put(vproc1);
+		return PTR_ERR(vsram);
 	}
 
-	before = regulator_get_voltage(vproc1);
-	ret = regulator_set_voltage(vproc1, uv, uv);
-	after = regulator_get_voltage(vproc1);
-	pr_info("vproc-set: VPROC1 %d -> %d uV (target %d, ret %d), VSRAM_L %d uV\n",
-		before, after, uv, ret, vsram);
-	if (ret) {
-		regulator_put(vproc1);
-		return ret;
+	proc0 = regulator_get_voltage(vproc1);
+	sram0 = regulator_get_voltage(vsram);
+	if (proc0 < 0 || sram0 < 0 || !rule_ok(proc0, sram0)) {
+		pr_err("vproc-set: start state VPROC1 %d / VSRAM_L %d uV not sane - refusing\n",
+		       proc0, sram0);
+		ret = -EINVAL;
+		goto put;
 	}
-	return 0;
+
+	if (uv >= proc0) {	/* up: SRAM first */
+		ret = regulator_set_voltage(vsram, sram_t, SRAM_MAX);
+		if (!ret)
+			ret = regulator_set_voltage(vproc1, uv, uv);
+	} else {		/* down: VPROC first */
+		ret = regulator_set_voltage(vproc1, uv, uv);
+		if (!ret)
+			ret = regulator_set_voltage(vsram, sram_t, SRAM_MAX);
+	}
+	proc1 = regulator_get_voltage(vproc1);
+	sram1 = regulator_get_voltage(vsram);
+	pr_info("vproc-set: VPROC1 %d -> %d uV, VSRAM_L %d -> %d uV (target %d/%d, ret %d)%s\n",
+		proc0, proc1, sram0, sram1, uv, sram_t, ret,
+		rule_ok(proc1, sram1) ? "" : " RULE BROKEN");
+	if (!ret)
+		return 0;
+put:
+	regulator_put(vsram);
+	regulator_put(vproc1);
+	return ret;
 }
 
 static void __exit vproc_set_exit(void)
 {
-	pr_info("vproc-set: unloading; VPROC1 stays at %d uV\n",
-		regulator_get_voltage(vproc1));
+	pr_info("vproc-set: unloading; VPROC1 %d / VSRAM_L %d uV stay\n",
+		regulator_get_voltage(vproc1), regulator_get_voltage(vsram));
+	regulator_put(vsram);
 	regulator_put(vproc1);
 }
 
 module_init(vproc_set_init);
 module_exit(vproc_set_exit);
-MODULE_DESCRIPTION("Gemini PDA test: set VPROC1 via the DA9214 regulator");
+MODULE_DESCRIPTION("Gemini PDA test: set VPROC1 + VSRAM_L via their regulators");
 MODULE_LICENSE("GPL");
