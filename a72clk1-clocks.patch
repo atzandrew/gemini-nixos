@@ -1,0 +1,527 @@
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
+index 30e4cdc..83f65a9 100644
+--- a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
++++ b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797-mcu.c
+@@ -52,9 +52,23 @@
+  * because the cluster is not on the PLL while it changes (the vendor's
+  * separate adjust_posdiv() also switches to MAINPLL around its write).
+  * CKDIV (the cpu_X divider) stays read-only: every OPP >= 559 MHz is /1.
++ *
++ * A72 CLUSTER (B = cpu8-9, added 2026-10-07): the same mux/divider pair in
++ * MCUMIXEDSYS (MUXSEL[1:0], CKDIV[4:0]), but its PLL is the "iDVFS" PLL in
++ * MCUCFG2 (CON0 0x102224a0: bit0 enable, 14:12 posdiv; CON1 0x102224a4:
++ * PCW, VCO = 26 MHz * PCW / 2^24), which the kernel may only program
++ * through ATF. Vendor non-hybrid path (mt_cpufreq.c adjust_armpll_dds() for
++ * MT_CPU_DVFS_B, mt_idvfs.c BigiDVFSPllSetFreq()): mux -> MAINPLL, SiP SMC
++ * 0xC20003B8 (BIGIDVFSPLLSETFREQ, arg = output MHz; ATF picks PCW and
++ * posdiv), 20 us, mux -> ARMPLL. Read back through the secure-read SMC
++ * 0xC200035F. The vendor only touches it while an A72 is online, so this
++ * driver does the same (cpus = every "arm,cortex-a72" CPU node); while the
++ * cluster is down the PLL reports its last known rate.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk-provider.h>
++#include <linux/cpumask.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -85,7 +99,18 @@
+ #define CSPM_CG_KEY_EN		0x0b160001
+ #define SEMA_TRIES		200	/* x 10 us = 2 ms (vendor SEMA_GET_TIMEOUT) */
+ 
++/* A72 iDVFS PLL (vendor mt_idvfs.h / mt_idvfs.c) */
++#define SIP_IDVFS_READ		0xC200035FUL
++#define SIP_IDVFS_PLL_SETFREQ	0xC20003B8UL
++#define B_PLL_CON0		0x102224a0UL
++#define B_PLL_CON1		0x102224a4UL
++#define B_PLL_MIN_HZ		250000000UL	/* BigiDVFSPllSetFreq() range */
++#define B_PLL_MAX_HZ		2587000000UL	/* SB/TT 0119 OPP0 */
++#define B_MUX_SHIFT		0
++#define B_DIV_SHIFT		0
++
+ struct mcu_clk_ctx {
++	struct cpumask b_cpus;		/* the A72s; empty = no B clocks */
+ 	void __iomem *base;
+ 	void __iomem *cspm;
+ 	void __iomem *misc_cfg;		/* TOPCKGEN CLK_MISC_CFG_0, one word */
+@@ -271,6 +296,115 @@ static const struct clk_ops mcu_pll_ops = {
+ 	.set_rate = mcu_pll_set_rate,
+ };
+ 
++/* ---- A72 iDVFS PLL (through ATF) ---------------------------------------- */
++
++struct mcu_bpll {
++	struct clk_hw hw;
++	struct mcu_clk_ctx *c;
++	unsigned long last_rate;
++};
++#define to_mcu_bpll(_hw) container_of(_hw, struct mcu_bpll, hw)
++
++static bool mcu_b_cluster_up(struct mcu_clk_ctx *c)
++{
++	return cpumask_intersects(&c->b_cpus, cpu_online_mask);
++}
++
++static unsigned long mcu_sip_read(unsigned long addr)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(SIP_IDVFS_READ, addr, 0, 0, 0, 0, 0, 0, &res);
++	return res.a0;
++}
++
++static unsigned long mcu_bpll_read_rate(void)
++{
++	u32 con0 = mcu_sip_read(B_PLL_CON0);
++	u32 pcw = mcu_sip_read(B_PLL_CON1) & GENMASK(30, 0);
++	u64 vco = (26000000ULL * pcw) >> 24;
++
++	if (!(con0 & BIT(0)))
++		return 0;
++	return (unsigned long)(vco >> ((con0 >> 12) & 0x7));
++}
++
++static unsigned long mcu_bpll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
++{
++	struct mcu_bpll *b = to_mcu_bpll(hw);
++
++	if (mcu_b_cluster_up(b->c))
++		b->last_rate = mcu_bpll_read_rate();
++	return b->last_rate;
++}
++
++static int mcu_bpll_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
++{
++	/* ATF takes whole MHz */
++	req->rate = rounddown(clamp(req->rate, B_PLL_MIN_HZ, B_PLL_MAX_HZ), 1000000);
++	return 0;
++}
++
++static int mcu_bpll_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long parent_rate)
++{
++	struct mcu_bpll *b = to_mcu_bpll(hw);
++	struct mcu_clk_ctx *c = b->c;
++	struct arm_smccc_res res;
++	unsigned long flags, got;
++	u32 muxsel;
++	int ret;
++
++	if (rate > B_PLL_MAX_HZ || rate < B_PLL_MIN_HZ)
++		return -EINVAL;
++
++	/*
++	 * No cpus_read_lock() here: cpufreq calls this with the policy rwsem
++	 * held, and CPU hotplug takes them in the other order. cpufreq only
++	 * retunes an online policy, which is what this check is for.
++	 */
++	if (!mcu_b_cluster_up(c)) {
++		ret = -EAGAIN;
++		goto out;
++	}
++
++	/* refuse to retune the PLL the A72s are running from */
++	spin_lock_irqsave(&c->lock, flags);
++	ret = mcu_sema_get(c);
++	if (!ret) {
++		ndelay(200);
++		muxsel = readl(c->base + ARMPLLDIV_MUXSEL);
++		mcu_sema_put(c);
++		if (((muxsel >> B_MUX_SHIFT) & 0x3) == MUX_ARMPLL)
++			ret = -EBUSY;
++	}
++	spin_unlock_irqrestore(&c->lock, flags);
++	if (ret)
++		goto out;
++
++	arm_smccc_smc(SIP_IDVFS_PLL_SETFREQ, rate / 1000000, 0, 0, 0, 0, 0, 0, &res);
++	udelay(PLL_SETTLE_US);
++	got = mcu_bpll_read_rate();
++	b->last_rate = got;
++	/* PCW resolution: 26 MHz / 2^24 per step, so allow 1 MHz of slack */
++	if ((long)res.a0 < 0 || abs((long)got - (long)rate) > 1000000) {
++		pr_err("clk-mt6797-mcu: armpll_b -> %lu Hz: SMC 0x%lx, PLL now %lu Hz\n",
++		       rate, res.a0, got);
++		ret = -EIO;
++	}
++out:
++	if (ret)
++		pr_err("clk-mt6797-mcu: armpll_b -> %lu Hz refused: %d\n", rate, ret);
++	else
++		pr_debug("clk-mt6797-mcu: armpll_b -> %lu Hz\n", got);
++	return ret;
++}
++
++static const struct clk_ops mcu_bpll_ops = {
++	.recalc_rate = mcu_bpll_recalc_rate,
++	.determine_rate = mcu_bpll_determine_rate,
++	.set_rate = mcu_bpll_set_rate,
++};
++
+ /* ---- mux (source select) ------------------------------------------------ */
+ 
+ struct mcu_mux {
+@@ -450,6 +584,45 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
+ 		data->hws[CLK_MCU_LL + i] = &d->hw;
+ 	}
+ 
++	/* A72 cluster: the CPUs it clocks are every "arm,cortex-a72" CPU node */
++	for_each_possible_cpu(i) {
++		struct device_node *np = of_get_cpu_node(i, NULL);
++
++		if (np && of_device_is_compatible(np, "arm,cortex-a72"))
++			cpumask_set_cpu(i, &c->b_cpus);
++		of_node_put(np);
++	}
++	if (!cpumask_empty(&c->b_cpus)) {
++		static const char * const clk26m[] = { "clk26m" };
++		static const char * const b_parents[] = {
++			"clk26m", "armpll_b", "mainpll", "univpll" };
++		static const char * const b_sel[] = { "cpu_b_sel" };
++		struct mcu_bpll *b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
++		struct mcu_mux *m = devm_kzalloc(dev, sizeof(*m), GFP_KERNEL);
++		struct mcu_div *d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
++
++		if (!b || !m || !d)
++			return -ENOMEM;
++		b->c = m->c = d->c = c;
++		m->shift = B_MUX_SHIFT;
++		d->shift = B_DIV_SHIFT;
++
++		ret = mcu_register(dev, &b->hw, "armpll_b", &mcu_bpll_ops, clk26m, 1, 0);
++		if (!ret)
++			ret = mcu_register(dev, &m->hw, "cpu_b_sel", &mcu_mux_ops, b_parents, 4,
++					   CLK_SET_RATE_NO_REPARENT);
++		if (!ret)
++			ret = mcu_register(dev, &d->hw, "cpu_b", &mcu_div_ops, b_sel, 1, 0);
++		if (ret)
++			return ret;
++		data->hws[CLK_MCU_ARMPLL_B] = &b->hw;
++		data->hws[CLK_MCU_B_SEL] = &m->hw;
++		data->hws[CLK_MCU_B] = &d->hw;
++	} else {
++		for (i = CLK_MCU_ARMPLL_B; i <= CLK_MCU_B; i++)
++			data->hws[i] = ERR_PTR(-ENOENT);
++	}
++
+ 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
+ 	if (ret)
+ 		return ret;
+diff --git a/devices/planet-geminipda/kernel/delta/include/dt-bindings/clock/mt6797-mcumixedsys.h b/devices/planet-geminipda/kernel/delta/include/dt-bindings/clock/mt6797-mcumixedsys.h
+index 867e4b3..0dc1aae 100644
+--- a/devices/planet-geminipda/kernel/delta/include/dt-bindings/clock/mt6797-mcumixedsys.h
++++ b/devices/planet-geminipda/kernel/delta/include/dt-bindings/clock/mt6797-mcumixedsys.h
+@@ -15,6 +15,9 @@
+ #define CLK_MCU_LL		6	/* ARMPLLDIV_CKDIV[9:5]   -> cpu0-3 clock */
+ #define CLK_MCU_L		7	/* ARMPLLDIV_CKDIV[14:10] -> cpu4-7 clock */
+ #define CLK_MCU_CCI		8	/* ARMPLLDIV_CKDIV[19:15] -> CCI clock */
+-#define CLK_MCU_NR_CLK		9
++#define CLK_MCU_ARMPLL_B	9	/* A72 iDVFS PLL (MCUCFG2 0x102224a0), via ATF SMCs */
++#define CLK_MCU_B_SEL		10	/* ARMPLLDIV_MUXSEL[1:0] */
++#define CLK_MCU_B		11	/* ARMPLLDIV_CKDIV[4:0]   -> cpu8-9 clock */
++#define CLK_MCU_NR_CLK		12
+ 
+ #endif
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/Kbuild b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/Kbuild
+new file mode 100644
+index 0000000..965500b
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/Kbuild
+@@ -0,0 +1 @@
++obj-m := mt6797-a72clk-step.o
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/default.nix b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/default.nix
+new file mode 100644
+index 0000000..7914c3d
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/default.nix
+@@ -0,0 +1,57 @@
++# mt6797-a72clk-step.ko — test: step the A72 (cpu8-9) clock via the clk framework
++# (docs/cpu-dvfs.md). Same light build as mt6351-probe.
++#
++#   nix build .#packages.aarch64-linux.mt6797-a72clk-step --print-out-paths --no-link
++#   -> $out/mt6797-a72clk-step.ko   (also $out/lib/modules/6.6.157/extra/)
++#
++# Light build: reuses the kernel derivation (same source = base tarball +
++# delta, same .config, same GCC, same makeFlags/postPatch) via
++# overrideAttrs, but replaces the kernel build/install with
++# `modules_prepare` + this one module. The kernel's own configurePhase
++# already runs `make prepare` and checks kernel.release == 6.6.157, so
++# vermagic matches the flashed kernel ("6.6.157 SMP preempt mod_unload
++# aarch64"; MODVERSIONS/signing are off). No full kernel rebuild.
++#
++# KBUILD_MODPOST_WARN=1: there is no Module.symvers without a full
++# build, so modpost cannot see the kernel's exports; with MODVERSIONS
++# off that is only a build-time check — symbols resolve by name at
++# insmod time.
++{ kernel }:
++
++kernel.overrideAttrs (old: {
++  name = "mt6797-a72clk-step-${old.version}";
++
++  buildFlags = [ ];
++  # The kernel's pre/postInstall (zinstall bookkeeping, DTBs, the
++  # sramldo-smc module build) do not apply to this derivation.
++  preInstall = "";
++  postInstall = "";
++  dontFixup = true;
++
++  buildPhase = ''
++    runHook preBuild
++    echo ":: modules_prepare (cwd $PWD)"
++    make $makeFlags "''${makeFlagsArray[@]}" -j$NIX_BUILD_CORES modules_prepare
++
++    echo ":: Building mt6797-a72clk-step.ko"
++    cp -r ${./.} mt6797-a72clk-step-src
++    chmod -R u+w mt6797-a72clk-step-src
++    make $makeFlags "''${makeFlagsArray[@]}" M="$PWD/mt6797-a72clk-step-src" \
++      KBUILD_MODPOST_WARN=1 modules
++
++    vm="$(modinfo -F vermagic mt6797-a72clk-step-src/mt6797-a72clk-step.ko)"
++    echo ":: vermagic: $vm"
++    case "$vm" in
++      "6.6.157 SMP preempt mod_unload aarch64"*) ;;
++      *) echo "error: unexpected vermagic '$vm' (flashed kernel: 6.6.157 SMP preempt mod_unload aarch64)"; exit 1 ;;
++    esac
++    runHook postBuild
++  '';
++
++  installPhase = ''
++    mkdir -p "$out/lib/modules/${old.version}/extra"
++    install -m 644 mt6797-a72clk-step-src/mt6797-a72clk-step.ko "$out/mt6797-a72clk-step.ko"
++    install -m 644 mt6797-a72clk-step-src/mt6797-a72clk-step.ko \
++      "$out/lib/modules/${old.version}/extra/mt6797-a72clk-step.ko"
++  '';
++})
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c
+new file mode 100644
+index 0000000..a7cef13
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/modules/mt6797-a72clk-step/mt6797-a72clk-step.c
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * mt6797-a72clk-step.c — TEST module: change the A72 cluster (cpu8-9) clock
++ * through the clk framework, in the sequence mediatek-cpufreq uses and the
++ * vendor's non-hybrid adjust_armpll_dds() for MT_CPU_DVFS_B:
++ *
++ *   clk_set_parent(cpu_b_sel, mainpll)   A72s run at 1092 MHz meanwhile
++ *   clk_set_rate(armpll_b, target)       ATF SMC 0xC20003B8 (output MHz)
++ *   clk_set_parent(cpu_b_sel, armpll_b)
++ *
++ * docs/cpu-dvfs.md, "A72 step 1" (2026-10-07). Needs the boot image with the
++ * A72 clocks in clk-mt6797-mcu (a72clk1) and both A72s online.
++ *
++ * Frequency only — VPROC2 stays where it is (LK/cl2-power: 1.000 V). The
++ * module refuses unless VPROC2 >= the vendor SB-0119 voltage for the target:
++ *    750 MHz  0.880 V  (what cl2-power/LK leave; for going back)
++ *    845 MHz  0.880 V  (OPP13)
++ *   1001 MHz  0.900 V  (OPP12)
++ *   1131 MHz  0.930 V  (OPP11)
++ *   1378 MHz  0.980 V  (OPP9)
++ *   1495 MHz  1.000 V  (OPP8)   <- highest point at today's 1.000 V
++ * The intermediate (MAINPLL 1092 MHz) is below 1131 @ 0.93 V, so it is safe
++ * at 1.000 V.
++ *
++ * Usage (root):  insmod mt6797-a72clk-step.ko mhz=1001
++ *                rmmod mt6797_a72clk_step      # clock STAYS where it is
++ *                ./cpumhz                      # measure (cpu8/9 column)
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/cpumask.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <dt-bindings/clock/mt6797-mcumixedsys.h>
++
++#define CLK_APMIXED_MAINPLL	1	/* dt-bindings/clock/mt6797-clk.h */
++
++static int mhz = 1001;
++module_param(mhz, int, 0444);
++MODULE_PARM_DESC(mhz, "A72 target in MHz: 750, 845, 1001, 1131, 1378 or 1495");
++
++static const struct { int mhz; int uv; } b_opp[] = {
++	{  750,  880000 },
++	{  845,  880000 },
++	{ 1001,  900000 },
++	{ 1131,  930000 },
++	{ 1378,  980000 },
++	{ 1495, 1000000 },
++};
++
++static struct clk *get_clk(const char *compat, int id)
++{
++	struct of_phandle_args args = { .args_count = 1, .args = { id } };
++	struct clk *clk;
++
++	args.np = of_find_compatible_node(NULL, NULL, compat);
++	if (!args.np)
++		return ERR_PTR(-ENODEV);
++	clk = of_clk_get_from_provider(&args);
++	of_node_put(args.np);
++	return clk;
++}
++
++static int __init a72clk_step_init(void)
++{
++	struct clk *sel, *pll, *mainpll, *cpu_b;
++	struct regulator *vproc2;
++	int i, need_uv = -1, vproc_uv, ret;
++	unsigned long before, mid, after, pll_rate, pll_before, ceiling;
++
++	for (i = 0; i < ARRAY_SIZE(b_opp); i++)
++		if (b_opp[i].mhz == mhz)
++			need_uv = b_opp[i].uv;
++	if (need_uv < 0) {
++		pr_err("a72clk-step: mhz=%d not allowed (750, 845, 1001, 1131, 1378, 1495)\n", mhz);
++		return -EINVAL;
++	}
++	if (!cpu_online(8) || !cpu_online(9)) {
++		pr_err("a72clk-step: cpu8/cpu9 not both online - refusing\n");
++		return -EAGAIN;
++	}
++
++	vproc2 = regulator_get(NULL, "vproc2");
++	if (IS_ERR(vproc2)) {
++		pr_err("a72clk-step: no vproc2 regulator: %ld\n", PTR_ERR(vproc2));
++		return PTR_ERR(vproc2);
++	}
++	vproc_uv = regulator_get_voltage(vproc2);
++	regulator_put(vproc2);
++	if (vproc_uv < need_uv) {
++		pr_err("a72clk-step: VPROC2 %d uV < %d uV needed for %d MHz - refusing\n",
++		       vproc_uv, need_uv, mhz);
++		return -EPERM;
++	}
++
++	sel = get_clk("mediatek,mt6797-mcumixedsys", CLK_MCU_B_SEL);
++	pll = get_clk("mediatek,mt6797-mcumixedsys", CLK_MCU_ARMPLL_B);
++	cpu_b = get_clk("mediatek,mt6797-mcumixedsys", CLK_MCU_B);
++	mainpll = get_clk("mediatek,mt6797-apmixedsys", CLK_APMIXED_MAINPLL);
++	if (IS_ERR(sel) || IS_ERR(pll) || IS_ERR(cpu_b) || IS_ERR(mainpll)) {
++		pr_err("a72clk-step: clocks missing (sel %ld pll %ld cpu_b %ld mainpll %ld) - old boot image?\n",
++		       PTR_ERR_OR_ZERO(sel), PTR_ERR_OR_ZERO(pll),
++		       PTR_ERR_OR_ZERO(cpu_b), PTR_ERR_OR_ZERO(mainpll));
++		ret = -ENODEV;
++		goto put;
++	}
++	if (!clk_is_match(clk_get_parent(sel), pll)) {
++		pr_err("a72clk-step: cpu_b_sel is not on armpll_b - refusing\n");
++		ret = -EBUSY;
++		goto put;
++	}
++
++	before = clk_get_rate(cpu_b);
++	pll_before = clk_get_rate(pll);
++	/* the A72s may only go back to a rate they ran at or that we asked for */
++	ceiling = max_t(unsigned long, pll_before, (unsigned long)mhz * 1000000) + 2000000;
++	ret = clk_set_parent(sel, mainpll);
++	if (ret) {
++		pr_err("a72clk-step: switch to mainpll failed: %d\n", ret);
++		goto put;
++	}
++	mid = clk_get_rate(cpu_b);
++	ret = clk_set_rate(pll, (unsigned long)mhz * 1000000);
++	if (ret)	/* still switch back */
++		pr_err("a72clk-step: armpll_b set_rate failed: %d\n", ret);
++	pll_rate = clk_get_rate(pll);
++	if (pll_rate < 250000000 || pll_rate > ceiling) {
++		/* never put the A72s on a PLL we did not ask for */
++		pr_err("a72clk-step: armpll_b reads %lu Hz - staying on mainpll (1092 MHz)\n",
++		       pll_rate);
++		ret = ret ?: -EIO;
++		after = clk_get_rate(cpu_b);
++		goto report;
++	}
++	i = clk_set_parent(sel, pll);
++	if (i) {
++		pr_err("a72clk-step: switch BACK to armpll_b failed: %d (A72s stay on mainpll 1092 MHz)\n", i);
++		ret = ret ?: i;
++	}
++	after = clk_get_rate(cpu_b);
++report:
++	pr_info("a72clk-step: cpu_b %lu -> %lu (mainpll) -> %lu Hz, armpll_b %lu Hz, VPROC2 %d uV, ret %d\n",
++		before, mid, after, pll_rate, vproc_uv, ret);
++put:
++	if (!IS_ERR(sel))
++		clk_put(sel);
++	if (!IS_ERR(pll))
++		clk_put(pll);
++	if (!IS_ERR(cpu_b))
++		clk_put(cpu_b);
++	if (!IS_ERR(mainpll))
++		clk_put(mainpll);
++	return ret;
++}
++
++static void __exit a72clk_step_exit(void)
++{
++}
++
++module_init(a72clk_step_init);
++module_exit(a72clk_step_exit);
++MODULE_DESCRIPTION("Gemini PDA test: step the A72 clock via the clk framework");
++MODULE_LICENSE("GPL");
+diff --git a/docs/cpu-dvfs.md b/docs/cpu-dvfs.md
+index 0ed631d..812fb64 100644
+--- a/docs/cpu-dvfs.md
++++ b/docs/cpu-dvfs.md
+@@ -560,3 +560,39 @@ cl2-up.sh, the timer and sramldo-smc.
+   (isp/venc/vdec/mjc + imgpll/vdecpll) kept on by `pd_ignore_unused`, the
+   display engine/DSI still scanning when DPMS is off, and the CONSYS
+   driver polling (~43 mA). Continued as a separate power project.
++
++## A72 DVFS (started 2026-10-07; needs docs/thermal.md first)
++
++Vendor non-hybrid path for MT_CPU_DVFS_B (mt_cpufreq.c `_cpufreq_set_locked`
++→ `adjust_armpll_dds()`, mt_idvfs.c): the same MCUMIXED mux trick as the
++A53s (B field = MUXSEL[1:0], CKDIV[4:0]), but the PLL lives in MCUCFG2
++(0x102224a0 CON0: bit0 en, 14:12 posdiv; 0x102224a4 PCW, VCO = 26 MHz ×
++PCW / 2^24) and is programmed only through ATF: SiP SMC 0xC20003B8
++(BIGIDVFSPLLSETFREQ, arg = **output** MHz, range 250–3000; the vendor never
++sets the B posdiv itself in this path, so ATF picks PCW + posdiv), read back
++with 0xC200035F. VPROC2 = DA9214 BUCKB (`vproc2`), SRAM LDO = SMC 0xC20003BF
++(mV × 100) / 0xC20003C0 (get), same tracking rule as VSRAM_L (VPROC + 100,
++1.0–1.2 V, ≤ 300 mV apart). While on MAINPLL the vendor lifts VPROC2 to its
++OPP9 voltage if lower. No FHCTL for B. Table = SB/TT 0119 (`cluster2_opp`).
++
++Plan, each step on its own boot/test:
++
++1. **a72clk1** (boot image + test module): `clk-mt6797-mcu` gains
++   `armpll_b` (SMC-backed; reads only while an A72 is online — the CPUs are
++   the `arm,cortex-a72` nodes — otherwise last known rate), `cpu_b_sel`,
++   `cpu_b` (`CLK_MCU_ARMPLL_B/B_SEL/B` = 9/10/11). Nothing uses them at
++   boot. Test module `mt6797-a72clk-step mhz=…` steps the A72s at today's
++   fixed VPROC2 1.000 V: 845 / 1001 / 1131 / 1378 / **1495** MHz (all ≤ their
++   SB-0119 voltage), back with 750. Verify with `cpumhz` and the SMC
++   readback in dmesg. Answers: does SETFREQ take output MHz, which posdiv
++   ATF picks, how long it takes.
++2. **a72dvfs1**: `cpu8 { clocks = <&mcumixedsys CLK_MCU_B_SEL>,
++   <&apmixedsys CLK_APMIXED_MAINPLL>; proc-supply = <&vproc2>; }` + an A72
++   OPP table capped at 1495 MHz with every OPP at ≥ 1.000 V (no voltage
++   scaling yet, SRAM LDO stays at cl2-power's 1.1 V) → schedutil on
++   policy8, cpufreq cooling joins `soc-thermal`. mediatek-cpufreq needs a
++   policy for cpu8 only after cl2-power onlined it (check probe order /
++   hotplug).
++3. **a72dvfs2**: `vsram_b` regulator driver over the SRAM-LDO SMCs, real
++   SB-0119 voltages (880 mV … 1.2 V), OPPs above 1495 after soak + thermal
++   checks under load (`gemini-thermal-check.sh load`).
+diff --git a/flake.nix b/flake.nix
+index 27a8af3..2e24af3 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -299,6 +299,10 @@
+         mt6797-cpuclk-step = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cpuclk-step {
+           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+         };
++        # Test: step the A72 (cpu8-9) clock through the clk framework (docs/cpu-dvfs.md).
++        mt6797-a72clk-step = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-a72clk-step {
++          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
++        };
+         # MT6351 fuel gauge as a power_supply (development module, step 2+).
+         mt6351-gauge = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
+           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };

@@ -1,0 +1,79 @@
+diff --git a/services/scripts/battery-guard.sh b/services/scripts/battery-guard.sh
+index d670a70..7a1c9cd 100644
+--- a/services/scripts/battery-guard.sh
++++ b/services/scripts/battery-guard.sh
+@@ -57,11 +57,17 @@
+ # On battery:
+ #   WARN  capacity <= GAUGE_WARN_PCT (10) or VBAT < GAUGE_WARN_MV (3450)
+ #         -> journal + desktop notification
+-#   CRIT  VBAT < GAUGE_CRIT_MV (3400, loaded; vendor Android also shut
+-#         down at 3.4 V) or (capacity == 0 and VBAT < GAUGE_CAP0_MV 3500),
+-#         two consecutive samples -> notify + systemctl poweroff.
+-#   (Loaded thresholds: this pack has ~0.28 Ohm, so 3.40 V at ~1 A is a
+-#   resting ~3.68 V = a few percent left, not empty.)
++#   CRIT  VBAT + |I| x R < GAUGE_CRIT_MV (3400; IR-compensated, see below;
++#         vendor Android also shut down at 3.4 V), or raw VBAT <
++#         GAUGE_FLOOR_MV (3100, under any load), or (capacity == 0 and
++#         VBAT < GAUGE_CAP0_MV 3500), two consecutive samples
++#         -> notify + systemctl poweroff.
++#   IR compensation [2026-10-07]: this pack has ~0.28 Ohm, so heavy load
++#   sags the terminal voltage far below the cell's own voltage. A full
++#   10-CPU load at 70 % read 3296 mV and the old raw 3400 mV rule powered
++#   the device off. The guard now adds |current_avg| x GAUGE_R_MOHM (250,
++#   a bit under the measured 0.28 Ohm so it errs towards shutting down)
++#   before comparing; the raw 3.1 V floor still protects the cell.
+ # Also persists the gauge's learned charge_full to
+ # /var/lib/gemini-gauge/charge_full and restores it when the gauge appears.
+ # NOTE (G1): systemctl poweroff does not yet truly power the unit off
+@@ -84,6 +90,8 @@ G_WARN_PCT=${BATTERY_GUARD_GAUGE_WARN_PCT:-10}
+ G_WARN_MV=${BATTERY_GUARD_GAUGE_WARN_MV:-3450}
+ G_CRIT_MV=${BATTERY_GUARD_GAUGE_CRIT_MV:-3400}
+ G_CAP0_MV=${BATTERY_GUARD_GAUGE_CAP0_MV:-3500}
++G_FLOOR_MV=${BATTERY_GUARD_GAUGE_FLOOR_MV:-3100}
++G_R_MOHM=${BATTERY_GUARD_GAUGE_R_MOHM:-250}
+ FCC_SAVE=/var/lib/gemini-gauge/charge_full
+ g_seen=0
+ g_fcc_last=""
+@@ -199,20 +207,29 @@ gauge_poll() {
+         alert ERROR "gauge VBAT read failed (${v:-empty}) — capacity ${CAP}%"
+         [ "$CAP" = 0 ] || return
+         crit_strikes=$((crit_strikes + 1))
+-    elif [ "$VBAT_MV" -lt "$G_CRIT_MV" ] || { [ "$CAP" = 0 ] && [ "$VBAT_MV" -lt "$G_CAP0_MV" ]; }; then
++    fi
++    # IR-compensated cell voltage: current_avg is uA, + = charging
++    VCOMP_MV=$VBAT_MV
++    case "$VBAT_MV:$IBAT" in
++        ([0-9]*:-[0-9]*) VCOMP_MV=$((VBAT_MV + (-IBAT / 1000) * G_R_MOHM / 1000)) ;;
++    esac
++    if [ "$VBAT_MV" = "?" ] || [ "$VBAT_MV" -lt 2500 ]; then
++        :	# handled above
++    elif [ "$VCOMP_MV" -lt "$G_CRIT_MV" ] || [ "$VBAT_MV" -lt "$G_FLOOR_MV" ] ||
++         { [ "$CAP" = 0 ] && [ "$VBAT_MV" -lt "$G_CAP0_MV" ]; }; then
+         crit_strikes=$((crit_strikes + 1))
+     else
+         crit_strikes=0
+-        if { [ "$CAP" != "?" ] && [ "$CAP" -le "$G_WARN_PCT" ]; } || [ "$VBAT_MV" -lt "$G_WARN_MV" ]; then
++        if { [ "$CAP" != "?" ] && [ "$CAP" -le "$G_WARN_PCT" ]; } || [ "$VCOMP_MV" -lt "$G_WARN_MV" ]; then
+             GUARD=LOW
+-            alert WARN "battery low: ${CAP}% (${VBAT_MV} mV under load) — connect the charger"
++            alert WARN "battery low: ${CAP}% (${VBAT_MV} mV under load, ${VCOMP_MV} mV compensated) — connect the charger"
+         fi
+         return
+     fi
+ 
+     GUARD=CRITICAL
+     if [ "$crit_strikes" -ge 2 ]; then
+-        log "CRITICAL (gauge): ${CAP}%, VBAT ${VBAT_MV} mV on battery — powering off in 10 s"
++        log "CRITICAL (gauge): ${CAP}%, VBAT ${VBAT_MV} mV (${VCOMP_MV} mV IR-compensated, I ${IBAT} uA) on battery — powering off in 10 s"
+         notify_desktop "Battery empty (${CAP}%, ${VBAT_MV} mV) — powering off in 10 s. Connect the charger!"
+         write_state
+         sleep 10
+@@ -223,7 +240,7 @@ gauge_poll() {
+         fi
+         exec systemctl poweroff
+     fi
+-    alert CRIT "battery critical: ${CAP}%, ${VBAT_MV} mV — will power off on the next sample unless the charger is connected"
++    alert CRIT "battery critical: ${CAP}%, ${VBAT_MV} mV (${VCOMP_MV} mV compensated) — will power off on the next sample unless the charger is connected"
+ }
+ 
+ read_psy() {
