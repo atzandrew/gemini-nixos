@@ -544,3 +544,19 @@ cl2-up.sh, the timer and sramldo-smc.
   driver no longer falls back to ETERNAL (which would block ondemand /
   conservative), 0 = mainline behaviour. total_trans after the game:
   17476 (LL) / 10540 (L), no errors, dmesg quiet.
+- 2026-10-07 10:00: fix3 confirmed: cpuinfo_transition_latency 500000,
+  schedutil rate_limit_us 10000 on both policies. **CPU DVFS for CPU0-7 is
+  at a stable stopping point** (boot-cpufreq5). Open items, none urgent:
+  CKDIV + CCI devfreq (drops the 1.00 V floor; small idle win, see below),
+  FHCTL hopping (no 1.07 V detour), more OPPs after soaks, A72 DVFS after a
+  thermal sensor.
+- 2026-10-07 10:55: **idle drain split** (screen blanked, 60 s averages of
+  current_now): baseline 548 mA; CPU1-7 offline 536; Wi-Fi off 505; A72s
+  offline 540. Cores idling in WFI at the bottom OPP cost ~10 mA per
+  cluster, so cpuidle (which on MT6797 needs the SPM MCDI firmware + a
+  per-entry SPM handshake, like cpuidle-qcom-spm) is NOT worth it for
+  power yet. The ~500 mA is platform: GPU rail + MFG domains forced on by
+  gpu-poweron.sh and never off (mfgpll enabled), unused MM sub-domains
+  (isp/venc/vdec/mjc + imgpll/vdecpll) kept on by `pd_ignore_unused`, the
+  display engine/DSI still scanning when DPMS is off, and the CONSYS
+  driver polling (~43 mA). Continued as a separate power project.
