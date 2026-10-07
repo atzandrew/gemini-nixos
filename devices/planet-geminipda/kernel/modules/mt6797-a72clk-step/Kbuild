@@ -1,0 +1,1 @@
+obj-m := mt6797-a72clk-step.o

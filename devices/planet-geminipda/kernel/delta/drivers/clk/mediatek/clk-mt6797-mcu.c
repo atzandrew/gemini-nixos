@@ -52,9 +52,23 @@
  * because the cluster is not on the PLL while it changes (the vendor's
  * separate adjust_posdiv() also switches to MAINPLL around its write).
  * CKDIV (the cpu_X divider) stays read-only: every OPP >= 559 MHz is /1.
+ *
+ * A72 CLUSTER (B = cpu8-9, added 2026-10-07): the same mux/divider pair in
+ * MCUMIXEDSYS (MUXSEL[1:0], CKDIV[4:0]), but its PLL is the "iDVFS" PLL in
+ * MCUCFG2 (CON0 0x102224a0: bit0 enable, 14:12 posdiv; CON1 0x102224a4:
+ * PCW, VCO = 26 MHz * PCW / 2^24), which the kernel may only program
+ * through ATF. Vendor non-hybrid path (mt_cpufreq.c adjust_armpll_dds() for
+ * MT_CPU_DVFS_B, mt_idvfs.c BigiDVFSPllSetFreq()): mux -> MAINPLL, SiP SMC
+ * 0xC20003B8 (BIGIDVFSPLLSETFREQ, arg = output MHz; ATF picks PCW and
+ * posdiv), 20 us, mux -> ARMPLL. Read back through the secure-read SMC
+ * 0xC200035F. The vendor only touches it while an A72 is online, so this
+ * driver does the same (cpus = every "arm,cortex-a72" CPU node); while the
+ * cluster is down the PLL reports its last known rate.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/clk-provider.h>
+#include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -85,7 +99,18 @@
 #define CSPM_CG_KEY_EN		0x0b160001
 #define SEMA_TRIES		200	/* x 10 us = 2 ms (vendor SEMA_GET_TIMEOUT) */
 
+/* A72 iDVFS PLL (vendor mt_idvfs.h / mt_idvfs.c) */
+#define SIP_IDVFS_READ		0xC200035FUL
+#define SIP_IDVFS_PLL_SETFREQ	0xC20003B8UL
+#define B_PLL_CON0		0x102224a0UL
+#define B_PLL_CON1		0x102224a4UL
+#define B_PLL_MIN_HZ		250000000UL	/* BigiDVFSPllSetFreq() range */
+#define B_PLL_MAX_HZ		2587000000UL	/* SB/TT 0119 OPP0 */
+#define B_MUX_SHIFT		0
+#define B_DIV_SHIFT		0
+
 struct mcu_clk_ctx {
+	struct cpumask b_cpus;		/* the A72s; empty = no B clocks */
 	void __iomem *base;
 	void __iomem *cspm;
 	void __iomem *misc_cfg;		/* TOPCKGEN CLK_MISC_CFG_0, one word */
@@ -271,6 +296,115 @@ static const struct clk_ops mcu_pll_ops = {
 	.set_rate = mcu_pll_set_rate,
 };
 
+/* ---- A72 iDVFS PLL (through ATF) ---------------------------------------- */
+
+struct mcu_bpll {
+	struct clk_hw hw;
+	struct mcu_clk_ctx *c;
+	unsigned long last_rate;
+};
+#define to_mcu_bpll(_hw) container_of(_hw, struct mcu_bpll, hw)
+
+static bool mcu_b_cluster_up(struct mcu_clk_ctx *c)
+{
+	return cpumask_intersects(&c->b_cpus, cpu_online_mask);
+}
+
+static unsigned long mcu_sip_read(unsigned long addr)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(SIP_IDVFS_READ, addr, 0, 0, 0, 0, 0, 0, &res);
+	return res.a0;
+}
+
+static unsigned long mcu_bpll_read_rate(void)
+{
+	u32 con0 = mcu_sip_read(B_PLL_CON0);
+	u32 pcw = mcu_sip_read(B_PLL_CON1) & GENMASK(30, 0);
+	u64 vco = (26000000ULL * pcw) >> 24;
+
+	if (!(con0 & BIT(0)))
+		return 0;
+	return (unsigned long)(vco >> ((con0 >> 12) & 0x7));
+}
+
+static unsigned long mcu_bpll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
+{
+	struct mcu_bpll *b = to_mcu_bpll(hw);
+
+	if (mcu_b_cluster_up(b->c))
+		b->last_rate = mcu_bpll_read_rate();
+	return b->last_rate;
+}
+
+static int mcu_bpll_determine_rate(struct clk_hw *hw, struct clk_rate_request *req)
+{
+	/* ATF takes whole MHz */
+	req->rate = rounddown(clamp(req->rate, B_PLL_MIN_HZ, B_PLL_MAX_HZ), 1000000);
+	return 0;
+}
+
+static int mcu_bpll_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long parent_rate)
+{
+	struct mcu_bpll *b = to_mcu_bpll(hw);
+	struct mcu_clk_ctx *c = b->c;
+	struct arm_smccc_res res;
+	unsigned long flags, got;
+	u32 muxsel;
+	int ret;
+
+	if (rate > B_PLL_MAX_HZ || rate < B_PLL_MIN_HZ)
+		return -EINVAL;
+
+	/*
+	 * No cpus_read_lock() here: cpufreq calls this with the policy rwsem
+	 * held, and CPU hotplug takes them in the other order. cpufreq only
+	 * retunes an online policy, which is what this check is for.
+	 */
+	if (!mcu_b_cluster_up(c)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	/* refuse to retune the PLL the A72s are running from */
+	spin_lock_irqsave(&c->lock, flags);
+	ret = mcu_sema_get(c);
+	if (!ret) {
+		ndelay(200);
+		muxsel = readl(c->base + ARMPLLDIV_MUXSEL);
+		mcu_sema_put(c);
+		if (((muxsel >> B_MUX_SHIFT) & 0x3) == MUX_ARMPLL)
+			ret = -EBUSY;
+	}
+	spin_unlock_irqrestore(&c->lock, flags);
+	if (ret)
+		goto out;
+
+	arm_smccc_smc(SIP_IDVFS_PLL_SETFREQ, rate / 1000000, 0, 0, 0, 0, 0, 0, &res);
+	udelay(PLL_SETTLE_US);
+	got = mcu_bpll_read_rate();
+	b->last_rate = got;
+	/* PCW resolution: 26 MHz / 2^24 per step, so allow 1 MHz of slack */
+	if ((long)res.a0 < 0 || abs((long)got - (long)rate) > 1000000) {
+		pr_err("clk-mt6797-mcu: armpll_b -> %lu Hz: SMC 0x%lx, PLL now %lu Hz\n",
+		       rate, res.a0, got);
+		ret = -EIO;
+	}
+out:
+	if (ret)
+		pr_err("clk-mt6797-mcu: armpll_b -> %lu Hz refused: %d\n", rate, ret);
+	else
+		pr_debug("clk-mt6797-mcu: armpll_b -> %lu Hz\n", got);
+	return ret;
+}
+
+static const struct clk_ops mcu_bpll_ops = {
+	.recalc_rate = mcu_bpll_recalc_rate,
+	.determine_rate = mcu_bpll_determine_rate,
+	.set_rate = mcu_bpll_set_rate,
+};
+
 /* ---- mux (source select) ------------------------------------------------ */
 
 struct mcu_mux {
@@ -448,6 +582,45 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MCU_ARMPLL_LL + i] = &p->hw;
 		data->hws[CLK_MCU_LL_SEL + i] = &m->hw;
 		data->hws[CLK_MCU_LL + i] = &d->hw;
+	}
+
+	/* A72 cluster: the CPUs it clocks are every "arm,cortex-a72" CPU node */
+	for_each_possible_cpu(i) {
+		struct device_node *np = of_get_cpu_node(i, NULL);
+
+		if (np && of_device_is_compatible(np, "arm,cortex-a72"))
+			cpumask_set_cpu(i, &c->b_cpus);
+		of_node_put(np);
+	}
+	if (!cpumask_empty(&c->b_cpus)) {
+		static const char * const clk26m[] = { "clk26m" };
+		static const char * const b_parents[] = {
+			"clk26m", "armpll_b", "mainpll", "univpll" };
+		static const char * const b_sel[] = { "cpu_b_sel" };
+		struct mcu_bpll *b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
+		struct mcu_mux *m = devm_kzalloc(dev, sizeof(*m), GFP_KERNEL);
+		struct mcu_div *d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+
+		if (!b || !m || !d)
+			return -ENOMEM;
+		b->c = m->c = d->c = c;
+		m->shift = B_MUX_SHIFT;
+		d->shift = B_DIV_SHIFT;
+
+		ret = mcu_register(dev, &b->hw, "armpll_b", &mcu_bpll_ops, clk26m, 1, 0);
+		if (!ret)
+			ret = mcu_register(dev, &m->hw, "cpu_b_sel", &mcu_mux_ops, b_parents, 4,
+					   CLK_SET_RATE_NO_REPARENT);
+		if (!ret)
+			ret = mcu_register(dev, &d->hw, "cpu_b", &mcu_div_ops, b_sel, 1, 0);
+		if (ret)
+			return ret;
+		data->hws[CLK_MCU_ARMPLL_B] = &b->hw;
+		data->hws[CLK_MCU_B_SEL] = &m->hw;
+		data->hws[CLK_MCU_B] = &d->hw;
+	} else {
+		for (i = CLK_MCU_ARMPLL_B; i <= CLK_MCU_B; i++)
+			data->hws[i] = ERR_PTR(-ENOENT);
 	}
 
 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);

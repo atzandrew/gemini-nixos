@@ -560,3 +560,39 @@ cl2-up.sh, the timer and sramldo-smc.
   (isp/venc/vdec/mjc + imgpll/vdecpll) kept on by `pd_ignore_unused`, the
   display engine/DSI still scanning when DPMS is off, and the CONSYS
   driver polling (~43 mA). Continued as a separate power project.
+
+## A72 DVFS (started 2026-10-07; needs docs/thermal.md first)
+
+Vendor non-hybrid path for MT_CPU_DVFS_B (mt_cpufreq.c `_cpufreq_set_locked`
+→ `adjust_armpll_dds()`, mt_idvfs.c): the same MCUMIXED mux trick as the
+A53s (B field = MUXSEL[1:0], CKDIV[4:0]), but the PLL lives in MCUCFG2
+(0x102224a0 CON0: bit0 en, 14:12 posdiv; 0x102224a4 PCW, VCO = 26 MHz ×
+PCW / 2^24) and is programmed only through ATF: SiP SMC 0xC20003B8
+(BIGIDVFSPLLSETFREQ, arg = **output** MHz, range 250–3000; the vendor never
+sets the B posdiv itself in this path, so ATF picks PCW + posdiv), read back
+with 0xC200035F. VPROC2 = DA9214 BUCKB (`vproc2`), SRAM LDO = SMC 0xC20003BF
+(mV × 100) / 0xC20003C0 (get), same tracking rule as VSRAM_L (VPROC + 100,
+1.0–1.2 V, ≤ 300 mV apart). While on MAINPLL the vendor lifts VPROC2 to its
+OPP9 voltage if lower. No FHCTL for B. Table = SB/TT 0119 (`cluster2_opp`).
+
+Plan, each step on its own boot/test:
+
+1. **a72clk1** (boot image + test module): `clk-mt6797-mcu` gains
+   `armpll_b` (SMC-backed; reads only while an A72 is online — the CPUs are
+   the `arm,cortex-a72` nodes — otherwise last known rate), `cpu_b_sel`,
+   `cpu_b` (`CLK_MCU_ARMPLL_B/B_SEL/B` = 9/10/11). Nothing uses them at
+   boot. Test module `mt6797-a72clk-step mhz=…` steps the A72s at today's
+   fixed VPROC2 1.000 V: 845 / 1001 / 1131 / 1378 / **1495** MHz (all ≤ their
+   SB-0119 voltage), back with 750. Verify with `cpumhz` and the SMC
+   readback in dmesg. Answers: does SETFREQ take output MHz, which posdiv
+   ATF picks, how long it takes.
+2. **a72dvfs1**: `cpu8 { clocks = <&mcumixedsys CLK_MCU_B_SEL>,
+   <&apmixedsys CLK_APMIXED_MAINPLL>; proc-supply = <&vproc2>; }` + an A72
+   OPP table capped at 1495 MHz with every OPP at ≥ 1.000 V (no voltage
+   scaling yet, SRAM LDO stays at cl2-power's 1.1 V) → schedutil on
+   policy8, cpufreq cooling joins `soc-thermal`. mediatek-cpufreq needs a
+   policy for cpu8 only after cl2-power onlined it (check probe order /
+   hotplug).
+3. **a72dvfs2**: `vsram_b` regulator driver over the SRAM-LDO SMCs, real
+   SB-0119 voltages (880 mV … 1.2 V), OPPs above 1495 after soak + thermal
+   checks under load (`gemini-thermal-check.sh load`).

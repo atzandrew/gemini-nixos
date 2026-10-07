@@ -15,6 +15,9 @@
 #define CLK_MCU_LL		6	/* ARMPLLDIV_CKDIV[9:5]   -> cpu0-3 clock */
 #define CLK_MCU_L		7	/* ARMPLLDIV_CKDIV[14:10] -> cpu4-7 clock */
 #define CLK_MCU_CCI		8	/* ARMPLLDIV_CKDIV[19:15] -> CCI clock */
-#define CLK_MCU_NR_CLK		9
+#define CLK_MCU_ARMPLL_B	9	/* A72 iDVFS PLL (MCUCFG2 0x102224a0), via ATF SMCs */
+#define CLK_MCU_B_SEL		10	/* ARMPLLDIV_MUXSEL[1:0] */
+#define CLK_MCU_B		11	/* ARMPLLDIV_CKDIV[4:0]   -> cpu8-9 clock */
+#define CLK_MCU_NR_CLK		12
 
 #endif

@@ -299,6 +299,10 @@
         mt6797-cpuclk-step = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cpuclk-step {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # Test: step the A72 (cpu8-9) clock through the clk framework (docs/cpu-dvfs.md).
+        mt6797-a72clk-step = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-a72clk-step {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # MT6351 fuel gauge as a power_supply (development module, step 2+).
         mt6351-gauge = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-gauge {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
