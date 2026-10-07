@@ -68,13 +68,15 @@ load)
 	echo "zone $z, load ${secs}s on $(nproc) CPUs, then 60 s cooldown"
 	pids=
 	for i in $(seq "$(nproc)"); do sha256sum /dev/zero & pids="$pids $!"; done
-	t=0
+	start=$(date +%s); t=0; stopped=0
 	while [ $t -le $((secs + 60)) ]; do
-		[ $t -eq "$secs" ] && { kill $pids 2>/dev/null; echo "-- load stopped"; }
+		[ $stopped = 0 ] && [ $t -ge "$secs" ] && { kill $pids 2>/dev/null; stopped=1; echo "-- load stopped"; }
 		f0=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null)
 		f4=$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq 2>/dev/null)
-		echo "t=${t}s  $(cat "$z/temp") mC  LL ${f0} kHz  L ${f4} kHz"
-		sleep 2; t=$((t + 2))
+		f8=$(cat /sys/devices/system/cpu/cpufreq/policy8/scaling_cur_freq 2>/dev/null || echo -)
+		# t = wall-clock seconds since start, so a stalled read shows as a gap
+		echo "t=${t}s  $(cat "$z/temp") mC  LL ${f0} L ${f4} B ${f8} kHz"
+		sleep 2; t=$(($(date +%s) - start))
 	done
 	kill $pids 2>/dev/null
 	;;
