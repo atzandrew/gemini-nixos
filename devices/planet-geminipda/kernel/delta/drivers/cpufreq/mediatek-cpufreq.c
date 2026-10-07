@@ -600,11 +600,11 @@ static int mtk_cpufreq_init(struct cpufreq_policy *policy)
 	 * Gemini PDA: mainline leaves transition_latency 0, which makes
 	 * schedutil re-evaluate every 1 ms; with an I2C buck in every
 	 * transition that ping-pongs the clusters ~1000x/s. Use the OPP
-	 * table's clock-latency-ns (cpufreq-dt does the same).
+	 * table's per-OPP clock-latency-ns (cpufreq-dt does the same); 0 (the
+	 * mainline behaviour) if the table has none.
 	 */
 	policy->cpuinfo.transition_latency =
-		dev_pm_opp_get_max_transition_latency(info->cpu_dev) ?:
-		CPUFREQ_ETERNAL;
+		dev_pm_opp_get_max_transition_latency(info->cpu_dev);
 
 	return 0;
 }

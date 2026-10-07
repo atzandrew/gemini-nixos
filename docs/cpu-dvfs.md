@@ -537,3 +537,10 @@ cl2-up.sh, the timer and sramldo-smc.
   OPP table; both tables get clock-latency-ns = 500 us -> schedutil
   rate_limit 10 ms. Next: FHCTL (no intermediate, no 1.07 V detour), CCI
   scaling (drops the 1.00 V floor), more OPPs.
+- 2026-10-07 08:25: fix2 result: rate_limit_us 10000 but
+  cpuinfo_transition_latency 4294967295 (CPUFREQ_ETERNAL fallback):
+  `clock-latency-ns` is a per-OPP property in the opp-v2 binding, the
+  table-level one was ignored. Fix3: clock-latency-ns in every OPP node;
+  driver no longer falls back to ETERNAL (which would block ondemand /
+  conservative), 0 = mainline behaviour. total_trans after the game:
+  17476 (LL) / 10540 (L), no errors, dmesg quiet.

@@ -420,6 +420,8 @@
  *   proc         = VPROC1 (DA9214 BUCKA, shared by LL, L and CCI),
  *   sram         = VSRAM_L (CPULDO), tracked +100 mV / <= 300 mV.
  * OPPs = vendor speed bin SB (level 1) sign-off voltages, unadjusted by EEM.
+ * clock-latency-ns (per OPP, as the binding wants): mux + PLL + DA9214 I2C,
+ * ~0.1-0.5 ms; gives schedutil a 10 ms rate limit.
  * Limits for now:
  *  - L tops out at 1352 MHz (tested), LL at 1118 MHz (LL needs an OPP at
  *    or above 1092 MHz for the intermediate clock; 1118 @ 1.07 V is the SB
@@ -496,30 +498,35 @@
 	cluster0_opp: opp-table-cluster0 {	/* LL, cpu0-3 */
 		compatible = "operating-points-v2";
 		opp-shared;
-		clock-latency-ns = <500000>;	/* mux+PLL+DA9214 I2C, measured ~0.1-0.5 ms */
 		opp-624000000 {
 			opp-hz = /bits/ 64 <624000000>;
 			opp-microvolt = <1000000>;	/* SB 900 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-715000000 {
 			opp-hz = /bits/ 64 <715000000>;
 			opp-microvolt = <1000000>;	/* SB 940 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-806000000 {
 			opp-hz = /bits/ 64 <806000000>;
 			opp-microvolt = <1000000>;	/* SB 970 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-897000000 {
 			opp-hz = /bits/ 64 <897000000>;
 			opp-microvolt = <1000000>;
+			clock-latency-ns = <500000>;
 		};
 		opp-1014000000 {
 			opp-hz = /bits/ 64 <1014000000>;
 			opp-microvolt = <1040000>;
+			clock-latency-ns = <500000>;
 		};
 		opp-1118000000 {
 			opp-hz = /bits/ 64 <1118000000>;
 			opp-microvolt = <1070000>;
+			clock-latency-ns = <500000>;
 		};
 	};
 
@@ -600,30 +607,35 @@
 	cluster1_opp: opp-table-cluster1 {	/* L, cpu4-7 */
 		compatible = "operating-points-v2";
 		opp-shared;
-		clock-latency-ns = <500000>;	/* mux+PLL+DA9214 I2C, measured ~0.1-0.5 ms */
 		opp-650000000 {
 			opp-hz = /bits/ 64 <650000000>;
 			opp-microvolt = <1000000>;	/* SB 850 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-832000000 {
 			opp-hz = /bits/ 64 <832000000>;
 			opp-microvolt = <1000000>;	/* SB 900 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-962000000 {
 			opp-hz = /bits/ 64 <962000000>;
 			opp-microvolt = <1000000>;	/* SB 940 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-1092000000 {
 			opp-hz = /bits/ 64 <1092000000>;
 			opp-microvolt = <1000000>;	/* SB 970 mV, CCI floor */
+			clock-latency-ns = <500000>;
 		};
 		opp-1209000000 {
 			opp-hz = /bits/ 64 <1209000000>;
 			opp-microvolt = <1000000>;
+			clock-latency-ns = <500000>;
 		};
 		opp-1352000000 {
 			opp-hz = /bits/ 64 <1352000000>;
 			opp-microvolt = <1040000>;
+			clock-latency-ns = <500000>;
 		};
 	};
 };
