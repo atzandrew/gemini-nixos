@@ -109,8 +109,11 @@
 #define B_MUX_SHIFT		0
 #define B_DIV_SHIFT		0
 
+struct mcu_bpll;
+
 struct mcu_clk_ctx {
 	struct cpumask b_cpus;		/* the A72s; empty = no B clocks */
+	struct mcu_bpll *bpll;		/* armpll_b, for the B mux rate */
 	void __iomem *base;
 	void __iomem *cspm;
 	void __iomem *misc_cfg;		/* TOPCKGEN CLK_MISC_CFG_0, one word */
@@ -467,6 +470,34 @@ static const struct clk_ops mcu_mux_ops = {
 	.determine_rate = __clk_mux_determine_rate,
 };
 
+/*
+ * A72 mux rate. CLK_GET_RATE_NOCACHE re-runs recalc for the clock that is
+ * asked and its children, but takes the parent's CACHED rate — and
+ * armpll_b's cache is the 0 it had at registration (cluster down) until
+ * someone asks armpll_b itself. cpufreq asks cpu_b_sel, so its ->get()
+ * returned 0 and policy8 was never created (a72dvfs1, 2026-10-07). While
+ * the A72s run from armpll_b, read the PLL here (and refresh its cache).
+ */
+static unsigned long mcu_bmux_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
+{
+	struct mcu_mux *m = to_mcu_mux(hw);
+	struct mcu_clk_ctx *c = m->c;
+	u32 v;
+
+	if (!c->bpll || !mcu_b_cluster_up(c) || mcu_read(c, ARMPLLDIV_MUXSEL, &v) ||
+	    ((v >> m->shift) & 0x3) != MUX_ARMPLL)
+		return parent_rate;
+	c->bpll->last_rate = mcu_bpll_read_rate();
+	return c->bpll->last_rate;
+}
+
+static const struct clk_ops mcu_bmux_ops = {
+	.get_parent = mcu_mux_get_parent,
+	.set_parent = mcu_mux_set_parent,
+	.determine_rate = __clk_mux_determine_rate,
+	.recalc_rate = mcu_bmux_recalc_rate,
+};
+
 /* ---- divider ------------------------------------------------------------ */
 
 struct mcu_div {
@@ -616,11 +647,12 @@ static int mt6797_mcu_clk_probe(struct platform_device *pdev)
 		b->c = m->c = d->c = c;
 		m->shift = B_MUX_SHIFT;
 		m->b = true;
+		c->bpll = b;
 		d->shift = B_DIV_SHIFT;
 
 		ret = mcu_register(dev, &b->hw, "armpll_b", &mcu_bpll_ops, clk26m, 1, 0);
 		if (!ret)
-			ret = mcu_register(dev, &m->hw, "cpu_b_sel", &mcu_mux_ops, b_parents, 4,
+			ret = mcu_register(dev, &m->hw, "cpu_b_sel", &mcu_bmux_ops, b_parents, 4,
 					   CLK_SET_RATE_NO_REPARENT);
 		if (!ret)
 			ret = mcu_register(dev, &d->hw, "cpu_b", &mcu_div_ops, b_sel, 1, 0);

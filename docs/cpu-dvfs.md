@@ -613,4 +613,12 @@ A72 log:
   latch). cpu8: clocks cpu_b_sel + MAINPLL, OPPs 845/1001/1131/1378/1495
   enabled (others `status = "disabled"`), clock-latency 500 µs, cooling map
   `map-cpu-b` on the 85 °C trip.
+- 2026-10-07 15:55 a72dvfs1 booted: `cpu8: no proc supply, fixed voltage`
+  at 0.45 s, cl2-power onlined cpu8/9 at 2.0 s, but NO policy8 (A72s stay at
+  750). Cause: cpufreq_online()'s ->get() = clk_get_rate(cpu_b_sel); with
+  CLK_GET_RATE_NOCACHE the clk core recalcs cpu_b_sel from armpll_b's
+  CACHED rate, which is the 0 from registration (cluster down) → ->get()
+  returns 0 → "cpufreq_online: ->get() failed", policy dropped. Fix
+  a72dvfs1b: cpu_b_sel gets its own recalc_rate that reads the PLL (via
+  SMC) while the A72s run from it.
 
