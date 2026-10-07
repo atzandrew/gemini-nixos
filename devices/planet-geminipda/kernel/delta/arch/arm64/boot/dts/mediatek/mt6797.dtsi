@@ -9,6 +9,7 @@
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/pinctrl/mt6797-pinfunc.h>
 #include <dt-bindings/power/mt6797-power.h>
+#include <dt-bindings/reset/mt6797-resets.h>
 
 / {
 	compatible = "mediatek,mt6797";
@@ -38,6 +39,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x000>;
 		};
 
@@ -45,6 +47,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x001>;
 		};
 
@@ -52,6 +55,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x002>;
 		};
 
@@ -59,6 +63,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x003>;
 		};
 
@@ -66,6 +71,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x100>;
 		};
 
@@ -73,6 +79,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x101>;
 		};
 
@@ -80,6 +87,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x102>;
 		};
 
@@ -87,6 +95,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x103>;
 		};
 
@@ -94,6 +103,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a72";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x200>;
 		};
 
@@ -101,6 +111,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a72";
 			enable-method = "psci";
+			#cooling-cells = <2>;
 			reg = <0x201>;
 		};
 	};
@@ -131,6 +142,7 @@
 		compatible = "mediatek,mt6797-infracfg", "syscon";
 		reg = <0 0x10001000 0 0x1000>;
 		#clock-cells = <1>;
+		#reset-cells = <1>;
 	};
 
 	/*
@@ -273,6 +285,21 @@
 		      <0 0x10220690 0 0x10>;
 	};
 
+	/*
+	 * AUXADC. Channel 11 belongs to the thermal controller, which drives
+	 * it by itself over AHB; keep the IIO driver off until it can share
+	 * the block with the thermal controller.
+	 */
+	auxadc: adc@11001000 {
+		compatible = "mediatek,mt6797-auxadc",
+			     "mediatek,mt8173-auxadc";
+		reg = <0 0x11001000 0 0x1000>;
+		clocks = <&infrasys CLK_INFRA_AUXADC>;
+		clock-names = "main";
+		#io-channel-cells = <1>;
+		status = "disabled";
+	};
+
 	uart0: serial@11002000 {
 		compatible = "mediatek,mt6797-uart",
 			     "mediatek,mt6577-uart";
@@ -363,6 +390,25 @@
 		clock-div = <10>;
 		#address-cells = <1>;
 		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	/*
+	 * Thermal controller: 5 sensors (TS_MCU1..4, ABB) in 6 banks.
+	 * PTPCORESEL at +0x400 is shared with the EEM/PTP block (not used).
+	 * Needs nvmem-cells = the efuse calibration words (board file).
+	 */
+	thermal: thermal@1100b000 {
+		compatible = "mediatek,mt6797-thermal";
+		reg = <0 0x1100b000 0 0x1000>;
+		interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&infrasys CLK_INFRA_THERM>,
+			 <&infrasys CLK_INFRA_AUXADC>;
+		clock-names = "therm", "auxadc";
+		resets = <&infrasys MT6797_INFRA_THERM_CTRL_SW_RST>;
+		mediatek,auxadc = <&auxadc>;
+		mediatek,apmixedsys = <&apmixedsys>;
+		#thermal-sensor-cells = <0>;
 		status = "disabled";
 	};
 

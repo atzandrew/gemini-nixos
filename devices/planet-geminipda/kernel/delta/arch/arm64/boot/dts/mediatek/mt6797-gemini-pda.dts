@@ -24,6 +24,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/phy/phy.h>
 #include <dt-bindings/power/mt6797-power.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	model = "Planet Computers Gemini PDA";
@@ -2105,4 +2106,70 @@
 		output-low;
 		line-name = "fusb301a-sw-sel";
 	};
+};
+
+/*
+ * SoC thermal (2026-10-07, docs/thermal.md). The thermal controller's
+ * calibration = efuse words 0x10206180..0x10206188, which LK copies into
+ * /chosen/atag,devinfo as devinfo indexes 31..33 (vendor ADDRESS_INDEX_1/
+ * 0/2); drivers/nvmem/mtk-lk-devinfo.c exposes that copy (byte offset =
+ * 4 * index). One zone = the hottest of the five sensors (A72, GPU, SoC
+ * and the A53/CCI banks), like the vendor "mtktscpu" zone.
+ * Trips: passive 85 C throttles the A53 clusters (cpufreq cooling,
+ * step_wise), critical 105 C = orderly poweroff (vendor: 117 C HW reset).
+ * The A72s join the cooling map when they get DVFS.
+ */
+/ {
+	firmware {
+		lk_devinfo: lk-devinfo {
+			compatible = "mediatek,mt6797-lk-devinfo";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			read-only;
+
+			thermal_calibration: calib@7c {
+				reg = <0x7c 0xc>;
+			};
+		};
+	};
+
+	thermal-zones {
+		soc_thermal: soc-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&thermal>;
+
+			trips {
+				soc_alert: trip-alert {
+					temperature = <85000>;
+					hysteresis = <3000>;
+					type = "passive";
+				};
+
+				soc_crit: trip-crit {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-cpu-ll {
+					trip = <&soc_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-cpu-l {
+					trip = <&soc_alert>;
+					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+&thermal {
+	nvmem-cells = <&thermal_calibration>;
+	nvmem-cell-names = "calibration-data";
+	status = "okay";
 };

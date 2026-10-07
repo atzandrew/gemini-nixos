@@ -1,0 +1,3501 @@
+diff --git a/bin/gemini-thermal-check.sh b/bin/gemini-thermal-check.sh
+new file mode 100755
+index 0000000..38591a0
+--- /dev/null
++++ b/bin/gemini-thermal-check.sh
+@@ -0,0 +1,83 @@
++#!/bin/sh
++# gemini-thermal-check.sh — SoC thermal sensor checks, run ON the Gemini.
++#
++#   sh gemini-thermal-check.sh pre    decode the thermal calibration that LK
++#                                     passes in /chosen/atag,devinfo (works on
++#                                     any kernel; run before flashing)
++#   sh gemini-thermal-check.sh post   after booting the thermal kernel: driver
++#                                     messages, zone, trips, cooling devices
++#   sh gemini-thermal-check.sh load [SECONDS]
++#                                     log the zone temperature every 2 s while
++#                                     all online CPUs spin, then 60 s of cooldown
++#
++# docs/thermal.md. Calibration = efuse 0x10206180/84/88 = devinfo index 31/32/33
++# (vendor mtk_tc.c ADDRESS_INDEX_1/0/2), checked with the vendor range rules.
++
++P=/proc/device-tree/chosen/atag,devinfo
++
++zone() {
++	for z in /sys/class/thermal/thermal_zone*; do
++		[ "$(cat "$z/type" 2>/dev/null)" = soc-thermal ] && { echo "$z"; return 0; }
++	done
++	return 1
++}
++
++case "${1:-pre}" in
++pre)
++	[ -r "$P" ] || { echo "no $P - LK did not pass devinfo (thermal driver will refuse to probe)"; exit 1; }
++	od -A n -t u4 -v "$P" | tr -s ' ' '\n' | sed '/^$/d' | awk '
++	{ w[NR-1] = $1 }
++	function bits(x, hi, lo) { return int(x / 2^lo) % 2^(hi - lo + 1) }
++	function hex(x) { return sprintf("%04x%04x", int(x / 65536), x % 65536) }
++	END {
++		n = NR
++		printf "atag,devinfo: %d words, header size %d, tag 0x%s, trailing count %d\n", n, w[0], hex(w[1]), w[n-1]
++		if (w[0] != n || w[1] != 1090521092 || w[n-1] != n - 3) { print "MALFORMED (driver will refuse)"; exit 1 }
++		a = w[2+31]; b = w[2+32]; c = w[2+33]	# efuse 0x180, 0x184, 0x188
++		printf "efuse 0x180=0x%s 0x184=0x%s 0x188=0x%s\n", hex(a), hex(b), hex(c)
++		en = bits(a, 0, 0); degc = bits(a, 6, 1); sign = bits(a, 7, 7); slope = bits(a, 31, 26)
++		v1 = bits(a, 25, 17); v2 = bits(a, 16, 8)
++		ge = bits(b, 31, 22); oe = bits(b, 21, 12); id = bits(b, 9, 9); v3 = bits(b, 8, 0)
++		v4 = bits(c, 31, 23); vabb = bits(c, 22, 14)
++		if (id == 0) slope = 0
++		printf "cali_en %d  ADC GE %d OE %d  DEGC %d  slope %s%d (id %d)\n", en, ge, oe, degc, sign ? "-" : "+", slope, id
++		printf "VTS MCU1..4 %d %d %d %d  ABB %d\n", v1, v2, v3, v4, vabb
++		ok = en && ge >= 265 && ge <= 758 && oe >= 265 && oe <= 758 && degc >= 1 && degc <= 63 &&
++		     v1 <= 484 && v2 <= 484 && v3 <= 484 && v4 <= 484 && vabb <= 484
++		print ok ? "calibration VALID (vendor range checks pass)" : "calibration INVALID (driver will refuse to probe)"
++	}'
++	;;
++post)
++	echo "== kernel messages"
++	dmesg | grep -i -E 'thermal|lk-devinfo|1100b000' | tail -20
++	z=$(zone) || { echo "no soc-thermal zone"; exit 1; }
++	echo "== $z"
++	echo "temp $(cat "$z/temp") mC  mode $(cat "$z/mode")  policy $(cat "$z/policy")"
++	for t in "$z"/trip_point_*_type; do
++		i=${t%_type}; echo "$(basename "$i"): $(cat "$t") $(cat "${i}_temp") mC"
++	done
++	echo "== cooling devices"
++	for c in /sys/class/thermal/cooling_device*; do
++		echo "$(basename "$c"): $(cat "$c/type") state $(cat "$c/cur_state")/$(cat "$c/max_state")"
++	done
++	ls -d /sys/bus/nvmem/devices/* 2>/dev/null
++	;;
++load)
++	z=$(zone) || { echo "no soc-thermal zone"; exit 1; }
++	secs=${2:-120}
++	echo "zone $z, load ${secs}s on $(nproc) CPUs, then 60 s cooldown"
++	pids=
++	for i in $(seq "$(nproc)"); do sha256sum /dev/zero & pids="$pids $!"; done
++	t=0
++	while [ $t -le $((secs + 60)) ]; do
++		[ $t -eq "$secs" ] && { kill $pids 2>/dev/null; echo "-- load stopped"; }
++		f0=$(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null)
++		f4=$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq 2>/dev/null)
++		echo "t=${t}s  $(cat "$z/temp") mC  LL ${f0} kHz  L ${f4} kHz"
++		sleep 2; t=$((t + 2))
++	done
++	kill $pids 2>/dev/null
++	;;
++*)
++	sed -n '2,13p' "$0"; exit 2 ;;
++esac
+diff --git a/devices/planet-geminipda/kernel/config b/devices/planet-geminipda/kernel/config
+index 262f7a1..36e33c0 100644
+--- a/devices/planet-geminipda/kernel/config
++++ b/devices/planet-geminipda/kernel/config
+@@ -4621,7 +4621,9 @@ CONFIG_ARMADA_THERMAL=y
+ #
+ # Mediatek thermal drivers
+ #
+-# CONFIG_MTK_THERMAL is not set
++CONFIG_MTK_THERMAL=y
++CONFIG_MTK_SOC_THERMAL=y
++# CONFIG_MTK_LVTS_THERMAL is not set
+ # end of Mediatek thermal drivers
+ 
+ CONFIG_AMLOGIC_THERMAL=y
+@@ -9269,7 +9271,7 @@ CONFIG_APPLE_AIC=y
+ 
+ # CONFIG_IPACK_BUS is not set
+ CONFIG_ARCH_HAS_RESET_CONTROLLER=y
+-# CONFIG_RESET_CONTROLLER is not set
++CONFIG_RESET_CONTROLLER=y
+ # CONFIG_RESET_BERLIN is not set
+ # CONFIG_RESET_BRCMSTB is not set
+ # CONFIG_RESET_BRCMSTB_RESCAL is not set
+@@ -9478,7 +9480,7 @@ CONFIG_RAS=y
+ # CONFIG_LIBNVDIMM is not set
+ # CONFIG_DAX is not set
+ CONFIG_NVMEM=y
+-# CONFIG_NVMEM_SYSFS is not set
++CONFIG_NVMEM_SYSFS=y
+ 
+ #
+ # Layout Types
+@@ -9497,6 +9499,7 @@ CONFIG_NVMEM=y
+ # CONFIG_NVMEM_MESON_EFUSE is not set
+ # CONFIG_NVMEM_MESON_MX_EFUSE is not set
+ # CONFIG_NVMEM_MTK_EFUSE is not set
++CONFIG_NVMEM_MTK_LK_DEVINFO=y
+ # CONFIG_NVMEM_QCOM_QFPROM is not set
+ # CONFIG_NVMEM_QCOM_SEC_QFPROM is not set
+ # CONFIG_NVMEM_RMEM is not set
+diff --git a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 8fbc793..5eef0a0 100644
+--- a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -24,6 +24,7 @@
+ #include <dt-bindings/input/input.h>
+ #include <dt-bindings/phy/phy.h>
+ #include <dt-bindings/power/mt6797-power.h>
++#include <dt-bindings/thermal/thermal.h>
+ 
+ / {
+ 	model = "Planet Computers Gemini PDA";
+@@ -2106,3 +2107,69 @@
+ 		line-name = "fusb301a-sw-sel";
+ 	};
+ };
++
++/*
++ * SoC thermal (2026-10-07, docs/thermal.md). The thermal controller's
++ * calibration = efuse words 0x10206180..0x10206188, which LK copies into
++ * /chosen/atag,devinfo as devinfo indexes 31..33 (vendor ADDRESS_INDEX_1/
++ * 0/2); drivers/nvmem/mtk-lk-devinfo.c exposes that copy (byte offset =
++ * 4 * index). One zone = the hottest of the five sensors (A72, GPU, SoC
++ * and the A53/CCI banks), like the vendor "mtktscpu" zone.
++ * Trips: passive 85 C throttles the A53 clusters (cpufreq cooling,
++ * step_wise), critical 105 C = orderly poweroff (vendor: 117 C HW reset).
++ * The A72s join the cooling map when they get DVFS.
++ */
++/ {
++	firmware {
++		lk_devinfo: lk-devinfo {
++			compatible = "mediatek,mt6797-lk-devinfo";
++			#address-cells = <1>;
++			#size-cells = <1>;
++			read-only;
++
++			thermal_calibration: calib@7c {
++				reg = <0x7c 0xc>;
++			};
++		};
++	};
++
++	thermal-zones {
++		soc_thermal: soc-thermal {
++			polling-delay-passive = <250>;
++			polling-delay = <1000>;
++			thermal-sensors = <&thermal>;
++
++			trips {
++				soc_alert: trip-alert {
++					temperature = <85000>;
++					hysteresis = <3000>;
++					type = "passive";
++				};
++
++				soc_crit: trip-crit {
++					temperature = <105000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map-cpu-ll {
++					trip = <&soc_alert>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++
++				map-cpu-l {
++					trip = <&soc_alert>;
++					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++	};
++};
++
++&thermal {
++	nvmem-cells = <&thermal_calibration>;
++	nvmem-cell-names = "calibration-data";
++	status = "okay";
++};
+diff --git a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+index 7873b33..86b131e 100644
+--- a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -9,6 +9,7 @@
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/pinctrl/mt6797-pinfunc.h>
+ #include <dt-bindings/power/mt6797-power.h>
++#include <dt-bindings/reset/mt6797-resets.h>
+ 
+ / {
+ 	compatible = "mediatek,mt6797";
+@@ -38,6 +39,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x000>;
+ 		};
+ 
+@@ -45,6 +47,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x001>;
+ 		};
+ 
+@@ -52,6 +55,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x002>;
+ 		};
+ 
+@@ -59,6 +63,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x003>;
+ 		};
+ 
+@@ -66,6 +71,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x100>;
+ 		};
+ 
+@@ -73,6 +79,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x101>;
+ 		};
+ 
+@@ -80,6 +87,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x102>;
+ 		};
+ 
+@@ -87,6 +95,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x103>;
+ 		};
+ 
+@@ -94,6 +103,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x200>;
+ 		};
+ 
+@@ -101,6 +111,7 @@
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
++			#cooling-cells = <2>;
+ 			reg = <0x201>;
+ 		};
+ 	};
+@@ -131,6 +142,7 @@
+ 		compatible = "mediatek,mt6797-infracfg", "syscon";
+ 		reg = <0 0x10001000 0 0x1000>;
+ 		#clock-cells = <1>;
++		#reset-cells = <1>;
+ 	};
+ 
+ 	/*
+@@ -273,6 +285,21 @@
+ 		      <0 0x10220690 0 0x10>;
+ 	};
+ 
++	/*
++	 * AUXADC. Channel 11 belongs to the thermal controller, which drives
++	 * it by itself over AHB; keep the IIO driver off until it can share
++	 * the block with the thermal controller.
++	 */
++	auxadc: adc@11001000 {
++		compatible = "mediatek,mt6797-auxadc",
++			     "mediatek,mt8173-auxadc";
++		reg = <0 0x11001000 0 0x1000>;
++		clocks = <&infrasys CLK_INFRA_AUXADC>;
++		clock-names = "main";
++		#io-channel-cells = <1>;
++		status = "disabled";
++	};
++
+ 	uart0: serial@11002000 {
+ 		compatible = "mediatek,mt6797-uart",
+ 			     "mediatek,mt6577-uart";
+@@ -366,6 +393,25 @@
+ 		status = "disabled";
+ 	};
+ 
++	/*
++	 * Thermal controller: 5 sensors (TS_MCU1..4, ABB) in 6 banks.
++	 * PTPCORESEL at +0x400 is shared with the EEM/PTP block (not used).
++	 * Needs nvmem-cells = the efuse calibration words (board file).
++	 */
++	thermal: thermal@1100b000 {
++		compatible = "mediatek,mt6797-thermal";
++		reg = <0 0x1100b000 0 0x1000>;
++		interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&infrasys CLK_INFRA_THERM>,
++			 <&infrasys CLK_INFRA_AUXADC>;
++		clock-names = "therm", "auxadc";
++		resets = <&infrasys MT6797_INFRA_THERM_CTRL_SW_RST>;
++		mediatek,auxadc = <&auxadc>;
++		mediatek,apmixedsys = <&apmixedsys>;
++		#thermal-sensor-cells = <0>;
++		status = "disabled";
++	};
++
+ 	i2c9: i2c@1100d000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c
+new file mode 100644
+index 0000000..4c13690
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c
+@@ -0,0 +1,739 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2016 MediaTek Inc.
++ * Author: Kevin Chen <kevin-cw.chen@mediatek.com>
++ */
++
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#include "clk-gate.h"
++#include "clk-mtk.h"
++#include "clk-pll.h"
++#include "reset.h"
++
++#include <dt-bindings/clock/mt6797-clk.h>
++
++/*
++ * For some clocks, we don't care what their actual rates are. And these
++ * clocks may change their rate on different products or different scenarios.
++ * So we model these clocks' rate as 0, to denote it's not an actual rate.
++ */
++
++static DEFINE_SPINLOCK(mt6797_clk_lock);
++
++static const struct mtk_fixed_factor top_fixed_divs[] = {
++	FACTOR(CLK_TOP_SYSPLL_CK, "syspll_ck", "mainpll", 1, 1),
++	FACTOR(CLK_TOP_SYSPLL_D2, "syspll_d2", "mainpll", 1, 2),
++	FACTOR(CLK_TOP_SYSPLL1_D2, "syspll1_d2", "syspll_d2", 1, 2),
++	FACTOR(CLK_TOP_SYSPLL1_D4, "syspll1_d4", "syspll_d2", 1, 4),
++	FACTOR(CLK_TOP_SYSPLL1_D8, "syspll1_d8", "syspll_d2", 1, 8),
++	FACTOR(CLK_TOP_SYSPLL1_D16, "syspll1_d16", "syspll_d2", 1, 16),
++	FACTOR(CLK_TOP_SYSPLL_D3, "syspll_d3", "mainpll", 1, 3),
++	FACTOR(CLK_TOP_SYSPLL_D3_D3, "syspll_d3_d3", "syspll_d3", 1, 3),
++	FACTOR(CLK_TOP_SYSPLL2_D2, "syspll2_d2", "syspll_d3", 1, 2),
++	FACTOR(CLK_TOP_SYSPLL2_D4, "syspll2_d4", "syspll_d3", 1, 4),
++	FACTOR(CLK_TOP_SYSPLL2_D8, "syspll2_d8", "syspll_d3", 1, 8),
++	FACTOR(CLK_TOP_SYSPLL_D5, "syspll_d5", "mainpll", 1, 5),
++	FACTOR(CLK_TOP_SYSPLL3_D2, "syspll3_d2", "syspll_d5", 1, 2),
++	FACTOR(CLK_TOP_SYSPLL3_D4, "syspll3_d4", "syspll_d5", 1, 4),
++	FACTOR(CLK_TOP_SYSPLL_D7, "syspll_d7", "mainpll", 1, 7),
++	FACTOR(CLK_TOP_SYSPLL4_D2, "syspll4_d2", "syspll_d7", 1, 2),
++	FACTOR(CLK_TOP_SYSPLL4_D4, "syspll4_d4", "syspll_d7", 1, 4),
++	FACTOR(CLK_TOP_UNIVPLL_CK, "univpll_ck", "univpll", 1, 1),
++	FACTOR(CLK_TOP_UNIVPLL_D7, "univpll_d7", "univpll", 1, 7),
++	FACTOR(CLK_TOP_UNIVPLL_D26, "univpll_d26", "univpll", 1, 26),
++	FACTOR(CLK_TOP_SSUSB_PHY_48M_CK, "ssusb_phy_48m_ck", "univpll", 1, 1),
++	FACTOR(CLK_TOP_USB_PHY48M_CK, "usb_phy48m_ck", "univpll", 1, 1),
++	FACTOR(CLK_TOP_UNIVPLL_D2, "univpll_d2", "univpll", 1, 2),
++	FACTOR(CLK_TOP_UNIVPLL1_D2, "univpll1_d2", "univpll_d2", 1, 2),
++	FACTOR(CLK_TOP_UNIVPLL1_D4, "univpll1_d4", "univpll_d2", 1, 4),
++	FACTOR(CLK_TOP_UNIVPLL1_D8, "univpll1_d8", "univpll_d2", 1, 8),
++	FACTOR(CLK_TOP_UNIVPLL_D3, "univpll_d3", "univpll", 1, 3),
++	FACTOR(CLK_TOP_UNIVPLL2_D2, "univpll2_d2", "univpll", 1, 2),
++	FACTOR(CLK_TOP_UNIVPLL2_D4, "univpll2_d4", "univpll", 1, 4),
++	FACTOR(CLK_TOP_UNIVPLL2_D8, "univpll2_d8", "univpll", 1, 8),
++	FACTOR(CLK_TOP_UNIVPLL_D5, "univpll_d5", "univpll", 1, 5),
++	FACTOR(CLK_TOP_UNIVPLL3_D2, "univpll3_d2", "univpll_d5", 1, 2),
++	FACTOR(CLK_TOP_UNIVPLL3_D4, "univpll3_d4", "univpll_d5", 1, 4),
++	FACTOR(CLK_TOP_UNIVPLL3_D8, "univpll3_d8", "univpll_d5", 1, 8),
++	FACTOR(CLK_TOP_ULPOSC_CK_ORG, "ulposc_ck_org", "ulposc", 1, 1),
++	FACTOR(CLK_TOP_ULPOSC_CK, "ulposc_ck", "ulposc_ck_org", 1, 3),
++	FACTOR(CLK_TOP_ULPOSC_D2, "ulposc_d2", "ulposc_ck", 1, 2),
++	FACTOR(CLK_TOP_ULPOSC_D3, "ulposc_d3", "ulposc_ck", 1, 4),
++	FACTOR(CLK_TOP_ULPOSC_D4, "ulposc_d4", "ulposc_ck", 1, 8),
++	FACTOR(CLK_TOP_ULPOSC_D8, "ulposc_d8", "ulposc_ck", 1, 10),
++	FACTOR(CLK_TOP_ULPOSC_D10, "ulposc_d10", "ulposc_ck_org", 1, 1),
++	FACTOR(CLK_TOP_APLL1_CK, "apll1_ck", "apll1", 1, 1),
++	FACTOR(CLK_TOP_APLL2_CK, "apll2_ck", "apll2", 1, 1),
++	FACTOR(CLK_TOP_MFGPLL_CK, "mfgpll_ck", "mfgpll", 1, 1),
++	FACTOR(CLK_TOP_MFGPLL_D2, "mfgpll_d2", "mfgpll_ck", 1, 2),
++	FACTOR(CLK_TOP_IMGPLL_CK, "imgpll_ck", "imgpll", 1, 1),
++	FACTOR(CLK_TOP_IMGPLL_D2, "imgpll_d2", "imgpll_ck", 1, 2),
++	FACTOR(CLK_TOP_IMGPLL_D4, "imgpll_d4", "imgpll_ck", 1, 4),
++	FACTOR(CLK_TOP_CODECPLL_CK, "codecpll_ck", "codecpll", 1, 1),
++	FACTOR(CLK_TOP_CODECPLL_D2, "codecpll_d2", "codecpll_ck", 1, 2),
++	FACTOR(CLK_TOP_VDECPLL_CK, "vdecpll_ck", "vdecpll", 1, 1),
++	FACTOR(CLK_TOP_TVDPLL_CK, "tvdpll_ck", "tvdpll", 1, 1),
++	FACTOR(CLK_TOP_TVDPLL_D2, "tvdpll_d2", "tvdpll_ck", 1, 2),
++	FACTOR(CLK_TOP_TVDPLL_D4, "tvdpll_d4", "tvdpll_ck", 1, 4),
++	FACTOR(CLK_TOP_TVDPLL_D8, "tvdpll_d8", "tvdpll_ck", 1, 8),
++	FACTOR(CLK_TOP_TVDPLL_D16, "tvdpll_d16", "tvdpll_ck", 1, 16),
++	FACTOR(CLK_TOP_MSDCPLL_CK, "msdcpll_ck", "msdcpll", 1, 1),
++	FACTOR(CLK_TOP_MSDCPLL_D2, "msdcpll_d2", "msdcpll_ck", 1, 2),
++	FACTOR(CLK_TOP_MSDCPLL_D4, "msdcpll_d4", "msdcpll_ck", 1, 4),
++	FACTOR(CLK_TOP_MSDCPLL_D8, "msdcpll_d8", "msdcpll_ck", 1, 8),
++};
++
++static const char * const axi_parents[] = {
++	"clk26m",
++	"syspll_d7",
++	"ulposc_axi_ck_mux",
++};
++
++static const char * const ulposc_axi_ck_mux_parents[] = {
++	"syspll1_d4",
++	"ulposc_axi_ck_mux_pre",
++};
++
++static const char * const ulposc_axi_ck_mux_pre_parents[] = {
++	"ulposc_d2",
++	"ulposc_d3",
++};
++
++static const char * const ddrphycfg_parents[] = {
++	"clk26m",
++	"syspll3_d2",
++	"syspll2_d4",
++	"syspll1_d8",
++};
++
++static const char * const mm_parents[] = {
++	"clk26m",
++	"imgpll_ck",
++	"univpll1_d2",
++	"syspll1_d2",
++};
++
++static const char * const pwm_parents[] = {
++	"clk26m",
++	"univpll2_d4",
++	"ulposc_d2",
++	"ulposc_d3",
++	"ulposc_d8",
++	"ulposc_d10",
++	"ulposc_d4",
++};
++
++static const char * const vdec_parents[] = {
++	"clk26m",
++	"vdecpll_ck",
++	"imgpll_ck",
++	"syspll_d3",
++	"univpll_d5",
++	"clk26m",
++	"clk26m",
++};
++
++static const char * const venc_parents[] = {
++	"clk26m",
++	"codecpll_ck",
++	"syspll_d3",
++};
++
++static const char * const mfg_parents[] = {
++	"clk26m",
++	"mfgpll_ck",
++	"syspll_d3",
++	"univpll_d3",
++};
++
++static const char * const camtg[] = {
++	"clk26m",
++	"univpll_d26",
++	"univpll2_d2",
++};
++
++static const char * const uart_parents[] = {
++	"clk26m",
++	"univpll2_d8",
++};
++
++static const char * const spi_parents[] = {
++	"clk26m",
++	"syspll3_d2",
++	"syspll2_d4",
++	"ulposc_spi_ck_mux",
++};
++
++static const char * const ulposc_spi_ck_mux_parents[] = {
++	"ulposc_d2",
++	"ulposc_d3",
++};
++
++static const char * const usb20_parents[] = {
++	"clk26m",
++	"univpll1_d8",
++	"syspll4_d2",
++};
++
++static const char * const msdc50_0_hclk_parents[] = {
++	"clk26m",
++	"syspll1_d2",
++	"syspll2_d2",
++	"syspll4_d2",
++};
++
++static const char * const msdc50_0_parents[] = {
++	"clk26m",
++	"msdcpll",
++	"syspll_d3",
++	"univpll1_d4",
++	"syspll2_d2",
++	"syspll_d7",
++	"msdcpll_d2",
++	"univpll1_d2",
++	"univpll_d3",
++};
++
++static const char * const msdc30_1_parents[] = {
++	"clk26m",
++	"univpll2_d2",
++	"msdcpll_d2",
++	"univpll1_d4",
++	"syspll2_d2",
++	"syspll_d7",
++	"univpll_d7",
++};
++
++static const char * const msdc30_2_parents[] = {
++	"clk26m",
++	"univpll2_d8",
++	"syspll2_d8",
++	"syspll1_d8",
++	"msdcpll_d8",
++	"syspll3_d4",
++	"univpll_d26",
++};
++
++static const char * const audio_parents[] = {
++	"clk26m",
++	"syspll3_d4",
++	"syspll4_d4",
++	"syspll1_d16",
++};
++
++static const char * const aud_intbus_parents[] = {
++	"clk26m",
++	"syspll1_d4",
++	"syspll4_d2",
++};
++
++static const char * const pmicspi_parents[] = {
++	"clk26m",
++	"univpll_d26",
++	"syspll3_d4",
++	"syspll1_d8",
++	"ulposc_d4",
++	"ulposc_d8",
++	"syspll2_d8",
++};
++
++static const char * const scp_parents[] = {
++	"clk26m",
++	"syspll_d3",
++	"ulposc_ck",
++	"univpll_d5",
++};
++
++static const char * const atb_parents[] = {
++	"clk26m",
++	"syspll1_d2",
++	"syspll_d5",
++};
++
++static const char * const mjc_parents[] = {
++	"clk26m",
++	"imgpll_ck",
++	"univpll_d5",
++	"syspll1_d2",
++};
++
++static const char * const dpi0_parents[] = {
++	"clk26m",
++	"tvdpll_d2",
++	"tvdpll_d4",
++	"tvdpll_d8",
++	"tvdpll_d16",
++	"clk26m",
++	"clk26m",
++};
++
++static const char * const aud_1_parents[] = {
++	"clk26m",
++	"apll1_ck",
++};
++
++static const char * const aud_2_parents[] = {
++	"clk26m",
++	"apll2_ck",
++};
++
++static const char * const ssusb_top_sys_parents[] = {
++	"clk26m",
++	"univpll3_d2",
++};
++
++static const char * const spm_parents[] = {
++	"clk26m",
++	"syspll1_d8",
++};
++
++static const char * const bsi_spi_parents[] = {
++	"clk26m",
++	"syspll_d3_d3",
++	"syspll1_d4",
++	"syspll_d7",
++};
++
++static const char * const audio_h_parents[] = {
++	"clk26m",
++	"apll2_ck",
++	"apll1_ck",
++	"univpll_d7",
++};
++
++static const char * const mfg_52m_parents[] = {
++	"clk26m",
++	"univpll2_d8",
++	"univpll2_d4",
++	"univpll2_d4",
++};
++
++static const char * const anc_md32_parents[] = {
++	"clk26m",
++	"syspll1_d2",
++	"univpll_d5",
++};
++
++/*
++ * Clock mux ddrphycfg is needed by the DRAM controller. We mark it as
++ * critical as otherwise the system will hang after boot.
++ */
++static const struct mtk_composite top_muxes[] = {
++	MUX(CLK_TOP_MUX_ULPOSC_AXI_CK_MUX_PRE, "ulposc_axi_ck_mux_pre",
++	    ulposc_axi_ck_mux_pre_parents, 0x0040, 3, 1),
++	MUX(CLK_TOP_MUX_ULPOSC_AXI_CK_MUX, "ulposc_axi_ck_mux",
++	    ulposc_axi_ck_mux_parents, 0x0040, 2, 1),
++	MUX(CLK_TOP_MUX_AXI, "axi_sel", axi_parents,
++	    0x0040, 0, 2),
++	MUX_FLAGS(CLK_TOP_MUX_DDRPHYCFG, "ddrphycfg_sel", ddrphycfg_parents,
++		  0x0040, 16, 2, CLK_IS_CRITICAL | CLK_SET_RATE_PARENT),
++	MUX(CLK_TOP_MUX_MM, "mm_sel", mm_parents,
++	    0x0040, 24, 2),
++	MUX_GATE(CLK_TOP_MUX_PWM, "pwm_sel", pwm_parents, 0x0050, 0, 3, 7),
++	MUX_GATE(CLK_TOP_MUX_VDEC, "vdec_sel", vdec_parents, 0x0050, 8, 3, 15),
++	MUX_GATE(CLK_TOP_MUX_VENC, "venc_sel", venc_parents, 0x0050, 16, 2, 23),
++	MUX_GATE(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents, 0x0050, 24, 2, 31),
++	MUX_GATE(CLK_TOP_MUX_CAMTG, "camtg_sel", camtg, 0x0060, 0, 2, 7),
++	MUX_GATE(CLK_TOP_MUX_UART, "uart_sel", uart_parents, 0x0060, 8, 1, 15),
++	MUX_GATE(CLK_TOP_MUX_SPI, "spi_sel", spi_parents, 0x0060, 16, 2, 23),
++	MUX(CLK_TOP_MUX_ULPOSC_SPI_CK_MUX, "ulposc_spi_ck_mux",
++	    ulposc_spi_ck_mux_parents, 0x0060, 18, 1),
++	MUX_GATE(CLK_TOP_MUX_USB20, "usb20_sel", usb20_parents,
++		 0x0060, 24, 2, 31),
++	MUX(CLK_TOP_MUX_MSDC50_0_HCLK, "msdc50_0_hclk_sel",
++	    msdc50_0_hclk_parents, 0x0070, 8, 2),
++	MUX_GATE(CLK_TOP_MUX_MSDC50_0, "msdc50_0_sel", msdc50_0_parents,
++		 0x0070, 16, 4, 23),
++	MUX_GATE(CLK_TOP_MUX_MSDC30_1, "msdc30_1_sel", msdc30_1_parents,
++		 0x0070, 24, 3, 31),
++	MUX_GATE(CLK_TOP_MUX_MSDC30_2, "msdc30_2_sel", msdc30_2_parents,
++		 0x0080, 0, 3, 7),
++	MUX_GATE(CLK_TOP_MUX_AUDIO, "audio_sel", audio_parents,
++		 0x0080, 16, 2, 23),
++	MUX(CLK_TOP_MUX_AUD_INTBUS, "aud_intbus_sel", aud_intbus_parents,
++	    0x0080, 24, 2),
++	MUX(CLK_TOP_MUX_PMICSPI, "pmicspi_sel", pmicspi_parents,
++	    0x0090, 0, 3),
++	MUX(CLK_TOP_MUX_SCP, "scp_sel", scp_parents,
++	    0x0090, 8, 2),
++	MUX(CLK_TOP_MUX_ATB, "atb_sel", atb_parents,
++	    0x0090, 16, 2),
++	MUX_GATE(CLK_TOP_MUX_MJC, "mjc_sel", mjc_parents, 0x0090, 24, 2, 31),
++	MUX_GATE(CLK_TOP_MUX_DPI0, "dpi0_sel", dpi0_parents, 0x00A0, 0, 3, 7),
++	MUX_GATE(CLK_TOP_MUX_AUD_1, "aud_1_sel", aud_1_parents,
++		 0x00A0, 16, 1, 23),
++	MUX_GATE(CLK_TOP_MUX_AUD_2, "aud_2_sel", aud_2_parents,
++		 0x00A0, 24, 1, 31),
++	MUX(CLK_TOP_MUX_SSUSB_TOP_SYS, "ssusb_top_sys_sel",
++	    ssusb_top_sys_parents, 0x00B0, 8, 1),
++	MUX(CLK_TOP_MUX_SPM, "spm_sel", spm_parents,
++	    0x00C0, 0, 1),
++	MUX(CLK_TOP_MUX_BSI_SPI, "bsi_spi_sel", bsi_spi_parents,
++	    0x00C0, 8, 2),
++	MUX_GATE(CLK_TOP_MUX_AUDIO_H, "audio_h_sel", audio_h_parents,
++		 0x00C0, 16, 2, 23),
++	MUX_GATE(CLK_TOP_MUX_ANC_MD32, "anc_md32_sel", anc_md32_parents,
++		 0x00C0, 24, 2, 31),
++	MUX(CLK_TOP_MUX_MFG_52M, "mfg_52m_sel", mfg_52m_parents,
++	    0x0104, 1, 2),
++};
++
++static int mtk_topckgen_init(struct platform_device *pdev)
++{
++	struct clk_hw_onecell_data *clk_data;
++	void __iomem *base;
++	struct device_node *node = pdev->dev.of_node;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	clk_data = mtk_alloc_clk_data(CLK_TOP_NR);
++	if (!clk_data)
++		return -ENOMEM;
++
++	mtk_clk_register_factors(top_fixed_divs, ARRAY_SIZE(top_fixed_divs),
++				 clk_data);
++
++	mtk_clk_register_composites(&pdev->dev, top_muxes,
++				    ARRAY_SIZE(top_muxes), base,
++				    &mt6797_clk_lock, clk_data);
++
++	return of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
++}
++
++static const struct mtk_gate_regs infra0_cg_regs = {
++	.set_ofs = 0x0080,
++	.clr_ofs = 0x0084,
++	.sta_ofs = 0x0090,
++};
++
++static const struct mtk_gate_regs infra1_cg_regs = {
++	.set_ofs = 0x0088,
++	.clr_ofs = 0x008c,
++	.sta_ofs = 0x0094,
++};
++
++static const struct mtk_gate_regs infra2_cg_regs = {
++	.set_ofs = 0x00a8,
++	.clr_ofs = 0x00ac,
++	.sta_ofs = 0x00b0,
++};
++
++#define GATE_ICG0(_id, _name, _parent, _shift)				\
++	GATE_MTK(_id, _name, _parent, &infra0_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++#define GATE_ICG1(_id, _name, _parent, _shift)				\
++	GATE_MTK(_id, _name, _parent, &infra1_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++#define GATE_ICG1_FLAGS(_id, _name, _parent, _shift, _flags)		\
++	GATE_MTK_FLAGS(_id, _name, _parent, &infra1_cg_regs, _shift,	\
++		       &mtk_clk_gate_ops_setclr, _flags)
++
++#define GATE_ICG2(_id, _name, _parent, _shift)				\
++	GATE_MTK(_id, _name, _parent, &infra2_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++#define GATE_ICG2_FLAGS(_id, _name, _parent, _shift, _flags)		\
++	GATE_MTK_FLAGS(_id, _name, _parent, &infra2_cg_regs, _shift,	\
++		       &mtk_clk_gate_ops_setclr, _flags)
++
++/*
++ * Clock gates dramc and dramc_b are needed by the DRAM controller.
++ * We mark them as critical as otherwise the system will hang after boot.
++ */
++static const struct mtk_gate infra_clks[] = {
++	GATE_ICG0(CLK_INFRA_PMIC_TMR, "infra_pmic_tmr", "ulposc", 0),
++	GATE_ICG0(CLK_INFRA_PMIC_AP, "infra_pmic_ap", "pmicspi_sel", 1),
++	GATE_ICG0(CLK_INFRA_PMIC_MD, "infra_pmic_md", "pmicspi_sel", 2),
++	GATE_ICG0(CLK_INFRA_PMIC_CONN, "infra_pmic_conn", "pmicspi_sel", 3),
++	GATE_ICG0(CLK_INFRA_SCP, "infra_scp", "scp_sel", 4),
++	GATE_ICG0(CLK_INFRA_SEJ, "infra_sej", "axi_sel", 5),
++	GATE_ICG0(CLK_INFRA_APXGPT, "infra_apxgpt", "axi_sel", 6),
++	GATE_ICG0(CLK_INFRA_SEJ_13M, "infra_sej_13m", "clk26m", 7),
++	GATE_ICG0(CLK_INFRA_ICUSB, "infra_icusb", "usb20_sel", 8),
++	GATE_ICG0(CLK_INFRA_GCE, "infra_gce", "axi_sel", 9),
++	GATE_ICG0(CLK_INFRA_THERM, "infra_therm", "axi_sel", 10),
++	GATE_ICG0(CLK_INFRA_I2C0, "infra_i2c0", "axi_sel", 11),
++	GATE_ICG0(CLK_INFRA_I2C1, "infra_i2c1", "axi_sel", 12),
++	GATE_ICG0(CLK_INFRA_I2C2, "infra_i2c2", "axi_sel", 13),
++	GATE_ICG0(CLK_INFRA_I2C3, "infra_i2c3", "axi_sel", 14),
++	GATE_ICG0(CLK_INFRA_PWM_HCLK, "infra_pwm_hclk", "axi_sel", 15),
++	GATE_ICG0(CLK_INFRA_PWM1, "infra_pwm1", "axi_sel", 16),
++	GATE_ICG0(CLK_INFRA_PWM2, "infra_pwm2", "axi_sel", 17),
++	GATE_ICG0(CLK_INFRA_PWM3, "infra_pwm3", "axi_sel", 18),
++	GATE_ICG0(CLK_INFRA_PWM4, "infra_pwm4", "axi_sel", 19),
++	GATE_ICG0(CLK_INFRA_PWM, "infra_pwm", "axi_sel", 21),
++	GATE_ICG0(CLK_INFRA_UART0, "infra_uart0", "uart_sel", 22),
++	GATE_ICG0(CLK_INFRA_UART1, "infra_uart1", "uart_sel", 23),
++	GATE_ICG0(CLK_INFRA_UART2, "infra_uart2", "uart_sel", 24),
++	GATE_ICG0(CLK_INFRA_UART3, "infra_uart3", "uart_sel", 25),
++	GATE_ICG0(CLK_INFRA_MD2MD_CCIF_0, "infra_md2md_ccif_0", "axi_sel", 27),
++	GATE_ICG0(CLK_INFRA_MD2MD_CCIF_1, "infra_md2md_ccif_1", "axi_sel", 28),
++	GATE_ICG0(CLK_INFRA_MD2MD_CCIF_2, "infra_md2md_ccif_2", "axi_sel", 29),
++	GATE_ICG0(CLK_INFRA_FHCTL, "infra_fhctl", "clk26m", 30),
++	GATE_ICG0(CLK_INFRA_BTIF, "infra_btif", "axi_sel", 31),
++	GATE_ICG1(CLK_INFRA_MD2MD_CCIF_3, "infra_md2md_ccif_3", "axi_sel", 0),
++	GATE_ICG1(CLK_INFRA_SPI, "infra_spi", "spi_sel", 1),
++	GATE_ICG1(CLK_INFRA_MSDC0, "infra_msdc0", "msdc50_0_sel", 2),
++	GATE_ICG1(CLK_INFRA_MD2MD_CCIF_4, "infra_md2md_ccif_4", "axi_sel", 3),
++	GATE_ICG1(CLK_INFRA_MSDC1, "infra_msdc1", "msdc30_1_sel", 4),
++	GATE_ICG1(CLK_INFRA_MSDC2, "infra_msdc2", "msdc30_2_sel", 5),
++	GATE_ICG1(CLK_INFRA_MD2MD_CCIF_5, "infra_md2md_ccif_5", "axi_sel", 7),
++	GATE_ICG1(CLK_INFRA_GCPU, "infra_gcpu", "axi_sel", 8),
++	GATE_ICG1(CLK_INFRA_TRNG, "infra_trng", "axi_sel", 9),
++	GATE_ICG1(CLK_INFRA_AUXADC, "infra_auxadc", "clk26m", 10),
++	GATE_ICG1(CLK_INFRA_CPUM, "infra_cpum", "axi_sel", 11),
++	GATE_ICG1(CLK_INFRA_AP_C2K_CCIF_0, "infra_ap_c2k_ccif_0",
++		  "axi_sel", 12),
++	GATE_ICG1(CLK_INFRA_AP_C2K_CCIF_1, "infra_ap_c2k_ccif_1",
++		  "axi_sel", 13),
++	GATE_ICG1(CLK_INFRA_CLDMA, "infra_cldma", "axi_sel", 16),
++	GATE_ICG1(CLK_INFRA_DISP_PWM, "infra_disp_pwm", "pwm_sel", 17),
++	GATE_ICG1(CLK_INFRA_AP_DMA, "infra_ap_dma", "axi_sel", 18),
++	GATE_ICG1(CLK_INFRA_DEVICE_APC, "infra_device_apc", "axi_sel", 20),
++	GATE_ICG1(CLK_INFRA_L2C_SRAM, "infra_l2c_sram", "mm_sel", 22),
++	GATE_ICG1(CLK_INFRA_CCIF_AP, "infra_ccif_ap", "axi_sel", 23),
++	GATE_ICG1(CLK_INFRA_AUDIO, "infra_audio", "axi_sel", 25),
++	GATE_ICG1(CLK_INFRA_CCIF_MD, "infra_ccif_md", "axi_sel", 26),
++	GATE_ICG1_FLAGS(CLK_INFRA_DRAMC_F26M, "infra_dramc_f26m",
++			"clk26m", 31, CLK_IS_CRITICAL),
++	GATE_ICG2(CLK_INFRA_I2C4, "infra_i2c4", "axi_sel", 0),
++	GATE_ICG2(CLK_INFRA_I2C_APPM, "infra_i2c_appm", "axi_sel", 1),
++	GATE_ICG2(CLK_INFRA_I2C_GPUPM, "infra_i2c_gpupm", "axi_sel", 2),
++	GATE_ICG2(CLK_INFRA_I2C2_IMM, "infra_i2c2_imm", "axi_sel", 3),
++	GATE_ICG2(CLK_INFRA_I2C2_ARB, "infra_i2c2_arb", "axi_sel", 4),
++	GATE_ICG2(CLK_INFRA_I2C3_IMM, "infra_i2c3_imm", "axi_sel", 5),
++	GATE_ICG2(CLK_INFRA_I2C3_ARB, "infra_i2c3_arb", "axi_sel", 6),
++	GATE_ICG2(CLK_INFRA_I2C5, "infra_i2c5", "axi_sel", 7),
++	GATE_ICG2(CLK_INFRA_SYS_CIRQ, "infra_sys_cirq", "axi_sel", 8),
++	GATE_ICG2(CLK_INFRA_SPI1, "infra_spi1", "spi_sel", 10),
++	GATE_ICG2_FLAGS(CLK_INFRA_DRAMC_B_F26M, "infra_dramc_b_f26m",
++			"clk26m", 11, CLK_IS_CRITICAL),
++	GATE_ICG2(CLK_INFRA_ANC_MD32, "infra_anc_md32", "anc_md32_sel", 12),
++	GATE_ICG2(CLK_INFRA_ANC_MD32_32K, "infra_anc_md32_32k", "clk26m", 13),
++	GATE_ICG2(CLK_INFRA_DVFS_SPM1, "infra_dvfs_spm1", "axi_sel", 15),
++	GATE_ICG2(CLK_INFRA_AES_TOP0, "infra_aes_top0", "axi_sel", 16),
++	GATE_ICG2(CLK_INFRA_AES_TOP1, "infra_aes_top1", "axi_sel", 17),
++	GATE_ICG2(CLK_INFRA_SSUSB_BUS, "infra_ssusb_bus", "axi_sel", 18),
++	GATE_ICG2(CLK_INFRA_SPI2, "infra_spi2", "spi_sel", 19),
++	GATE_ICG2(CLK_INFRA_SPI3, "infra_spi3", "spi_sel", 20),
++	GATE_ICG2(CLK_INFRA_SPI4, "infra_spi4", "spi_sel", 21),
++	GATE_ICG2(CLK_INFRA_SPI5, "infra_spi5", "spi_sel", 22),
++	GATE_ICG2(CLK_INFRA_IRTX, "infra_irtx", "spi_sel", 23),
++	GATE_ICG2(CLK_INFRA_SSUSB_SYS, "infra_ssusb_sys",
++		  "ssusb_top_sys_sel", 24),
++	GATE_ICG2(CLK_INFRA_SSUSB_REF, "infra_ssusb_ref", "clk26m", 9),
++	GATE_ICG2(CLK_INFRA_AUDIO_26M, "infra_audio_26m", "clk26m", 26),
++	GATE_ICG2(CLK_INFRA_AUDIO_26M_PAD_TOP, "infra_audio_26m_pad_top",
++		  "clk26m", 27),
++	GATE_ICG2(CLK_INFRA_MODEM_TEMP_SHARE, "infra_modem_temp_share",
++		  "axi_sel", 28),
++	GATE_ICG2(CLK_INFRA_VAD_WRAP_SOC, "infra_vad_wrap_soc", "axi_sel", 29),
++	GATE_ICG2(CLK_INFRA_DRAMC_CONF, "infra_dramc_conf", "axi_sel", 30),
++	GATE_ICG2(CLK_INFRA_DRAMC_B_CONF, "infra_dramc_b_conf", "axi_sel", 31),
++	GATE_ICG1(CLK_INFRA_MFG_VCG, "infra_mfg_vcg", "mfg_52m_sel", 14),
++};
++
++static const struct mtk_fixed_factor infra_fixed_divs[] = {
++	FACTOR(CLK_INFRA_13M, "clk13m", "clk26m", 1, 2),
++};
++
++static struct clk_hw_onecell_data *infra_clk_data;
++
++static void mtk_infrasys_init_early(struct device_node *node)
++{
++	int r, i;
++
++	if (!infra_clk_data) {
++		infra_clk_data = mtk_alloc_clk_data(CLK_INFRA_NR);
++		if (!infra_clk_data)
++			return;
++
++		for (i = 0; i < CLK_INFRA_NR; i++)
++			infra_clk_data->hws[i] = ERR_PTR(-EPROBE_DEFER);
++	}
++
++	mtk_clk_register_factors(infra_fixed_divs, ARRAY_SIZE(infra_fixed_divs),
++				 infra_clk_data);
++
++	r = of_clk_add_hw_provider(node, of_clk_hw_onecell_get,
++				   infra_clk_data);
++	if (r)
++		pr_err("%s(): could not register clock provider: %d\n",
++		       __func__, r);
++}
++
++CLK_OF_DECLARE_DRIVER(mtk_infra, "mediatek,mt6797-infracfg",
++		      mtk_infrasys_init_early);
++
++/*
++ * INFRACFG_AO software resets, set/clear register pairs (vendor
++ * INFRA_GLOBALCON_RST_n_SET/_CLR). Reset id = 32 * bank + bit, see
++ * include/dt-bindings/reset/mt6797-resets.h.
++ */
++static u16 infra_rst_ofs[] = {
++	INFRA_RST0_SET_OFFSET,
++	INFRA_RST1_SET_OFFSET,
++	INFRA_RST2_SET_OFFSET,
++	INFRA_RST3_SET_OFFSET,
++};
++
++static const struct mtk_clk_rst_desc infra_rst_desc = {
++	.version = MTK_RST_SET_CLR,
++	.rst_bank_ofs = infra_rst_ofs,
++	.rst_bank_nr = ARRAY_SIZE(infra_rst_ofs),
++};
++
++static int mtk_infrasys_init(struct platform_device *pdev)
++{
++	int i, r;
++	struct device_node *node = pdev->dev.of_node;
++
++	if (!infra_clk_data) {
++		infra_clk_data = mtk_alloc_clk_data(CLK_INFRA_NR);
++		if (!infra_clk_data)
++			return -ENOMEM;
++	} else {
++		for (i = 0; i < CLK_INFRA_NR; i++) {
++			if (infra_clk_data->hws[i] == ERR_PTR(-EPROBE_DEFER))
++				infra_clk_data->hws[i] = ERR_PTR(-ENOENT);
++		}
++	}
++
++	mtk_clk_register_gates(&pdev->dev, node, infra_clks,
++			       ARRAY_SIZE(infra_clks), infra_clk_data);
++	mtk_clk_register_factors(infra_fixed_divs, ARRAY_SIZE(infra_fixed_divs),
++				 infra_clk_data);
++
++	r = of_clk_add_hw_provider(node, of_clk_hw_onecell_get,
++				   infra_clk_data);
++	if (r)
++		return r;
++
++	/* Clocks are live by now: a reset-controller failure must not undo them */
++	r = mtk_register_reset_controller_with_dev(&pdev->dev, &infra_rst_desc);
++	if (r)
++		dev_warn(&pdev->dev, "reset controller not registered: %d\n", r);
++
++	return 0;
++}
++
++#define MT6797_PLL_FMAX		(3000UL * MHZ)
++
++#define CON0_MT6797_RST_BAR	BIT(24)
++
++#define PLL_B(_id, _name, _reg, _pwr_reg, _en_mask, _flags, _pcwbits,	\
++			_pd_reg, _pd_shift, _tuner_reg, _pcw_reg,	\
++			_pcw_shift, _div_table) {			\
++	.id = _id,						\
++	.name = _name,						\
++	.reg = _reg,						\
++	.pwr_reg = _pwr_reg,					\
++	.en_mask = _en_mask,					\
++	.flags = _flags,					\
++	.rst_bar_mask = CON0_MT6797_RST_BAR,			\
++	.fmax = MT6797_PLL_FMAX,				\
++	.pcwbits = _pcwbits,					\
++	.pd_reg = _pd_reg,					\
++	.pd_shift = _pd_shift,					\
++	.tuner_reg = _tuner_reg,				\
++	.pcw_reg = _pcw_reg,					\
++	.pcw_shift = _pcw_shift,				\
++	.div_table = _div_table,				\
++}
++
++#define PLL(_id, _name, _reg, _pwr_reg, _en_mask, _flags, _pcwbits,	\
++			_pd_reg, _pd_shift, _tuner_reg, _pcw_reg,	\
++			_pcw_shift)					\
++		PLL_B(_id, _name, _reg, _pwr_reg, _en_mask, _flags, _pcwbits, \
++			_pd_reg, _pd_shift, _tuner_reg, _pcw_reg, _pcw_shift, \
++			NULL)
++
++static const struct mtk_pll_data plls[] = {
++	PLL(CLK_APMIXED_MAINPLL, "mainpll", 0x0220, 0x022C, 0xF0000100, PLL_AO,
++	    21, 0x220, 4, 0x0, 0x224, 0),
++	PLL(CLK_APMIXED_UNIVPLL, "univpll", 0x0230, 0x023C, 0xFE000010, 0, 7,
++	    0x230, 4, 0x0, 0x234, 14),
++	PLL(CLK_APMIXED_MFGPLL, "mfgpll", 0x0240, 0x024C, 0x00000100, 0, 21,
++	    0x244, 24, 0x0, 0x244, 0),
++	PLL(CLK_APMIXED_MSDCPLL, "msdcpll", 0x0250, 0x025C, 0x00000120, 0, 21,
++	    0x250, 4, 0x0, 0x254, 0),
++	PLL(CLK_APMIXED_IMGPLL, "imgpll", 0x0260, 0x026C, 0x00000120, 0, 21,
++	    0x260, 4, 0x0, 0x264, 0),
++	PLL(CLK_APMIXED_TVDPLL, "tvdpll", 0x0270, 0x027C, 0xC0000120, 0, 21,
++	    0x270, 4, 0x0, 0x274, 0),
++	PLL(CLK_APMIXED_CODECPLL, "codecpll", 0x0290, 0x029C, 0x00000120, 0, 21,
++	    0x290, 4, 0x0, 0x294, 0),
++	PLL(CLK_APMIXED_VDECPLL, "vdecpll", 0x02E4, 0x02F0, 0x00000120, 0, 21,
++	    0x2E4, 4, 0x0, 0x2E8, 0),
++	PLL(CLK_APMIXED_APLL1, "apll1", 0x02A0, 0x02B0, 0x00000130, 0, 31,
++	    0x2A0, 4, 0x2A8, 0x2A4, 0),
++	PLL(CLK_APMIXED_APLL2, "apll2", 0x02B4, 0x02C4, 0x00000130, 0, 31,
++	    0x2B4, 4, 0x2BC, 0x2B8, 0),
++};
++
++static int mtk_apmixedsys_init(struct platform_device *pdev)
++{
++	struct clk_hw_onecell_data *clk_data;
++	struct device_node *node = pdev->dev.of_node;
++
++	clk_data = mtk_alloc_clk_data(CLK_APMIXED_NR);
++	if (!clk_data)
++		return -ENOMEM;
++
++	mtk_clk_register_plls(node, plls, ARRAY_SIZE(plls), clk_data);
++
++	return of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
++}
++
++static const struct of_device_id of_match_clk_mt6797[] = {
++	{
++		.compatible = "mediatek,mt6797-topckgen",
++		.data = mtk_topckgen_init,
++	}, {
++		.compatible = "mediatek,mt6797-infracfg",
++		.data = mtk_infrasys_init,
++	}, {
++		.compatible = "mediatek,mt6797-apmixedsys",
++		.data = mtk_apmixedsys_init,
++	}, {
++		/* sentinel */
++	}
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6797);
++
++static int clk_mt6797_probe(struct platform_device *pdev)
++{
++	int (*clk_init)(struct platform_device *);
++	int r;
++
++	clk_init = of_device_get_match_data(&pdev->dev);
++	if (!clk_init)
++		return -EINVAL;
++
++	r = clk_init(pdev);
++	if (r)
++		dev_err(&pdev->dev,
++			"could not register clock provider: %s: %d\n",
++			pdev->name, r);
++
++	return r;
++}
++
++static struct platform_driver clk_mt6797_drv = {
++	.probe = clk_mt6797_probe,
++	.driver = {
++		.name = "clk-mt6797",
++		.of_match_table = of_match_clk_mt6797,
++	},
++};
++
++static int __init clk_mt6797_init(void)
++{
++	return platform_driver_register(&clk_mt6797_drv);
++}
++
++arch_initcall(clk_mt6797_init);
++MODULE_LICENSE("GPL");
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/nvmem/Kconfig b/devices/planet-geminipda/kernel/delta/drivers/nvmem/Kconfig
+new file mode 100644
+index 0000000..ad3d5c9
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/drivers/nvmem/Kconfig
+@@ -0,0 +1,434 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menuconfig NVMEM
++	bool "NVMEM Support"
++	help
++	  Support for NVMEM(Non Volatile Memory) devices like EEPROM, EFUSES...
++
++	  This framework is designed to provide a generic interface to NVMEM
++	  from both the Linux Kernel and the userspace.
++
++	  If unsure, say no.
++
++if NVMEM
++
++config NVMEM_SYSFS
++	bool "/sys/bus/nvmem/devices/*/nvmem (sysfs interface)"
++	depends on SYSFS
++	default y
++	help
++	 Say Y here to add a sysfs interface for NVMEM.
++
++	 This interface is mostly used by userspace applications to
++	 read/write directly into nvmem.
++
++# Layouts
++
++source "drivers/nvmem/layouts/Kconfig"
++
++# Devices
++
++config NVMEM_APPLE_EFUSES
++	tristate "Apple eFuse support"
++	depends on ARCH_APPLE || COMPILE_TEST
++	default ARCH_APPLE
++	help
++	  Say y here to enable support for reading eFuses on Apple SoCs
++	  such as the M1. These are e.g. used to store factory programmed
++	  calibration data required for the PCIe or the USB-C PHY.
++
++	  This driver can also be built as a module. If so, the module will
++	  be called nvmem-apple-efuses.
++
++config NVMEM_BCM_OCOTP
++	tristate "Broadcom On-Chip OTP Controller support"
++	depends on ARCH_BCM_IPROC || COMPILE_TEST
++	depends on HAS_IOMEM
++	default ARCH_BCM_IPROC
++	help
++	  Say y here to enable read/write access to the Broadcom OTP
++	  controller.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-bcm-ocotp.
++
++config NVMEM_BRCM_NVRAM
++	tristate "Broadcom's NVRAM support"
++	depends on ARCH_BCM_5301X || COMPILE_TEST
++	depends on HAS_IOMEM
++	select GENERIC_NET_UTILS
++	help
++	  This driver provides support for Broadcom's NVRAM that can be accessed
++	  using I/O mapping.
++
++config NVMEM_IMX_IIM
++	tristate "i.MX IC Identification Module support"
++	depends on ARCH_MXC || COMPILE_TEST
++	help
++	  This is a driver for the IC Identification Module (IIM) available on
++	  i.MX SoCs, providing access to 4 Kbits of programmable
++	  eFuses.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-imx-iim.
++
++config NVMEM_IMX_OCOTP
++	tristate "i.MX 6/7/8 On-Chip OTP Controller support"
++	depends on ARCH_MXC || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a driver for the On-Chip OTP Controller (OCOTP) available on
++	  i.MX6 SoCs, providing access to 4 Kbits of one-time programmable
++	  eFuses.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-imx-ocotp.
++
++config NVMEM_IMX_OCOTP_ELE
++	tristate "i.MX On-Chip OTP Controller support"
++	depends on ARCH_MXC || COMPILE_TEST
++	depends on HAS_IOMEM
++	depends on OF
++	help
++	  This is a driver for the On-Chip OTP Controller (OCOTP)
++	  available on i.MX SoCs which has ELE.
++
++config NVMEM_IMX_OCOTP_SCU
++	tristate "i.MX8 SCU On-Chip OTP Controller support"
++	depends on IMX_SCU
++	depends on HAVE_ARM_SMCCC
++	help
++	  This is a driver for the SCU On-Chip OTP Controller (OCOTP)
++	  available on i.MX8 SoCs.
++
++config NVMEM_JZ4780_EFUSE
++	tristate "JZ4780 EFUSE Memory Support"
++	depends on MACH_INGENIC || COMPILE_TEST
++	depends on HAS_IOMEM
++	depends on OF
++	select REGMAP_MMIO
++	help
++	  Say Y here to include support for JZ4780 efuse memory found on
++	  all JZ4780 SoC based devices.
++	  To compile this driver as a module, choose M here: the module
++	  will be called nvmem_jz4780_efuse.
++
++config NVMEM_LAN9662_OTPC
++	tristate "Microchip LAN9662 OTP controller support"
++	depends on SOC_LAN966 || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This driver enables the OTP controller available on Microchip LAN9662
++	  SoCs. It controls the access to the OTP memory connected to it.
++
++config NVMEM_LAYERSCAPE_SFP
++	tristate "Layerscape SFP (Security Fuse Processor) support"
++	depends on ARCH_LAYERSCAPE || COMPILE_TEST
++	depends on HAS_IOMEM
++	select REGMAP_MMIO
++	help
++	  This driver provides support to read the eFuses on Freescale
++	  Layerscape SoC's. For example, the vendor provides a per part
++	  unique ID there.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called layerscape-sfp.
++
++config NVMEM_LPC18XX_EEPROM
++	tristate "NXP LPC18XX EEPROM Memory Support"
++	depends on ARCH_LPC18XX || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  Say Y here to include support for NXP LPC18xx EEPROM memory found in
++	  NXP LPC185x/3x and LPC435x/3x/2x/1x devices.
++	  To compile this driver as a module, choose M here: the module
++	  will be called nvmem_lpc18xx_eeprom.
++
++config NVMEM_LPC18XX_OTP
++	tristate "NXP LPC18XX OTP Memory Support"
++	depends on ARCH_LPC18XX || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  Say Y here to include support for NXP LPC18xx OTP memory found on
++	  all LPC18xx and LPC43xx devices.
++	  To compile this driver as a module, choose M here: the module
++	  will be called nvmem_lpc18xx_otp.
++
++config NVMEM_MESON_EFUSE
++	tristate "Amlogic Meson GX eFuse Support"
++	depends on (ARCH_MESON || COMPILE_TEST) && MESON_SM
++	help
++	  This is a driver to retrieve specific values from the eFuse found on
++	  the Amlogic Meson GX SoCs.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_meson_efuse.
++
++config NVMEM_MESON_MX_EFUSE
++	tristate "Amlogic Meson6/Meson8/Meson8b eFuse Support"
++	depends on ARCH_MESON || COMPILE_TEST
++	help
++	  This is a driver to retrieve specific values from the eFuse found on
++	  the Amlogic Meson6, Meson8 and Meson8b SoCs.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_meson_mx_efuse.
++
++config NVMEM_MICROCHIP_OTPC
++	tristate "Microchip OTPC support"
++	depends on ARCH_AT91 || COMPILE_TEST
++	help
++	  This driver enable the OTP controller available on Microchip SAMA7G5
++	  SoCs. It controls the access to the OTP memory connected to it.
++
++config NVMEM_MTK_EFUSE
++	tristate "Mediatek SoCs EFUSE support"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a driver to access hardware related data like sensor
++	  calibration, HDMI impedance etc.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called efuse-mtk.
++
++config NVMEM_MTK_LK_DEVINFO
++	tristate "MediaTek LK devinfo (efuse copy) support"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on OF
++	help
++	  Expose the efuse "devinfo" words that the MediaTek LK bootloader
++	  passes in /chosen/atag,devinfo as a read-only NVMEM device, so
++	  drivers can get their calibration data (e.g. the MT6797 thermal
++	  sensor calibration) the way the vendor kernel does, without
++	  mapping the efuse block.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_mtk-lk-devinfo.
++
++config NVMEM_MXS_OCOTP
++	tristate "Freescale MXS On-Chip OTP Memory Support"
++	depends on ARCH_MXS || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  If you say Y here, you will get readonly access to the
++	  One Time Programmable memory pages that are stored
++	  on the Freescale i.MX23/i.MX28 processor.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-mxs-ocotp.
++
++config NVMEM_NINTENDO_OTP
++	tristate "Nintendo Wii and Wii U OTP Support"
++	depends on WII || COMPILE_TEST
++	help
++	  This is a driver exposing the OTP of a Nintendo Wii or Wii U console.
++
++	  This memory contains common and per-console keys, signatures and
++	  related data required to access peripherals.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-nintendo-otp.
++
++config NVMEM_QCOM_QFPROM
++	tristate "QCOM QFPROM Support"
++	depends on ARCH_QCOM || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  Say y here to enable QFPROM support. The QFPROM provides access
++	  functions for QFPROM data to rest of the drivers via nvmem interface.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_qfprom.
++
++config NVMEM_QCOM_SEC_QFPROM
++        tristate "QCOM SECURE QFPROM Support"
++        depends on ARCH_QCOM || COMPILE_TEST
++        depends on HAS_IOMEM
++        depends on OF
++        select QCOM_SCM
++        help
++          Say y here to enable secure QFPROM support. The secure QFPROM provides access
++          functions for QFPROM data to rest of the drivers via nvmem interface.
++
++          This driver can also be built as a module. If so, the module will be called
++          nvmem_sec_qfprom.
++
++config NVMEM_RAVE_SP_EEPROM
++	tristate "Rave SP EEPROM Support"
++	depends on RAVE_SP_CORE
++	help
++	  Say y here to enable Rave SP EEPROM support.
++
++config NVMEM_RMEM
++	tristate "Reserved Memory Based Driver Support"
++	depends on HAS_IOMEM
++	help
++	  This driver maps reserved memory into an nvmem device. It might be
++	  useful to expose information left by firmware in memory.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-rmem.
++
++config NVMEM_ROCKCHIP_EFUSE
++	tristate "Rockchip eFuse Support"
++	depends on ARCH_ROCKCHIP || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a simple driver to dump specified values of Rockchip SoC
++	  from eFuse, such as cpu-leakage.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_rockchip_efuse.
++
++config NVMEM_ROCKCHIP_OTP
++	tristate "Rockchip OTP controller support"
++	depends on ARCH_ROCKCHIP || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a simple driver to dump specified values of Rockchip SoC
++	  from OTP, such as cpu-leakage.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_rockchip_otp.
++
++config NVMEM_SC27XX_EFUSE
++	tristate "Spreadtrum SC27XX eFuse Support"
++	depends on MFD_SC27XX_PMIC || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a simple driver to dump specified values of Spreadtrum
++	  SC27XX PMICs from eFuse.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-sc27xx-efuse.
++
++config NVMEM_SNVS_LPGPR
++	tristate "Support for Low Power General Purpose Register"
++	depends on ARCH_MXC || COMPILE_TEST
++	help
++	  This is a driver for Low Power General Purpose Register (LPGPR) available on
++	  i.MX6 and i.MX7 SoCs in Secure Non-Volatile Storage (SNVS) of this chip.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-snvs-lpgpr.
++
++config NVMEM_SPMI_SDAM
++	tristate "SPMI SDAM Support"
++	depends on SPMI
++	help
++	  This driver supports the Shared Direct Access Memory Module on
++	  Qualcomm Technologies, Inc. PMICs. It provides the clients
++	  an interface to read/write to the SDAM module's shared memory.
++
++config NVMEM_SPRD_EFUSE
++	tristate "Spreadtrum SoC eFuse Support"
++	depends on ARCH_SPRD || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a simple driver to dump specified values of Spreadtrum
++	  SoCs from eFuse.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-sprd-efuse.
++
++config NVMEM_STM32_BSEC_OPTEE_TA
++	def_bool NVMEM_STM32_ROMEM && OPTEE
++	help
++	  Say y here to enable the accesses to STM32MP SoC OTPs by the OP-TEE
++	  trusted application STM32MP BSEC.
++
++	  This library is a used by stm32-romem driver or included in the module
++	  called nvmem-stm32-romem.
++
++config NVMEM_STM32_ROMEM
++	tristate "STMicroelectronics STM32 factory-programmed memory support"
++	depends on ARCH_STM32 || COMPILE_TEST
++	depends on OPTEE || !OPTEE
++	help
++	  Say y here to enable read-only access for STMicroelectronics STM32
++	  factory-programmed memory area.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-stm32-romem.
++
++config NVMEM_SUNPLUS_OCOTP
++	tristate "Sunplus SoC OTP support"
++	depends on SOC_SP7021 || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a driver for the On-chip OTP controller (OCOTP) available
++	  on Sunplus SoCs. It provides access to 128 bytes of one-time
++	  programmable eFuse.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-sunplus-ocotp.
++
++config NVMEM_SUNXI_SID
++	tristate "Allwinner SoCs SID support"
++	depends on ARCH_SUNXI
++	help
++	  This is a driver for the 'security ID' available on various Allwinner
++	  devices.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_sunxi_sid.
++
++config NVMEM_U_BOOT_ENV
++	tristate "U-Boot environment variables support"
++	depends on OF && MTD
++	select CRC32
++	select GENERIC_NET_UTILS
++	help
++	  U-Boot stores its setup as environment variables. This driver adds
++	  support for verifying & exporting such data. It also exposes variables
++	  as NVMEM cells so they can be referenced by other drivers.
++
++	  Currently this drivers works only with env variables on top of MTD.
++
++	  If compiled as module it will be called nvmem_u-boot-env.
++
++config NVMEM_UNIPHIER_EFUSE
++	tristate "UniPhier SoCs eFuse support"
++	depends on ARCH_UNIPHIER || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a simple driver to dump specified values of UniPhier SoC
++	  from eFuse.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-uniphier-efuse.
++
++config NVMEM_VF610_OCOTP
++	tristate "VF610 SoC OCOTP support"
++	depends on SOC_VF610 || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a driver for the 'OCOTP' peripheral available on Vybrid
++	  devices like VF5xx and VF6xx.
++
++	  This driver can also be build as a module. If so, the module will
++	  be called nvmem-vf610-ocotp.
++
++config NVMEM_ZYNQMP
++	tristate "Xilinx ZYNQMP SoC nvmem firmware support"
++	depends on ARCH_ZYNQMP
++	help
++	  This is a driver to access hardware related data like
++	  soc revision, IDCODE... etc by using the firmware
++	  interface.
++
++	  If sure, say yes. If unsure, say no.
++
++config NVMEM_QORIQ_EFUSE
++	tristate "NXP QorIQ eFuse support"
++	depends on PPC_85xx || COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This driver provides read support for the eFuses (SFP) on NXP QorIQ
++	  series SoC's. This includes secure boot settings, the globally unique
++	  NXP ID 'FUIDR' and the OEM unique ID 'OUIDR'.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem_qoriq_efuse.
++
++endif
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/nvmem/Makefile b/devices/planet-geminipda/kernel/delta/drivers/nvmem/Makefile
+new file mode 100644
+index 0000000..0a53bb1
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/drivers/nvmem/Makefile
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for nvmem drivers.
++#
++
++obj-$(CONFIG_NVMEM)		+= nvmem_core.o
++nvmem_core-y			:= core.o
++obj-y				+= layouts/
++
++# Devices
++obj-$(CONFIG_NVMEM_APPLE_EFUSES)	+= nvmem-apple-efuses.o
++nvmem-apple-efuses-y 			:= apple-efuses.o
++obj-$(CONFIG_NVMEM_BCM_OCOTP)		+= nvmem-bcm-ocotp.o
++nvmem-bcm-ocotp-y			:= bcm-ocotp.o
++obj-$(CONFIG_NVMEM_BRCM_NVRAM)		+= nvmem_brcm_nvram.o
++nvmem_brcm_nvram-y			:= brcm_nvram.o
++obj-$(CONFIG_NVMEM_IMX_IIM)		+= nvmem-imx-iim.o
++nvmem-imx-iim-y				:= imx-iim.o
++obj-$(CONFIG_NVMEM_IMX_OCOTP)		+= nvmem-imx-ocotp.o
++nvmem-imx-ocotp-y			:= imx-ocotp.o
++obj-$(CONFIG_NVMEM_IMX_OCOTP_ELE)	+= nvmem-imx-ocotp-ele.o
++nvmem-imx-ocotp-ele-y			:= imx-ocotp-ele.o
++obj-$(CONFIG_NVMEM_IMX_OCOTP_SCU)	+= nvmem-imx-ocotp-scu.o
++nvmem-imx-ocotp-scu-y			:= imx-ocotp-scu.o
++obj-$(CONFIG_NVMEM_JZ4780_EFUSE)	+= nvmem_jz4780_efuse.o
++nvmem_jz4780_efuse-y			:= jz4780-efuse.o
++obj-$(CONFIG_NVMEM_LAN9662_OTPC)	+= nvmem-lan9662-otpc.o
++nvmem-lan9662-otpc-y		:= lan9662-otpc.o
++obj-$(CONFIG_NVMEM_LAYERSCAPE_SFP)	+= nvmem-layerscape-sfp.o
++nvmem-layerscape-sfp-y			:= layerscape-sfp.o
++obj-$(CONFIG_NVMEM_LPC18XX_EEPROM)	+= nvmem_lpc18xx_eeprom.o
++nvmem_lpc18xx_eeprom-y			:= lpc18xx_eeprom.o
++obj-$(CONFIG_NVMEM_LPC18XX_OTP)		+= nvmem_lpc18xx_otp.o
++nvmem_lpc18xx_otp-y			:= lpc18xx_otp.o
++obj-$(CONFIG_NVMEM_MESON_EFUSE)		+= nvmem_meson_efuse.o
++nvmem_meson_efuse-y			:= meson-efuse.o
++obj-$(CONFIG_NVMEM_MESON_MX_EFUSE)	+= nvmem_meson_mx_efuse.o
++nvmem_meson_mx_efuse-y			:= meson-mx-efuse.o
++obj-$(CONFIG_NVMEM_MICROCHIP_OTPC)	+= nvmem-microchip-otpc.o
++nvmem-microchip-otpc-y			:= microchip-otpc.o
++obj-$(CONFIG_NVMEM_MTK_EFUSE)		+= nvmem_mtk-efuse.o
++nvmem_mtk-efuse-y			:= mtk-efuse.o
++obj-$(CONFIG_NVMEM_MTK_LK_DEVINFO)	+= nvmem_mtk-lk-devinfo.o
++nvmem_mtk-lk-devinfo-y			:= mtk-lk-devinfo.o
++obj-$(CONFIG_NVMEM_MXS_OCOTP)		+= nvmem-mxs-ocotp.o
++nvmem-mxs-ocotp-y			:= mxs-ocotp.o
++obj-$(CONFIG_NVMEM_NINTENDO_OTP)	+= nvmem-nintendo-otp.o
++nvmem-nintendo-otp-y			:= nintendo-otp.o
++obj-$(CONFIG_NVMEM_QCOM_QFPROM)		+= nvmem_qfprom.o
++nvmem_qfprom-y				:= qfprom.o
++obj-$(CONFIG_NVMEM_QCOM_SEC_QFPROM)	+= nvmem_sec_qfprom.o
++nvmem_sec_qfprom-y			:= sec-qfprom.o
++obj-$(CONFIG_NVMEM_RAVE_SP_EEPROM)	+= nvmem-rave-sp-eeprom.o
++nvmem-rave-sp-eeprom-y			:= rave-sp-eeprom.o
++obj-$(CONFIG_NVMEM_RMEM) 		+= nvmem-rmem.o
++nvmem-rmem-y				:= rmem.o
++obj-$(CONFIG_NVMEM_ROCKCHIP_EFUSE)	+= nvmem_rockchip_efuse.o
++nvmem_rockchip_efuse-y			:= rockchip-efuse.o
++obj-$(CONFIG_NVMEM_ROCKCHIP_OTP)	+= nvmem-rockchip-otp.o
++nvmem-rockchip-otp-y			:= rockchip-otp.o
++obj-$(CONFIG_NVMEM_SC27XX_EFUSE)	+= nvmem-sc27xx-efuse.o
++nvmem-sc27xx-efuse-y			:= sc27xx-efuse.o
++obj-$(CONFIG_NVMEM_SNVS_LPGPR)		+= nvmem_snvs_lpgpr.o
++nvmem_snvs_lpgpr-y			:= snvs_lpgpr.o
++obj-$(CONFIG_NVMEM_SPMI_SDAM)		+= nvmem_qcom-spmi-sdam.o
++nvmem_qcom-spmi-sdam-y			+= qcom-spmi-sdam.o
++obj-$(CONFIG_NVMEM_SPRD_EFUSE)		+= nvmem_sprd_efuse.o
++nvmem_sprd_efuse-y			:= sprd-efuse.o
++obj-$(CONFIG_NVMEM_STM32_ROMEM)		+= nvmem_stm32_romem.o
++nvmem_stm32_romem-y 			:= stm32-romem.o
++nvmem_stm32_romem-$(CONFIG_NVMEM_STM32_BSEC_OPTEE_TA) += stm32-bsec-optee-ta.o
++obj-$(CONFIG_NVMEM_SUNPLUS_OCOTP)	+= nvmem_sunplus_ocotp.o
++nvmem_sunplus_ocotp-y			:= sunplus-ocotp.o
++obj-$(CONFIG_NVMEM_SUNXI_SID)		+= nvmem_sunxi_sid.o
++nvmem_sunxi_sid-y			:= sunxi_sid.o
++obj-$(CONFIG_NVMEM_U_BOOT_ENV)		+= nvmem_u-boot-env.o
++nvmem_u-boot-env-y			:= u-boot-env.o
++obj-$(CONFIG_NVMEM_UNIPHIER_EFUSE)	+= nvmem-uniphier-efuse.o
++nvmem-uniphier-efuse-y			:= uniphier-efuse.o
++obj-$(CONFIG_NVMEM_VF610_OCOTP)		+= nvmem-vf610-ocotp.o
++nvmem-vf610-ocotp-y			:= vf610-ocotp.o
++obj-$(CONFIG_NVMEM_ZYNQMP)		+= nvmem_zynqmp_nvmem.o
++nvmem_zynqmp_nvmem-y			:= zynqmp_nvmem.o
++obj-$(CONFIG_NVMEM_QORIQ_EFUSE)		+= nvmem-qoriq-efuse.o
++nvmem-qoriq-efuse-y			:= qoriq-efuse.o
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/nvmem/mtk-lk-devinfo.c b/devices/planet-geminipda/kernel/delta/drivers/nvmem/mtk-lk-devinfo.c
+new file mode 100644
+index 0000000..d3317fb
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/drivers/nvmem/mtk-lk-devinfo.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek LK "devinfo" handoff as a read-only NVMEM device.
++ *
++ * The MediaTek LK bootloader (MT6797 and relatives) copies the efuse
++ * "devinfo" words it read at boot into the device tree it hands to the
++ * kernel, as /chosen/atag,devinfo (lk/platform/mt6797/atags.c,
++ * target_atag_devinfo_data()). The property is an opaque little-endian
++ * word array, not a DT cell array:
++ *
++ *   word 0          ATAG size in words (= payload + 3)
++ *   word 1          tag 0x41000804
++ *   word 2 .. n+1   payload: get_devinfo_with_index(0 .. n-1)
++ *   word n+2        payload count n
++ *
++ * The vendor kernel reads its calibration (thermal, PTP/EEM, speed bin)
++ * through get_devinfo_with_index(), i.e. from this copy, and never maps
++ * the efuse block itself. This driver exposes the payload as an NVMEM
++ * device: byte offset = 4 * devinfo index, so DT cells can name the
++ * words they need (e.g. thermal calibration = indexes 31..33 =
++ * reg <0x7c 0xc>, the efuse words at 0x10206180..0x10206188).
++ *
++ * Idea and the LK wire format as recovered by the gemini-pda-mainline
++ * project (github.com/ixoo/gemini-pda-mainline,
++ * experiments/2026-07-13-mt6797-thermal-recovery).
++ */
++
++#include <linux/module.h>
++#include <linux/nvmem-provider.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <asm/unaligned.h>
++
++#define LK_DEVINFO_TAG		0x41000804
++#define LK_DEVINFO_OVERHEAD	3	/* size + tag + trailing count */
++
++struct mtk_lk_devinfo {
++	u32 *words;
++	unsigned int count;
++};
++
++static int mtk_lk_devinfo_read(void *context, unsigned int offset,
++			       void *val, size_t bytes)
++{
++	struct mtk_lk_devinfo *di = context;
++	size_t size = di->count * sizeof(u32);
++
++	if (offset >= size || bytes > size - offset)
++		return -EINVAL;
++
++	memcpy(val, (u8 *)di->words + offset, bytes);
++
++	return 0;
++}
++
++static int mtk_lk_devinfo_parse(struct device *dev, struct mtk_lk_devinfo *di)
++{
++	struct device_node *chosen;
++	const u8 *prop;
++	unsigned int words, count, i;
++	int len, ret = 0;
++
++	chosen = of_find_node_by_path("/chosen");
++	if (!chosen)
++		return -ENODEV;
++
++	prop = of_get_property(chosen, "atag,devinfo", &len);
++	if (!prop) {
++		ret = dev_err_probe(dev, -ENODEV, "no /chosen/atag,devinfo\n");
++		goto out;
++	}
++
++	words = len / sizeof(u32);
++	if (len % sizeof(u32) || words <= LK_DEVINFO_OVERHEAD ||
++	    get_unaligned_le32(prop) != words ||
++	    get_unaligned_le32(prop + 4) != LK_DEVINFO_TAG) {
++		dev_err(dev, "malformed atag,devinfo (%d bytes)\n", len);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	count = words - LK_DEVINFO_OVERHEAD;
++	if (get_unaligned_le32(prop + (words - 1) * sizeof(u32)) != count) {
++		dev_err(dev, "atag,devinfo count mismatch\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	di->words = devm_kcalloc(dev, count, sizeof(u32), GFP_KERNEL);
++	if (!di->words) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/* Stored in CPU (little-endian) order; nvmem consumers read u32s */
++	for (i = 0; i < count; i++)
++		di->words[i] = get_unaligned_le32(prop + (i + 2) * sizeof(u32));
++	di->count = count;
++
++out:
++	of_node_put(chosen);
++	return ret;
++}
++
++static int mtk_lk_devinfo_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct nvmem_config config = {
++		.dev = dev,
++		.name = "mtk-lk-devinfo",
++		.id = NVMEM_DEVID_NONE,
++		.owner = THIS_MODULE,
++		.add_legacy_fixed_of_cells = true,
++		.read_only = true,
++		.root_only = true,
++		.word_size = 4,
++		.stride = 4,
++		.reg_read = mtk_lk_devinfo_read,
++	};
++	struct mtk_lk_devinfo *di;
++	int ret;
++
++	di = devm_kzalloc(dev, sizeof(*di), GFP_KERNEL);
++	if (!di)
++		return -ENOMEM;
++
++	ret = mtk_lk_devinfo_parse(dev, di);
++	if (ret)
++		return ret;
++
++	config.priv = di;
++	config.size = di->count * sizeof(u32);
++
++	return PTR_ERR_OR_ZERO(devm_nvmem_register(dev, &config));
++}
++
++static const struct of_device_id mtk_lk_devinfo_of_match[] = {
++	{ .compatible = "mediatek,mt6797-lk-devinfo" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_lk_devinfo_of_match);
++
++static struct platform_driver mtk_lk_devinfo_driver = {
++	.probe = mtk_lk_devinfo_probe,
++	.driver = {
++		.name = "mtk-lk-devinfo",
++		.of_match_table = mtk_lk_devinfo_of_match,
++	},
++};
++module_platform_driver(mtk_lk_devinfo_driver);
++
++MODULE_DESCRIPTION("MediaTek LK devinfo (efuse copy) NVMEM provider");
++MODULE_LICENSE("GPL");
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/thermal/mediatek/auxadc_thermal.c b/devices/planet-geminipda/kernel/delta/drivers/thermal/mediatek/auxadc_thermal.c
+new file mode 100644
+index 0000000..5fcfe31
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/drivers/thermal/mediatek/auxadc_thermal.c
+@@ -0,0 +1,1578 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2015 MediaTek Inc.
++ * Author: Hanyi Wu <hanyi.wu@mediatek.com>
++ *         Sascha Hauer <s.hauer@pengutronix.de>
++ *         Dawei Chien <dawei.chien@mediatek.com>
++ *         Louis Yu <louis.yu@mediatek.com>
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/thermal.h>
++#include <linux/reset.h>
++#include <linux/types.h>
++
++#include "../thermal_hwmon.h"
++
++/* AUXADC Registers */
++#define AUXADC_CON1_SET_V	0x008
++#define AUXADC_CON1_CLR_V	0x00c
++#define AUXADC_CON2_V		0x010
++#define AUXADC_DATA(channel)	(0x14 + (channel) * 4)
++
++#define APMIXED_SYS_TS_CON0	0x600
++#define APMIXED_SYS_TS_CON1	0x604
++
++/* Thermal Controller Registers */
++#define TEMP_MONCTL0		0x000
++#define TEMP_MONCTL1		0x004
++#define TEMP_MONCTL2		0x008
++#define TEMP_MONIDET0		0x014
++#define TEMP_MONIDET1		0x018
++#define TEMP_MSRCTL0		0x038
++#define TEMP_MSRCTL1		0x03c
++#define TEMP_AHBPOLL		0x040
++#define TEMP_AHBTO		0x044
++#define TEMP_ADCPNP0		0x048
++#define TEMP_ADCPNP1		0x04c
++#define TEMP_ADCPNP2		0x050
++#define TEMP_ADCPNP3		0x0b4
++
++#define TEMP_ADCMUX		0x054
++#define TEMP_ADCEN		0x060
++#define TEMP_PNPMUXADDR		0x064
++#define TEMP_ADCMUXADDR		0x068
++#define TEMP_ADCENADDR		0x074
++#define TEMP_ADCVALIDADDR	0x078
++#define TEMP_ADCVOLTADDR	0x07c
++#define TEMP_RDCTRL		0x080
++#define TEMP_ADCVALIDMASK	0x084
++#define TEMP_ADCVOLTAGESHIFT	0x088
++#define TEMP_ADCWRITECTRL	0x08c
++#define TEMP_MSR0		0x090
++#define TEMP_MSR1		0x094
++#define TEMP_MSR2		0x098
++#define TEMP_MSR3		0x0B8
++
++#define TEMP_SPARE0		0x0f0
++
++#define TEMP_ADCPNP0_1          0x148
++#define TEMP_ADCPNP1_1          0x14c
++#define TEMP_ADCPNP2_1          0x150
++#define TEMP_MSR0_1             0x190
++#define TEMP_MSR1_1             0x194
++#define TEMP_MSR2_1             0x198
++#define TEMP_ADCPNP3_1          0x1b4
++#define TEMP_MSR3_1             0x1B8
++
++#define PTPCORESEL		0x400
++#define THERMAL_AHB_STATUS	0x418
++
++#define TEMP_MONCTL1_PERIOD_UNIT(x)	((x) & 0x3ff)
++
++#define TEMP_MONCTL2_FILTER_INTERVAL(x)	(((x) & 0x3ff) << 16)
++#define TEMP_MONCTL2_SENSOR_INTERVAL(x)	((x) & 0x3ff)
++
++#define TEMP_AHBPOLL_ADC_POLL_INTERVAL(x)	(x)
++
++#define TEMP_ADCWRITECTRL_ADC_PNP_WRITE		BIT(0)
++#define TEMP_ADCWRITECTRL_ADC_MUX_WRITE		BIT(1)
++
++#define TEMP_ADCVALIDMASK_VALID_HIGH		BIT(5)
++#define TEMP_ADCVALIDMASK_VALID_POS(bit)	(bit)
++
++/* TEMP_MSRCTL1: pause bits of the periodic sensing points 0..3 */
++#define TEMP_MSRCTL1_PAUSE_ALL			0x10e
++
++/* TEMP_MSRCTL0: hardware filter, 2 out of 4 samples per sensing point */
++#define TEMP_MSRCTL0_FILTER_2_OF_4		0x492
++
++/* AUXADC_CON0: per-channel synchronous (auto-set) mode */
++#define AUXADC_CON0_V		0x000
++
++/* MT8173 thermal sensors */
++#define MT8173_TS1	0
++#define MT8173_TS2	1
++#define MT8173_TS3	2
++#define MT8173_TS4	3
++#define MT8173_TSABB	4
++
++/* AUXADC channel 11 is used for the temperature sensors */
++#define MT8173_TEMP_AUXADC_CHANNEL	11
++
++/* The total number of temperature sensors in the MT8173 */
++#define MT8173_NUM_SENSORS		5
++
++/* The number of banks in the MT8173 */
++#define MT8173_NUM_ZONES		4
++
++/* The number of sensing points per bank */
++#define MT8173_NUM_SENSORS_PER_ZONE	4
++
++/* The number of controller in the MT8173 */
++#define MT8173_NUM_CONTROLLER		1
++
++/* The calibration coefficient of sensor  */
++#define MT8173_CALIBRATION	165
++
++/* Valid temperatures range */
++#define MT8173_TEMP_MIN		-20000
++#define MT8173_TEMP_MAX		150000
++
++/*
++ * Layout of the fuses providing the calibration data
++ * These macros could be used for MT8183, MT8173, MT2701, and MT2712.
++ * MT8183 has 6 sensors and needs 6 VTS calibration data.
++ * MT8173 has 5 sensors and needs 5 VTS calibration data.
++ * MT2701 has 3 sensors and needs 3 VTS calibration data.
++ * MT2712 has 4 sensors and needs 4 VTS calibration data.
++ */
++#define CALIB_BUF0_VALID_V1		BIT(0)
++#define CALIB_BUF1_ADC_GE_V1(x)		(((x) >> 22) & 0x3ff)
++#define CALIB_BUF0_VTS_TS1_V1(x)	(((x) >> 17) & 0x1ff)
++#define CALIB_BUF0_VTS_TS2_V1(x)	(((x) >> 8) & 0x1ff)
++#define CALIB_BUF1_VTS_TS3_V1(x)	(((x) >> 0) & 0x1ff)
++#define CALIB_BUF2_VTS_TS4_V1(x)	(((x) >> 23) & 0x1ff)
++#define CALIB_BUF2_VTS_TS5_V1(x)	(((x) >> 5) & 0x1ff)
++#define CALIB_BUF2_VTS_TSABB_V1(x)	(((x) >> 14) & 0x1ff)
++#define CALIB_BUF0_DEGC_CALI_V1(x)	(((x) >> 1) & 0x3f)
++#define CALIB_BUF0_O_SLOPE_V1(x)	(((x) >> 26) & 0x3f)
++#define CALIB_BUF0_O_SLOPE_SIGN_V1(x)	(((x) >> 7) & 0x1)
++#define CALIB_BUF1_ID_V1(x)		(((x) >> 9) & 0x1)
++
++/*
++ * MT6797 uses the V1 fuse layout above (words 0x180, 0x184, 0x188 of the
++ * efuse block) plus the ADC offset in the second word.
++ */
++#define CALIB_BUF1_ADC_OE_V4(x)		(((x) >> 12) & 0x3ff)
++
++/*
++ * Layout of the fuses providing the calibration data
++ * These macros could be used for MT7622.
++ */
++#define CALIB_BUF0_ADC_OE_V2(x)		(((x) >> 22) & 0x3ff)
++#define CALIB_BUF0_ADC_GE_V2(x)		(((x) >> 12) & 0x3ff)
++#define CALIB_BUF0_DEGC_CALI_V2(x)	(((x) >> 6) & 0x3f)
++#define CALIB_BUF0_O_SLOPE_V2(x)	(((x) >> 0) & 0x3f)
++#define CALIB_BUF1_VTS_TS1_V2(x)	(((x) >> 23) & 0x1ff)
++#define CALIB_BUF1_VTS_TS2_V2(x)	(((x) >> 14) & 0x1ff)
++#define CALIB_BUF1_VTS_TSABB_V2(x)	(((x) >> 5) & 0x1ff)
++#define CALIB_BUF1_VALID_V2(x)		(((x) >> 4) & 0x1)
++#define CALIB_BUF1_O_SLOPE_SIGN_V2(x)	(((x) >> 3) & 0x1)
++
++/*
++ * Layout of the fuses providing the calibration data
++ * These macros can be used for MT7981 and MT7986.
++ */
++#define CALIB_BUF0_ADC_GE_V3(x)		(((x) >> 0) & 0x3ff)
++#define CALIB_BUF0_DEGC_CALI_V3(x)	(((x) >> 20) & 0x3f)
++#define CALIB_BUF0_O_SLOPE_V3(x)	(((x) >> 26) & 0x3f)
++#define CALIB_BUF1_VTS_TS1_V3(x)	(((x) >> 0) & 0x1ff)
++#define CALIB_BUF1_VTS_TS2_V3(x)	(((x) >> 21) & 0x1ff)
++#define CALIB_BUF1_VTS_TSABB_V3(x)	(((x) >> 9) & 0x1ff)
++#define CALIB_BUF1_VALID_V3(x)		(((x) >> 18) & 0x1)
++#define CALIB_BUF1_O_SLOPE_SIGN_V3(x)	(((x) >> 19) & 0x1)
++#define CALIB_BUF1_ID_V3(x)		(((x) >> 20) & 0x1)
++
++enum {
++	VTS1,
++	VTS2,
++	VTS3,
++	VTS4,
++	VTS5,
++	VTSABB,
++	MAX_NUM_VTS,
++};
++
++enum mtk_thermal_version {
++	MTK_THERMAL_V1 = 1,
++	MTK_THERMAL_V2,
++	MTK_THERMAL_V3,
++	MTK_THERMAL_V4,
++};
++
++/* MT2701 thermal sensors */
++#define MT2701_TS1	0
++#define MT2701_TS2	1
++#define MT2701_TSABB	2
++
++/* AUXADC channel 11 is used for the temperature sensors */
++#define MT2701_TEMP_AUXADC_CHANNEL	11
++
++/* The total number of temperature sensors in the MT2701 */
++#define MT2701_NUM_SENSORS	3
++
++/* The number of sensing points per bank */
++#define MT2701_NUM_SENSORS_PER_ZONE	3
++
++/* The number of controller in the MT2701 */
++#define MT2701_NUM_CONTROLLER		1
++
++/* The calibration coefficient of sensor  */
++#define MT2701_CALIBRATION	165
++
++/* MT2712 thermal sensors */
++#define MT2712_TS1	0
++#define MT2712_TS2	1
++#define MT2712_TS3	2
++#define MT2712_TS4	3
++
++/* AUXADC channel 11 is used for the temperature sensors */
++#define MT2712_TEMP_AUXADC_CHANNEL	11
++
++/* The total number of temperature sensors in the MT2712 */
++#define MT2712_NUM_SENSORS	4
++
++/* The number of sensing points per bank */
++#define MT2712_NUM_SENSORS_PER_ZONE	4
++
++/* The number of controller in the MT2712 */
++#define MT2712_NUM_CONTROLLER		1
++
++/* The calibration coefficient of sensor  */
++#define MT2712_CALIBRATION	165
++
++#define MT7622_TEMP_AUXADC_CHANNEL	11
++#define MT7622_NUM_SENSORS		1
++#define MT7622_NUM_ZONES		1
++#define MT7622_NUM_SENSORS_PER_ZONE	1
++#define MT7622_TS1	0
++#define MT7622_NUM_CONTROLLER		1
++
++/* The maximum number of banks */
++#define MAX_NUM_ZONES		8
++
++/* The calibration coefficient of sensor  */
++#define MT7622_CALIBRATION	165
++
++/* MT8183 thermal sensors */
++#define MT8183_TS1	0
++#define MT8183_TS2	1
++#define MT8183_TS3	2
++#define MT8183_TS4	3
++#define MT8183_TS5	4
++#define MT8183_TSABB	5
++
++/* AUXADC channel  is used for the temperature sensors */
++#define MT8183_TEMP_AUXADC_CHANNEL	11
++
++/* The total number of temperature sensors in the MT8183 */
++#define MT8183_NUM_SENSORS	6
++
++/* The number of banks in the MT8183 */
++#define MT8183_NUM_ZONES               1
++
++/* The number of sensing points per bank */
++#define MT8183_NUM_SENSORS_PER_ZONE	 6
++
++/* The number of controller in the MT8183 */
++#define MT8183_NUM_CONTROLLER		2
++
++/* The calibration coefficient of sensor  */
++#define MT8183_CALIBRATION	153
++
++/* AUXADC channel 11 is used for the temperature sensors */
++#define MT7986_TEMP_AUXADC_CHANNEL	11
++
++/* The total number of temperature sensors in the MT7986 */
++#define MT7986_NUM_SENSORS		1
++
++/* The number of banks in the MT7986 */
++#define MT7986_NUM_ZONES		1
++
++/* The number of sensing points per bank */
++#define MT7986_NUM_SENSORS_PER_ZONE	1
++
++/* MT7986 thermal sensors */
++#define MT7986_TS1			0
++
++/* The number of controller in the MT7986 */
++#define MT7986_NUM_CONTROLLER		1
++
++/* The calibration coefficient of sensor  */
++#define MT7986_CALIBRATION		165
++
++/* MT8365 */
++#define MT8365_TEMP_AUXADC_CHANNEL 11
++#define MT8365_CALIBRATION 164
++#define MT8365_NUM_CONTROLLER 1
++#define MT8365_NUM_BANKS 1
++#define MT8365_NUM_SENSORS 3
++#define MT8365_NUM_SENSORS_PER_ZONE 3
++#define MT8365_TS1 0
++#define MT8365_TS2 1
++#define MT8365_TS3 2
++
++/*
++ * MT6797: five sensors read through six banks. The banks are the vendor's
++ * policy groups (0: big/A72, 1: GPU, 2: SoC, 3: L, 4: LL, 5: MCUCCI);
++ * several banks sample the same sensor (TS_MCU2).
++ */
++#define MT6797_TS_MCU1			0
++#define MT6797_TS_MCU2			1
++#define MT6797_TS_MCU3			2
++#define MT6797_TS_MCU4			3
++#define MT6797_TS_ABB			4
++#define MT6797_TEMP_AUXADC_CHANNEL	11
++#define MT6797_NUM_SENSORS		5
++#define MT6797_NUM_ZONES		6
++#define MT6797_NUM_SENSORS_PER_ZONE	2
++#define MT6797_NUM_CONTROLLER		1
++
++struct mtk_thermal;
++
++struct thermal_bank_cfg {
++	unsigned int num_sensors;
++	const int *sensors;
++};
++
++struct mtk_thermal_bank {
++	struct mtk_thermal *mt;
++	int id;
++};
++
++struct mtk_thermal_data {
++	s32 num_banks;
++	s32 num_sensors;
++	s32 auxadc_channel;
++	const int *vts_index;
++	const int *sensor_mux_values;
++	const int *msr;
++	const int *adcpnp;
++	const int cali_val;
++	const int num_controller;
++	const int *controller_offset;
++	bool need_switch_bank;
++	struct thermal_bank_cfg bank_data[MAX_NUM_ZONES];
++	enum mtk_thermal_version version;
++	u32 apmixed_buffer_ctl_reg;
++	u32 apmixed_buffer_ctl_mask;
++	u32 apmixed_buffer_ctl_set;
++	/* optional overrides of the bank timing; 0 = driver default */
++	u32 ahbpoll;
++	u32 msrctl0;
++	u32 adcvalidmask;
++};
++
++struct mtk_thermal {
++	struct device *dev;
++	void __iomem *thermal_base;
++
++	struct clk *clk_peri_therm;
++	struct clk *clk_auxadc;
++	/* lock: for getting and putting banks */
++	struct mutex lock;
++
++	/* Calibration values */
++	s32 adc_ge;
++	s32 adc_oe;
++	s32 degc_cali;
++	s32 o_slope;
++	s32 o_slope_sign;
++	s32 vts[MAX_NUM_VTS];
++
++	const struct mtk_thermal_data *conf;
++	struct mtk_thermal_bank banks[MAX_NUM_ZONES];
++
++	int (*raw_to_mcelsius)(struct mtk_thermal *mt, int sensno, s32 raw);
++};
++
++/* MT8183 thermal sensor data */
++static const int mt8183_bank_data[MT8183_NUM_SENSORS] = {
++	MT8183_TS1, MT8183_TS2, MT8183_TS3, MT8183_TS4, MT8183_TS5, MT8183_TSABB
++};
++
++static const int mt8183_msr[MT8183_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0_1, TEMP_MSR1_1, TEMP_MSR2_1, TEMP_MSR1, TEMP_MSR0, TEMP_MSR3_1
++};
++
++static const int mt8183_adcpnp[MT8183_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0_1, TEMP_ADCPNP1_1, TEMP_ADCPNP2_1,
++	TEMP_ADCPNP1, TEMP_ADCPNP0, TEMP_ADCPNP3_1
++};
++
++static const int mt8183_mux_values[MT8183_NUM_SENSORS] = { 0, 1, 2, 3, 4, 0 };
++static const int mt8183_tc_offset[MT8183_NUM_CONTROLLER] = {0x0, 0x100};
++
++static const int mt8183_vts_index[MT8183_NUM_SENSORS] = {
++	VTS1, VTS2, VTS3, VTS4, VTS5, VTSABB
++};
++
++/* MT8173 thermal sensor data */
++static const int mt8173_bank_data[MT8173_NUM_ZONES][3] = {
++	{ MT8173_TS2, MT8173_TS3 },
++	{ MT8173_TS2, MT8173_TS4 },
++	{ MT8173_TS1, MT8173_TS2, MT8173_TSABB },
++	{ MT8173_TS2 },
++};
++
++static const int mt8173_msr[MT8173_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0, TEMP_MSR1, TEMP_MSR2, TEMP_MSR3
++};
++
++static const int mt8173_adcpnp[MT8173_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0, TEMP_ADCPNP1, TEMP_ADCPNP2, TEMP_ADCPNP3
++};
++
++static const int mt8173_mux_values[MT8173_NUM_SENSORS] = { 0, 1, 2, 3, 16 };
++static const int mt8173_tc_offset[MT8173_NUM_CONTROLLER] = { 0x0, };
++
++static const int mt8173_vts_index[MT8173_NUM_SENSORS] = {
++	VTS1, VTS2, VTS3, VTS4, VTSABB
++};
++
++/* MT2701 thermal sensor data */
++static const int mt2701_bank_data[MT2701_NUM_SENSORS] = {
++	MT2701_TS1, MT2701_TS2, MT2701_TSABB
++};
++
++static const int mt2701_msr[MT2701_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0, TEMP_MSR1, TEMP_MSR2
++};
++
++static const int mt2701_adcpnp[MT2701_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0, TEMP_ADCPNP1, TEMP_ADCPNP2
++};
++
++static const int mt2701_mux_values[MT2701_NUM_SENSORS] = { 0, 1, 16 };
++static const int mt2701_tc_offset[MT2701_NUM_CONTROLLER] = { 0x0, };
++
++static const int mt2701_vts_index[MT2701_NUM_SENSORS] = {
++	VTS1, VTS2, VTS3
++};
++
++/* MT2712 thermal sensor data */
++static const int mt2712_bank_data[MT2712_NUM_SENSORS] = {
++	MT2712_TS1, MT2712_TS2, MT2712_TS3, MT2712_TS4
++};
++
++static const int mt2712_msr[MT2712_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0, TEMP_MSR1, TEMP_MSR2, TEMP_MSR3
++};
++
++static const int mt2712_adcpnp[MT2712_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0, TEMP_ADCPNP1, TEMP_ADCPNP2, TEMP_ADCPNP3
++};
++
++static const int mt2712_mux_values[MT2712_NUM_SENSORS] = { 0, 1, 2, 3 };
++static const int mt2712_tc_offset[MT2712_NUM_CONTROLLER] = { 0x0, };
++
++static const int mt2712_vts_index[MT2712_NUM_SENSORS] = {
++	VTS1, VTS2, VTS3, VTS4
++};
++
++/* MT7622 thermal sensor data */
++static const int mt7622_bank_data[MT7622_NUM_SENSORS] = { MT7622_TS1, };
++static const int mt7622_msr[MT7622_NUM_SENSORS_PER_ZONE] = { TEMP_MSR0, };
++static const int mt7622_adcpnp[MT7622_NUM_SENSORS_PER_ZONE] = { TEMP_ADCPNP0, };
++static const int mt7622_mux_values[MT7622_NUM_SENSORS] = { 0, };
++static const int mt7622_vts_index[MT7622_NUM_SENSORS] = { VTS1 };
++static const int mt7622_tc_offset[MT7622_NUM_CONTROLLER] = { 0x0, };
++
++/* MT7986 thermal sensor data */
++static const int mt7986_bank_data[MT7986_NUM_SENSORS] = { MT7986_TS1, };
++static const int mt7986_msr[MT7986_NUM_SENSORS_PER_ZONE] = { TEMP_MSR0, };
++static const int mt7986_adcpnp[MT7986_NUM_SENSORS_PER_ZONE] = { TEMP_ADCPNP0, };
++static const int mt7986_mux_values[MT7986_NUM_SENSORS] = { 0, };
++static const int mt7986_vts_index[MT7986_NUM_SENSORS] = { VTS1 };
++static const int mt7986_tc_offset[MT7986_NUM_CONTROLLER] = { 0x0, };
++
++/* MT8365 thermal sensor data */
++static const int mt8365_bank_data[MT8365_NUM_SENSORS] = {
++	MT8365_TS1, MT8365_TS2, MT8365_TS3
++};
++
++static const int mt8365_msr[MT8365_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0, TEMP_MSR1, TEMP_MSR2
++};
++
++static const int mt8365_adcpnp[MT8365_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0, TEMP_ADCPNP1, TEMP_ADCPNP2
++};
++
++static const int mt8365_mux_values[MT8365_NUM_SENSORS] = { 0, 1, 2 };
++static const int mt8365_tc_offset[MT8365_NUM_CONTROLLER] = { 0 };
++
++static const int mt8365_vts_index[MT8365_NUM_SENSORS] = { VTS1, VTS2, VTS3 };
++
++/*
++ * The MT8173 thermal controller has four banks. Each bank can read up to
++ * four temperature sensors simultaneously. The MT8173 has a total of 5
++ * temperature sensors. We use each bank to measure a certain area of the
++ * SoC. Since TS2 is located centrally in the SoC it is influenced by multiple
++ * areas, hence is used in different banks.
++ *
++ * The thermal core only gets the maximum temperature of all banks, so
++ * the bank concept wouldn't be necessary here. However, the SVS (Smart
++ * Voltage Scaling) unit makes its decisions based on the same bank
++ * data, and this indeed needs the temperatures of the individual banks
++ * for making better decisions.
++ */
++static const struct mtk_thermal_data mt8173_thermal_data = {
++	.auxadc_channel = MT8173_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT8173_NUM_ZONES,
++	.num_sensors = MT8173_NUM_SENSORS,
++	.vts_index = mt8173_vts_index,
++	.cali_val = MT8173_CALIBRATION,
++	.num_controller = MT8173_NUM_CONTROLLER,
++	.controller_offset = mt8173_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 2,
++			.sensors = mt8173_bank_data[0],
++		}, {
++			.num_sensors = 2,
++			.sensors = mt8173_bank_data[1],
++		}, {
++			.num_sensors = 3,
++			.sensors = mt8173_bank_data[2],
++		}, {
++			.num_sensors = 1,
++			.sensors = mt8173_bank_data[3],
++		},
++	},
++	.msr = mt8173_msr,
++	.adcpnp = mt8173_adcpnp,
++	.sensor_mux_values = mt8173_mux_values,
++	.version = MTK_THERMAL_V1,
++};
++
++/*
++ * The MT2701 thermal controller has one bank, which can read up to
++ * three temperature sensors simultaneously. The MT2701 has a total of 3
++ * temperature sensors.
++ *
++ * The thermal core only gets the maximum temperature of this one bank,
++ * so the bank concept wouldn't be necessary here. However, the SVS (Smart
++ * Voltage Scaling) unit makes its decisions based on the same bank
++ * data.
++ */
++static const struct mtk_thermal_data mt2701_thermal_data = {
++	.auxadc_channel = MT2701_TEMP_AUXADC_CHANNEL,
++	.num_banks = 1,
++	.num_sensors = MT2701_NUM_SENSORS,
++	.vts_index = mt2701_vts_index,
++	.cali_val = MT2701_CALIBRATION,
++	.num_controller = MT2701_NUM_CONTROLLER,
++	.controller_offset = mt2701_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 3,
++			.sensors = mt2701_bank_data,
++		},
++	},
++	.msr = mt2701_msr,
++	.adcpnp = mt2701_adcpnp,
++	.sensor_mux_values = mt2701_mux_values,
++	.version = MTK_THERMAL_V1,
++};
++
++/*
++ * The MT8365 thermal controller has one bank, which can read up to
++ * four temperature sensors simultaneously. The MT8365 has a total of 3
++ * temperature sensors.
++ *
++ * The thermal core only gets the maximum temperature of this one bank,
++ * so the bank concept wouldn't be necessary here. However, the SVS (Smart
++ * Voltage Scaling) unit makes its decisions based on the same bank
++ * data.
++ */
++static const struct mtk_thermal_data mt8365_thermal_data = {
++	.auxadc_channel = MT8365_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT8365_NUM_BANKS,
++	.num_sensors = MT8365_NUM_SENSORS,
++	.vts_index = mt8365_vts_index,
++	.cali_val = MT8365_CALIBRATION,
++	.num_controller = MT8365_NUM_CONTROLLER,
++	.controller_offset = mt8365_tc_offset,
++	.need_switch_bank = false,
++	.bank_data = {
++		{
++			.num_sensors = MT8365_NUM_SENSORS,
++			.sensors = mt8365_bank_data
++		},
++	},
++	.msr = mt8365_msr,
++	.adcpnp = mt8365_adcpnp,
++	.sensor_mux_values = mt8365_mux_values,
++	.version = MTK_THERMAL_V1,
++	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON0,
++	.apmixed_buffer_ctl_mask = (u32) ~GENMASK(29, 28),
++	.apmixed_buffer_ctl_set = 0,
++};
++
++/*
++ * The MT2712 thermal controller has one bank, which can read up to
++ * four temperature sensors simultaneously. The MT2712 has a total of 4
++ * temperature sensors.
++ *
++ * The thermal core only gets the maximum temperature of this one bank,
++ * so the bank concept wouldn't be necessary here. However, the SVS (Smart
++ * Voltage Scaling) unit makes its decisions based on the same bank
++ * data.
++ */
++static const struct mtk_thermal_data mt2712_thermal_data = {
++	.auxadc_channel = MT2712_TEMP_AUXADC_CHANNEL,
++	.num_banks = 1,
++	.num_sensors = MT2712_NUM_SENSORS,
++	.vts_index = mt2712_vts_index,
++	.cali_val = MT2712_CALIBRATION,
++	.num_controller = MT2712_NUM_CONTROLLER,
++	.controller_offset = mt2712_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 4,
++			.sensors = mt2712_bank_data,
++		},
++	},
++	.msr = mt2712_msr,
++	.adcpnp = mt2712_adcpnp,
++	.sensor_mux_values = mt2712_mux_values,
++	.version = MTK_THERMAL_V1,
++};
++
++/*
++ * MT7622 have only one sensing point which uses AUXADC Channel 11 for raw data
++ * access.
++ */
++static const struct mtk_thermal_data mt7622_thermal_data = {
++	.auxadc_channel = MT7622_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT7622_NUM_ZONES,
++	.num_sensors = MT7622_NUM_SENSORS,
++	.vts_index = mt7622_vts_index,
++	.cali_val = MT7622_CALIBRATION,
++	.num_controller = MT7622_NUM_CONTROLLER,
++	.controller_offset = mt7622_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 1,
++			.sensors = mt7622_bank_data,
++		},
++	},
++	.msr = mt7622_msr,
++	.adcpnp = mt7622_adcpnp,
++	.sensor_mux_values = mt7622_mux_values,
++	.version = MTK_THERMAL_V2,
++	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON1,
++	.apmixed_buffer_ctl_mask = GENMASK(31, 6) | BIT(3),
++	.apmixed_buffer_ctl_set = BIT(0),
++};
++
++/*
++ * The MT8183 thermal controller has one bank for the current SW framework.
++ * The MT8183 has a total of 6 temperature sensors.
++ * There are two thermal controller to control the six sensor.
++ * The first one bind 2 sensor, and the other bind 4 sensors.
++ * The thermal core only gets the maximum temperature of all sensor, so
++ * the bank concept wouldn't be necessary here. However, the SVS (Smart
++ * Voltage Scaling) unit makes its decisions based on the same bank
++ * data, and this indeed needs the temperatures of the individual banks
++ * for making better decisions.
++ */
++static const struct mtk_thermal_data mt8183_thermal_data = {
++	.auxadc_channel = MT8183_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT8183_NUM_ZONES,
++	.num_sensors = MT8183_NUM_SENSORS,
++	.vts_index = mt8183_vts_index,
++	.cali_val = MT8183_CALIBRATION,
++	.num_controller = MT8183_NUM_CONTROLLER,
++	.controller_offset = mt8183_tc_offset,
++	.need_switch_bank = false,
++	.bank_data = {
++		{
++			.num_sensors = 6,
++			.sensors = mt8183_bank_data,
++		},
++	},
++
++	.msr = mt8183_msr,
++	.adcpnp = mt8183_adcpnp,
++	.sensor_mux_values = mt8183_mux_values,
++	.version = MTK_THERMAL_V1,
++};
++
++/*
++ * MT7986 uses AUXADC Channel 11 for raw data access.
++ */
++static const struct mtk_thermal_data mt7986_thermal_data = {
++	.auxadc_channel = MT7986_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT7986_NUM_ZONES,
++	.num_sensors = MT7986_NUM_SENSORS,
++	.vts_index = mt7986_vts_index,
++	.cali_val = MT7986_CALIBRATION,
++	.num_controller = MT7986_NUM_CONTROLLER,
++	.controller_offset = mt7986_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 1,
++			.sensors = mt7986_bank_data,
++		},
++	},
++	.msr = mt7986_msr,
++	.adcpnp = mt7986_adcpnp,
++	.sensor_mux_values = mt7986_mux_values,
++	.version = MTK_THERMAL_V3,
++	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON1,
++	.apmixed_buffer_ctl_mask = GENMASK(31, 6) | BIT(3),
++	.apmixed_buffer_ctl_set = BIT(0),
++};
++
++static const int mt6797_bank_data[MT6797_NUM_ZONES][MT6797_NUM_SENSORS_PER_ZONE] = {
++	{ MT6797_TS_MCU1 },
++	{ MT6797_TS_MCU4 },
++	{ MT6797_TS_MCU2, MT6797_TS_MCU3 },
++	{ MT6797_TS_MCU2 },
++	{ MT6797_TS_MCU2 },
++	{ MT6797_TS_MCU2 },
++};
++
++static const int mt6797_msr[MT6797_NUM_SENSORS_PER_ZONE] = {
++	TEMP_MSR0, TEMP_MSR1
++};
++
++static const int mt6797_adcpnp[MT6797_NUM_SENSORS_PER_ZONE] = {
++	TEMP_ADCPNP0, TEMP_ADCPNP1
++};
++
++/* APMIXED TS_CON1 mux values: [5:4] = 0 (buffer on), [2:0] = sensor */
++static const int mt6797_mux_values[MT6797_NUM_SENSORS] = {
++	0x0, 0x1, 0x2, 0x3, 0x10
++};
++
++static const int mt6797_vts_index[MT6797_NUM_SENSORS] = {
++	VTS1, VTS2, VTS3, VTS4, VTSABB
++};
++
++static const int mt6797_tc_offset[MT6797_NUM_CONTROLLER] = { 0x0, };
++
++/*
++ * MT6797 (Helio X20/X25/X27): one controller, six banks selected through
++ * PTPCORESEL (shared with the EEM/PTP block at the same base), AUXADC
++ * channel 11. Timing, filter and valid-mask values are the vendor ones
++ * (mtk_tc.c); TS_CON1[5:4] must be cleared to route the sensors to the
++ * AUXADC through the buffer.
++ */
++static const struct mtk_thermal_data mt6797_thermal_data = {
++	.auxadc_channel = MT6797_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT6797_NUM_ZONES,
++	.num_sensors = MT6797_NUM_SENSORS,
++	.vts_index = mt6797_vts_index,
++	.num_controller = MT6797_NUM_CONTROLLER,
++	.controller_offset = mt6797_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{ .num_sensors = 1, .sensors = mt6797_bank_data[0] },
++		{ .num_sensors = 1, .sensors = mt6797_bank_data[1] },
++		{ .num_sensors = 2, .sensors = mt6797_bank_data[2] },
++		{ .num_sensors = 1, .sensors = mt6797_bank_data[3] },
++		{ .num_sensors = 1, .sensors = mt6797_bank_data[4] },
++		{ .num_sensors = 1, .sensors = mt6797_bank_data[5] },
++	},
++	.msr = mt6797_msr,
++	.adcpnp = mt6797_adcpnp,
++	.sensor_mux_values = mt6797_mux_values,
++	.version = MTK_THERMAL_V4,
++	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON1,
++	.apmixed_buffer_ctl_mask = (u32)~GENMASK(5, 4),
++	.apmixed_buffer_ctl_set = 0,
++	.ahbpoll = 0x30d,
++	.msrctl0 = TEMP_MSRCTL0_FILTER_2_OF_4,
++	.adcvalidmask = TEMP_ADCVALIDMASK_VALID_HIGH |
++			TEMP_ADCVALIDMASK_VALID_POS(12),
++};
++
++static bool mtk_thermal_temp_is_valid(int temp)
++{
++	return (temp >= MT8173_TEMP_MIN) && (temp <= MT8173_TEMP_MAX);
++}
++
++/**
++ * raw_to_mcelsius_v1 - convert a raw ADC value to mcelsius
++ * @mt:	The thermal controller
++ * @sensno:	sensor number
++ * @raw:	raw ADC value
++ *
++ * This converts the raw ADC value to mcelsius using the SoC specific
++ * calibration constants
++ */
++static int raw_to_mcelsius_v1(struct mtk_thermal *mt, int sensno, s32 raw)
++{
++	s32 tmp;
++
++	raw &= 0xfff;
++
++	tmp = 203450520 << 3;
++	tmp /= mt->conf->cali_val + mt->o_slope;
++	tmp /= 10000 + mt->adc_ge;
++	tmp *= raw - mt->vts[sensno] - 3350;
++	tmp >>= 3;
++
++	return mt->degc_cali * 500 - tmp;
++}
++
++static int raw_to_mcelsius_v2(struct mtk_thermal *mt, int sensno, s32 raw)
++{
++	s32 format_1;
++	s32 format_2;
++	s32 g_oe;
++	s32 g_gain;
++	s32 g_x_roomt;
++	s32 tmp;
++
++	if (raw == 0)
++		return 0;
++
++	raw &= 0xfff;
++	g_gain = 10000 + (((mt->adc_ge - 512) * 10000) >> 12);
++	g_oe = mt->adc_oe - 512;
++	format_1 = mt->vts[VTS2] + 3105 - g_oe;
++	format_2 = (mt->degc_cali * 10) >> 1;
++	g_x_roomt = (((format_1 * 10000) >> 12) * 10000) / g_gain;
++
++	tmp = (((((raw - g_oe) * 10000) >> 12) * 10000) / g_gain) - g_x_roomt;
++	tmp = tmp * 10 * 100 / 11;
++
++	if (mt->o_slope_sign == 0)
++		tmp = tmp / (165 - mt->o_slope);
++	else
++		tmp = tmp / (165 + mt->o_slope);
++
++	return (format_2 - tmp) * 100;
++}
++
++static int raw_to_mcelsius_v3(struct mtk_thermal *mt, int sensno, s32 raw)
++{
++	s32 tmp;
++
++	if (raw == 0)
++		return 0;
++
++	raw &= 0xfff;
++	tmp = 100000 * 15 / 16 * 10000;
++	tmp /= 4096 - 512 + mt->adc_ge;
++	tmp /= 1490;
++	tmp *= raw - mt->vts[sensno] - 2900;
++
++	return mt->degc_cali * 500 - tmp;
++}
++
++/*
++ * MT6797 (vendor raw_to_temperature_roomt()): like V2, but with the
++ * per-sensor VTS calibration, a 1663 + 10 * slope coefficient and the
++ * 15/18 factor. The vendor result is in 0.1 degC.
++ */
++static int raw_to_mcelsius_v4(struct mtk_thermal *mt, int sensno, s32 raw)
++{
++	s32 g_oe, g_gain, x_roomt, tmp, slope;
++
++	raw &= 0xfff;
++	if (raw == 0)
++		return THERMAL_TEMP_INVALID;
++
++	g_gain = 10000 + ((mt->adc_ge - 512) * 10000) / 4096;
++	g_oe = mt->adc_oe - 512;
++	x_roomt = (((mt->vts[mt->conf->vts_index[sensno]] + 3350 - g_oe) *
++		    10000) / 4096) * 10000 / g_gain;
++
++	tmp = ((((raw - g_oe) * 10000) >> 12) * 10000) / g_gain - x_roomt;
++	tmp = tmp * 15 / 18;
++
++	slope = 1663 + (mt->o_slope_sign ? -10 : 10) * mt->o_slope;
++	tmp = tmp * 1000 / slope;
++
++	return (((mt->degc_cali * 10) >> 1) - tmp) * 100;
++}
++
++/**
++ * mtk_thermal_get_bank - get bank
++ * @bank:	The bank
++ *
++ * The bank registers are banked, we have to select a bank in the
++ * PTPCORESEL register to access it.
++ */
++static void mtk_thermal_get_bank(struct mtk_thermal_bank *bank)
++{
++	struct mtk_thermal *mt = bank->mt;
++	u32 val;
++
++	if (mt->conf->need_switch_bank) {
++		mutex_lock(&mt->lock);
++
++		val = readl(mt->thermal_base + PTPCORESEL);
++		val &= ~0xf;
++		val |= bank->id;
++		writel(val, mt->thermal_base + PTPCORESEL);
++	}
++}
++
++/**
++ * mtk_thermal_put_bank - release bank
++ * @bank:	The bank
++ *
++ * release a bank previously taken with mtk_thermal_get_bank,
++ */
++static void mtk_thermal_put_bank(struct mtk_thermal_bank *bank)
++{
++	struct mtk_thermal *mt = bank->mt;
++
++	if (mt->conf->need_switch_bank)
++		mutex_unlock(&mt->lock);
++}
++
++/**
++ * mtk_thermal_bank_temperature - get the temperature of a bank
++ * @bank:	The bank
++ *
++ * The temperature of a bank is considered the maximum temperature of
++ * the sensors associated to the bank.
++ */
++static int mtk_thermal_bank_temperature(struct mtk_thermal_bank *bank)
++{
++	struct mtk_thermal *mt = bank->mt;
++	const struct mtk_thermal_data *conf = mt->conf;
++	int i, temp = INT_MIN, max = INT_MIN;
++	u32 raw;
++
++	for (i = 0; i < conf->bank_data[bank->id].num_sensors; i++) {
++		raw = readl(mt->thermal_base + conf->msr[i]);
++
++		temp = mt->raw_to_mcelsius(
++			mt, conf->bank_data[bank->id].sensors[i], raw);
++
++		/*
++		 * Depending on the filt/sen intervals and ADC polling time,
++		 * we may need up to 60 milliseconds after initialization: this
++		 * will result in the first reading containing an out of range
++		 * temperature value.
++		 * Validate the reading to both address the aforementioned issue
++		 * and to eventually avoid bogus readings during runtime in the
++		 * event that the AUXADC gets unstable due to high EMI, etc.
++		 */
++		if (!mtk_thermal_temp_is_valid(temp))
++			temp = THERMAL_TEMP_INVALID;
++
++		if (temp > max)
++			max = temp;
++	}
++
++	return max;
++}
++
++static int mtk_read_temp(struct thermal_zone_device *tz, int *temperature)
++{
++	struct mtk_thermal *mt = thermal_zone_device_priv(tz);
++	int i;
++	int tempmax = INT_MIN;
++
++	for (i = 0; i < mt->conf->num_banks; i++) {
++		struct mtk_thermal_bank *bank = &mt->banks[i];
++
++		mtk_thermal_get_bank(bank);
++
++		tempmax = max(tempmax, mtk_thermal_bank_temperature(bank));
++
++		mtk_thermal_put_bank(bank);
++	}
++
++	*temperature = tempmax;
++
++	return 0;
++}
++
++static const struct thermal_zone_device_ops mtk_thermal_ops = {
++	.get_temp = mtk_read_temp,
++};
++
++static void mtk_thermal_init_bank(struct mtk_thermal *mt, int num,
++				  u32 apmixed_phys_base, u32 auxadc_phys_base,
++				  int ctrl_id)
++{
++	struct mtk_thermal_bank *bank = &mt->banks[num];
++	const struct mtk_thermal_data *conf = mt->conf;
++	int i;
++
++	int offset = mt->conf->controller_offset[ctrl_id];
++	void __iomem *controller_base = mt->thermal_base + offset;
++
++	bank->id = num;
++	bank->mt = mt;
++
++	mtk_thermal_get_bank(bank);
++
++	/* bus clock 66M counting unit is 12 * 15.15ns * 256 = 46.540us */
++	writel(TEMP_MONCTL1_PERIOD_UNIT(12), controller_base + TEMP_MONCTL1);
++
++	/*
++	 * filt interval is 1 * 46.540us = 46.54us,
++	 * sen interval is 429 * 46.540us = 19.96ms
++	 */
++	writel(TEMP_MONCTL2_FILTER_INTERVAL(1) |
++			TEMP_MONCTL2_SENSOR_INTERVAL(429),
++			controller_base + TEMP_MONCTL2);
++
++	/* poll is set to 10u */
++	writel(TEMP_AHBPOLL_ADC_POLL_INTERVAL(conf->ahbpoll ?: 768),
++	       controller_base + TEMP_AHBPOLL);
++
++	/* temperature sampling control, 1 sample unless the SoC wants a filter */
++	writel(conf->msrctl0, controller_base + TEMP_MSRCTL0);
++
++	/* exceed this polling time, IRQ would be inserted */
++	writel(0xffffffff, controller_base + TEMP_AHBTO);
++
++	/* number of interrupts per event, 1 is enough */
++	writel(0x0, controller_base + TEMP_MONIDET0);
++	writel(0x0, controller_base + TEMP_MONIDET1);
++
++	/*
++	 * The MT8173 thermal controller does not have its own ADC. Instead it
++	 * uses AHB bus accesses to control the AUXADC. To do this the thermal
++	 * controller has to be programmed with the physical addresses of the
++	 * AUXADC registers and with the various bit positions in the AUXADC.
++	 * Also the thermal controller controls a mux in the APMIXEDSYS register
++	 * space.
++	 */
++
++	/*
++	 * this value will be stored to TEMP_PNPMUXADDR (TEMP_SPARE0)
++	 * automatically by hw
++	 */
++	writel(BIT(conf->auxadc_channel), controller_base + TEMP_ADCMUX);
++
++	/* AHB address for auxadc mux selection */
++	writel(auxadc_phys_base + AUXADC_CON1_CLR_V,
++	       controller_base + TEMP_ADCMUXADDR);
++
++	if (mt->conf->version == MTK_THERMAL_V1 ||
++	    mt->conf->version == MTK_THERMAL_V4) {
++		/* AHB address for pnp sensor mux selection */
++		writel(apmixed_phys_base + APMIXED_SYS_TS_CON1,
++		       controller_base + TEMP_PNPMUXADDR);
++	}
++
++	/* AHB value for auxadc enable */
++	writel(BIT(conf->auxadc_channel), controller_base + TEMP_ADCEN);
++
++	/* AHB address for auxadc enable (channel 0 immediate mode selected) */
++	writel(auxadc_phys_base + AUXADC_CON1_SET_V,
++	       controller_base + TEMP_ADCENADDR);
++
++	/* AHB address for auxadc valid bit */
++	writel(auxadc_phys_base + AUXADC_DATA(conf->auxadc_channel),
++	       controller_base + TEMP_ADCVALIDADDR);
++
++	/* AHB address for auxadc voltage output */
++	writel(auxadc_phys_base + AUXADC_DATA(conf->auxadc_channel),
++	       controller_base + TEMP_ADCVOLTADDR);
++
++	/* read valid & voltage are at the same register */
++	writel(0x0, controller_base + TEMP_RDCTRL);
++
++	/* indicate where the valid bit is */
++	writel(conf->adcvalidmask ?:
++	       (TEMP_ADCVALIDMASK_VALID_HIGH | TEMP_ADCVALIDMASK_VALID_POS(12)),
++	       controller_base + TEMP_ADCVALIDMASK);
++
++	/* no shift */
++	writel(0x0, controller_base + TEMP_ADCVOLTAGESHIFT);
++
++	/* enable auxadc mux write transaction */
++	writel(TEMP_ADCWRITECTRL_ADC_MUX_WRITE,
++		controller_base + TEMP_ADCWRITECTRL);
++
++	for (i = 0; i < conf->bank_data[num].num_sensors; i++)
++		writel(conf->sensor_mux_values[conf->bank_data[num].sensors[i]],
++		       mt->thermal_base + conf->adcpnp[i]);
++
++	/* MT6797 enables the sensing points only after all banks are set up */
++	if (conf->version != MTK_THERMAL_V4)
++		writel((1 << conf->bank_data[num].num_sensors) - 1,
++		       controller_base + TEMP_MONCTL0);
++
++	writel(TEMP_ADCWRITECTRL_ADC_PNP_WRITE |
++	       TEMP_ADCWRITECTRL_ADC_MUX_WRITE,
++	       controller_base + TEMP_ADCWRITECTRL);
++
++	mtk_thermal_put_bank(bank);
++}
++
++static u64 of_get_phys_base(struct device_node *np)
++{
++	struct resource res;
++
++	if (of_address_to_resource(np, 0, &res))
++		return OF_BAD_ADDR;
++
++	return res.start;
++}
++
++static int mtk_thermal_extract_efuse_v1(struct mtk_thermal *mt, u32 *buf)
++{
++	int i;
++
++	if (!(buf[0] & CALIB_BUF0_VALID_V1))
++		return -EINVAL;
++
++	mt->adc_ge = CALIB_BUF1_ADC_GE_V1(buf[1]);
++
++	for (i = 0; i < mt->conf->num_sensors; i++) {
++		switch (mt->conf->vts_index[i]) {
++		case VTS1:
++			mt->vts[VTS1] = CALIB_BUF0_VTS_TS1_V1(buf[0]);
++			break;
++		case VTS2:
++			mt->vts[VTS2] = CALIB_BUF0_VTS_TS2_V1(buf[0]);
++			break;
++		case VTS3:
++			mt->vts[VTS3] = CALIB_BUF1_VTS_TS3_V1(buf[1]);
++			break;
++		case VTS4:
++			mt->vts[VTS4] = CALIB_BUF2_VTS_TS4_V1(buf[2]);
++			break;
++		case VTS5:
++			mt->vts[VTS5] = CALIB_BUF2_VTS_TS5_V1(buf[2]);
++			break;
++		case VTSABB:
++			mt->vts[VTSABB] =
++				CALIB_BUF2_VTS_TSABB_V1(buf[2]);
++			break;
++		default:
++			break;
++		}
++	}
++
++	mt->degc_cali = CALIB_BUF0_DEGC_CALI_V1(buf[0]);
++	if (CALIB_BUF1_ID_V1(buf[1]) &
++	    CALIB_BUF0_O_SLOPE_SIGN_V1(buf[0]))
++		mt->o_slope = -CALIB_BUF0_O_SLOPE_V1(buf[0]);
++	else
++		mt->o_slope = CALIB_BUF0_O_SLOPE_V1(buf[0]);
++
++	return 0;
++}
++
++static int mtk_thermal_extract_efuse_v2(struct mtk_thermal *mt, u32 *buf)
++{
++	if (!CALIB_BUF1_VALID_V2(buf[1]))
++		return -EINVAL;
++
++	mt->adc_oe = CALIB_BUF0_ADC_OE_V2(buf[0]);
++	mt->adc_ge = CALIB_BUF0_ADC_GE_V2(buf[0]);
++	mt->degc_cali = CALIB_BUF0_DEGC_CALI_V2(buf[0]);
++	mt->o_slope = CALIB_BUF0_O_SLOPE_V2(buf[0]);
++	mt->vts[VTS1] = CALIB_BUF1_VTS_TS1_V2(buf[1]);
++	mt->vts[VTS2] = CALIB_BUF1_VTS_TS2_V2(buf[1]);
++	mt->vts[VTSABB] = CALIB_BUF1_VTS_TSABB_V2(buf[1]);
++	mt->o_slope_sign = CALIB_BUF1_O_SLOPE_SIGN_V2(buf[1]);
++
++	return 0;
++}
++
++static int mtk_thermal_extract_efuse_v3(struct mtk_thermal *mt, u32 *buf)
++{
++	if (!CALIB_BUF1_VALID_V3(buf[1]))
++		return -EINVAL;
++
++	mt->adc_ge = CALIB_BUF0_ADC_GE_V3(buf[0]);
++	mt->degc_cali = CALIB_BUF0_DEGC_CALI_V3(buf[0]);
++	mt->o_slope = CALIB_BUF0_O_SLOPE_V3(buf[0]);
++	mt->vts[VTS1] = CALIB_BUF1_VTS_TS1_V3(buf[1]);
++	mt->vts[VTS2] = CALIB_BUF1_VTS_TS2_V3(buf[1]);
++	mt->vts[VTSABB] = CALIB_BUF1_VTS_TSABB_V3(buf[1]);
++	mt->o_slope_sign = CALIB_BUF1_O_SLOPE_SIGN_V3(buf[1]);
++
++	if (CALIB_BUF1_ID_V3(buf[1]) == 0)
++		mt->o_slope = 0;
++
++	return 0;
++}
++
++static int mtk_thermal_extract_efuse_v4(struct mtk_thermal *mt, u32 *buf)
++{
++	int i;
++
++	if (!(buf[0] & CALIB_BUF0_VALID_V1))
++		return -EINVAL;
++
++	mt->adc_ge = CALIB_BUF1_ADC_GE_V1(buf[1]);
++	mt->adc_oe = CALIB_BUF1_ADC_OE_V4(buf[1]);
++	mt->vts[VTS1] = CALIB_BUF0_VTS_TS1_V1(buf[0]);
++	mt->vts[VTS2] = CALIB_BUF0_VTS_TS2_V1(buf[0]);
++	mt->vts[VTS3] = CALIB_BUF1_VTS_TS3_V1(buf[1]);
++	mt->vts[VTS4] = CALIB_BUF2_VTS_TS4_V1(buf[2]);
++	mt->vts[VTSABB] = CALIB_BUF2_VTS_TSABB_V1(buf[2]);
++	mt->degc_cali = CALIB_BUF0_DEGC_CALI_V1(buf[0]);
++	mt->o_slope = CALIB_BUF0_O_SLOPE_V1(buf[0]);
++	mt->o_slope_sign = CALIB_BUF0_O_SLOPE_SIGN_V1(buf[0]);
++
++	/* ID = 0: the slope fuse is not valid on this sample */
++	if (CALIB_BUF1_ID_V1(buf[1]) == 0)
++		mt->o_slope = 0;
++
++	/* Vendor range checks (mtk_tc.c eDataCorrector()) */
++	if (mt->adc_ge < 265 || mt->adc_ge > 758 ||
++	    mt->adc_oe < 265 || mt->adc_oe > 758 ||
++	    mt->degc_cali < 1 || mt->degc_cali > 63)
++		return -EINVAL;
++
++	for (i = 0; i < mt->conf->num_sensors; i++)
++		if (mt->vts[mt->conf->vts_index[i]] > 484)
++			return -EINVAL;
++
++	return 0;
++}
++
++static int mtk_thermal_get_calibration_data(struct device *dev,
++					    struct mtk_thermal *mt)
++{
++	struct nvmem_cell *cell;
++	u32 *buf;
++	size_t len;
++	int i, ret = 0;
++
++	/* Start with default values */
++	mt->adc_ge = 512;
++	mt->adc_oe = 512;
++	for (i = 0; i < mt->conf->num_sensors; i++)
++		mt->vts[i] = 260;
++	mt->degc_cali = 40;
++	mt->o_slope = 0;
++
++	cell = nvmem_cell_get(dev, "calibration-data");
++	if (IS_ERR(cell)) {
++		if (PTR_ERR(cell) == -EPROBE_DEFER)
++			return PTR_ERR(cell);
++		/* MT6797 defaults read ~20 degC off: refuse to run uncalibrated */
++		if (mt->conf->version == MTK_THERMAL_V4)
++			return dev_err_probe(dev, PTR_ERR(cell),
++					     "no calibration data\n");
++		return 0;
++	}
++
++	buf = (u32 *)nvmem_cell_read(cell, &len);
++
++	nvmem_cell_put(cell);
++
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	if (len < 3 * sizeof(u32)) {
++		dev_warn(dev, "invalid calibration data\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	switch (mt->conf->version) {
++	case MTK_THERMAL_V1:
++		ret = mtk_thermal_extract_efuse_v1(mt, buf);
++		break;
++	case MTK_THERMAL_V2:
++		ret = mtk_thermal_extract_efuse_v2(mt, buf);
++		break;
++	case MTK_THERMAL_V3:
++		ret = mtk_thermal_extract_efuse_v3(mt, buf);
++		break;
++	case MTK_THERMAL_V4:
++		ret = mtk_thermal_extract_efuse_v4(mt, buf);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	if (ret && mt->conf->version == MTK_THERMAL_V4) {
++		dev_err(dev, "invalid calibration data\n");
++		goto out;
++	}
++
++	if (ret) {
++		dev_info(dev, "Device not calibrated, using default calibration values\n");
++		ret = 0;
++	}
++
++	if (mt->conf->version == MTK_THERMAL_V4)
++		dev_info(dev, "calibration: ge %d oe %d degc %d slope %c%d vts %d %d %d %d %d\n",
++			mt->adc_ge, mt->adc_oe, mt->degc_cali,
++			mt->o_slope_sign ? '-' : '+', mt->o_slope,
++			mt->vts[VTS1], mt->vts[VTS2], mt->vts[VTS3],
++			mt->vts[VTS4], mt->vts[VTSABB]);
++
++out:
++	kfree(buf);
++
++	return ret;
++}
++
++static const struct of_device_id mtk_thermal_of_match[] = {
++	{
++		.compatible = "mediatek,mt8173-thermal",
++		.data = (void *)&mt8173_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt2701-thermal",
++		.data = (void *)&mt2701_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt2712-thermal",
++		.data = (void *)&mt2712_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt7622-thermal",
++		.data = (void *)&mt7622_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt7986-thermal",
++		.data = (void *)&mt7986_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt8183-thermal",
++		.data = (void *)&mt8183_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt8365-thermal",
++		.data = (void *)&mt8365_thermal_data,
++	},
++	{
++		.compatible = "mediatek,mt6797-thermal",
++		.data = (void *)&mt6797_thermal_data,
++	}, {
++	},
++};
++MODULE_DEVICE_TABLE(of, mtk_thermal_of_match);
++
++static void mtk_thermal_turn_on_buffer(struct mtk_thermal *mt,
++				       void __iomem *apmixed_base)
++{
++	u32 tmp;
++
++	if (!mt->conf->apmixed_buffer_ctl_reg)
++		return;
++
++	tmp = readl(apmixed_base + mt->conf->apmixed_buffer_ctl_reg);
++	tmp &= mt->conf->apmixed_buffer_ctl_mask;
++	tmp |= mt->conf->apmixed_buffer_ctl_set;
++	writel(tmp, apmixed_base + mt->conf->apmixed_buffer_ctl_reg);
++	udelay(200);
++}
++
++static void mtk_thermal_release_periodic_ts(struct mtk_thermal *mt,
++					    void __iomem *auxadc_base)
++{
++	int tmp;
++
++	writel(0x800, auxadc_base + AUXADC_CON1_SET_V);
++	writel(0x1, mt->thermal_base + TEMP_MONCTL0);
++	tmp = readl(mt->thermal_base + TEMP_MSRCTL1);
++	writel((tmp & (~0x10e)), mt->thermal_base + TEMP_MSRCTL1);
++}
++
++/*
++ * MT6797 bring-up, in the vendor order (mtk_ts_cpu.c init_thermal() and
++ * tscpu_thermal_initial_all_bank()): pause and disable every bank, wait
++ * for the controller's AHB master to go idle, take AUXADC channel 11 out
++ * of synchronous/immediate mode, program all banks, hand channel 11 back,
++ * then enable the sensing points and release the pause in every bank.
++ */
++static void mtk_thermal_v4_init(struct mtk_thermal *mt,
++				void __iomem *auxadc_base,
++				u32 apmixed_phys_base, u32 auxadc_phys_base)
++{
++	const struct mtk_thermal_data *conf = mt->conf;
++	u32 channel = BIT(conf->auxadc_channel);
++	u32 val;
++	int i;
++
++	for (i = 0; i < conf->num_banks; i++) {
++		struct mtk_thermal_bank *bank = &mt->banks[i];
++
++		bank->id = i;
++		bank->mt = mt;
++
++		mtk_thermal_get_bank(bank);
++		val = readl(mt->thermal_base + TEMP_MSRCTL1);
++		writel(val | TEMP_MSRCTL1_PAUSE_ALL,
++		       mt->thermal_base + TEMP_MSRCTL1);
++		writel(0, mt->thermal_base + TEMP_MONCTL0);
++		mtk_thermal_put_bank(bank);
++	}
++
++	if (readl_poll_timeout(mt->thermal_base + THERMAL_AHB_STATUS, val,
++			       !(val >> 16), 2, 1000))
++		dev_warn(mt->dev, "AHB master busy (0x%08x)\n", val);
++
++	val = readl(auxadc_base + AUXADC_CON0_V);
++	writel(val & ~channel, auxadc_base + AUXADC_CON0_V);
++	writel(channel, auxadc_base + AUXADC_CON1_CLR_V);
++
++	for (i = 0; i < conf->num_banks; i++)
++		mtk_thermal_init_bank(mt, i, apmixed_phys_base,
++				      auxadc_phys_base, 0);
++
++	writel(channel, auxadc_base + AUXADC_CON1_SET_V);
++
++	for (i = 0; i < conf->num_banks; i++) {
++		struct mtk_thermal_bank *bank = &mt->banks[i];
++
++		mtk_thermal_get_bank(bank);
++		writel(GENMASK(conf->bank_data[i].num_sensors - 1, 0),
++		       mt->thermal_base + TEMP_MONCTL0);
++		mtk_thermal_put_bank(bank);
++	}
++
++	for (i = 0; i < conf->num_banks; i++) {
++		struct mtk_thermal_bank *bank = &mt->banks[i];
++
++		mtk_thermal_get_bank(bank);
++		val = readl(mt->thermal_base + TEMP_MSRCTL1);
++		writel(val & ~TEMP_MSRCTL1_PAUSE_ALL,
++		       mt->thermal_base + TEMP_MSRCTL1);
++		mtk_thermal_put_bank(bank);
++	}
++}
++
++static int mtk_thermal_probe(struct platform_device *pdev)
++{
++	int ret, i, ctrl_id;
++	struct device_node *auxadc, *apmixedsys, *np = pdev->dev.of_node;
++	struct mtk_thermal *mt;
++	u64 auxadc_phys_base, apmixed_phys_base;
++	struct thermal_zone_device *tzdev;
++	void __iomem *apmixed_base, *auxadc_base;
++
++	mt = devm_kzalloc(&pdev->dev, sizeof(*mt), GFP_KERNEL);
++	if (!mt)
++		return -ENOMEM;
++
++	mt->conf = of_device_get_match_data(&pdev->dev);
++
++	mt->thermal_base = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
++	if (IS_ERR(mt->thermal_base))
++		return PTR_ERR(mt->thermal_base);
++
++	ret = mtk_thermal_get_calibration_data(&pdev->dev, mt);
++	if (ret)
++		return ret;
++
++	mutex_init(&mt->lock);
++
++	mt->dev = &pdev->dev;
++
++	auxadc = of_parse_phandle(np, "mediatek,auxadc", 0);
++	if (!auxadc) {
++		dev_err(&pdev->dev, "missing auxadc node\n");
++		return -ENODEV;
++	}
++
++	auxadc_base = of_iomap(auxadc, 0);
++	auxadc_phys_base = of_get_phys_base(auxadc);
++
++	of_node_put(auxadc);
++
++	if (auxadc_phys_base == OF_BAD_ADDR) {
++		dev_err(&pdev->dev, "Can't get auxadc phys address\n");
++		return -EINVAL;
++	}
++
++	apmixedsys = of_parse_phandle(np, "mediatek,apmixedsys", 0);
++	if (!apmixedsys) {
++		dev_err(&pdev->dev, "missing apmixedsys node\n");
++		return -ENODEV;
++	}
++
++	apmixed_base = of_iomap(apmixedsys, 0);
++	apmixed_phys_base = of_get_phys_base(apmixedsys);
++
++	of_node_put(apmixedsys);
++
++	if (apmixed_phys_base == OF_BAD_ADDR) {
++		dev_err(&pdev->dev, "Can't get auxadc phys address\n");
++		return -EINVAL;
++	}
++
++	ret = device_reset_optional(&pdev->dev);
++	if (ret)
++		return ret;
++
++	mt->clk_auxadc = devm_clk_get_enabled(&pdev->dev, "auxadc");
++	if (IS_ERR(mt->clk_auxadc)) {
++		ret = PTR_ERR(mt->clk_auxadc);
++		dev_err(&pdev->dev, "Can't enable auxadc clk: %d\n", ret);
++		return ret;
++	}
++
++	mt->clk_peri_therm = devm_clk_get_enabled(&pdev->dev, "therm");
++	if (IS_ERR(mt->clk_peri_therm)) {
++		ret = PTR_ERR(mt->clk_peri_therm);
++		dev_err(&pdev->dev, "Can't enable peri clk: %d\n", ret);
++		return ret;
++	}
++
++	mtk_thermal_turn_on_buffer(mt, apmixed_base);
++
++	if (mt->conf->version == MTK_THERMAL_V2 ||
++	    mt->conf->version == MTK_THERMAL_V3)
++		mtk_thermal_release_periodic_ts(mt, auxadc_base);
++
++	if (mt->conf->version == MTK_THERMAL_V1)
++		mt->raw_to_mcelsius = raw_to_mcelsius_v1;
++	else if (mt->conf->version == MTK_THERMAL_V2)
++		mt->raw_to_mcelsius = raw_to_mcelsius_v2;
++	else if (mt->conf->version == MTK_THERMAL_V4)
++		mt->raw_to_mcelsius = raw_to_mcelsius_v4;
++	else
++		mt->raw_to_mcelsius = raw_to_mcelsius_v3;
++
++	if (mt->conf->version == MTK_THERMAL_V4)
++		mtk_thermal_v4_init(mt, auxadc_base, apmixed_phys_base,
++				    auxadc_phys_base);
++	else
++		for (ctrl_id = 0; ctrl_id < mt->conf->num_controller ; ctrl_id++)
++			for (i = 0; i < mt->conf->num_banks; i++)
++				mtk_thermal_init_bank(mt, i, apmixed_phys_base,
++						      auxadc_phys_base, ctrl_id);
++
++	tzdev = devm_thermal_of_zone_register(&pdev->dev, 0, mt,
++					      &mtk_thermal_ops);
++	if (IS_ERR(tzdev))
++		return PTR_ERR(tzdev);
++
++	ret = devm_thermal_add_hwmon_sysfs(&pdev->dev, tzdev);
++	if (ret)
++		dev_warn(&pdev->dev, "error in thermal_add_hwmon_sysfs");
++
++	return 0;
++}
++
++static struct platform_driver mtk_thermal_driver = {
++	.probe = mtk_thermal_probe,
++	.driver = {
++		.name = "mtk-thermal",
++		.of_match_table = mtk_thermal_of_match,
++	},
++};
++
++module_platform_driver(mtk_thermal_driver);
++
++MODULE_AUTHOR("Michael Kao <michael.kao@mediatek.com>");
++MODULE_AUTHOR("Louis Yu <louis.yu@mediatek.com>");
++MODULE_AUTHOR("Dawei Chien <dawei.chien@mediatek.com>");
++MODULE_AUTHOR("Sascha Hauer <s.hauer@pengutronix.de>");
++MODULE_AUTHOR("Hanyi Wu <hanyi.wu@mediatek.com>");
++MODULE_DESCRIPTION("Mediatek thermal driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/devices/planet-geminipda/kernel/delta/include/dt-bindings/reset/mt6797-resets.h b/devices/planet-geminipda/kernel/delta/include/dt-bindings/reset/mt6797-resets.h
+new file mode 100644
+index 0000000..29dc017
+--- /dev/null
++++ b/devices/planet-geminipda/kernel/delta/include/dt-bindings/reset/mt6797-resets.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * MT6797 INFRACFG_AO software resets (reset id = 32 * bank + bit).
++ * Banks: RST0 set/clr 0x120/0x124, RST1 0x130/0x134, RST2 0x140/0x144,
++ * RST3 0x150/0x154. Bits from the vendor 3.18 kernel:
++ *   thermal controller  INFRA_GLOBALCON_RST_0 bit 0 (thermal/mt6797 mtk_tc.c)
++ *   PMIC wrapper        INFRA_GLOBALCON_RST_2 bit 0 (0x140/0x144)
++ */
++
++#ifndef _DT_BINDINGS_RESET_CONTROLLER_MT6797
++#define _DT_BINDINGS_RESET_CONTROLLER_MT6797
++
++#define MT6797_INFRA_THERM_CTRL_SW_RST		0
++#define MT6797_INFRA_PMIC_WRAP_SW_RST		64
++
++#endif  /* _DT_BINDINGS_RESET_CONTROLLER_MT6797 */
+diff --git a/docs/thermal.md b/docs/thermal.md
+new file mode 100644
+index 0000000..b2c7691
+--- /dev/null
++++ b/docs/thermal.md
+@@ -0,0 +1,93 @@
++# SoC thermal sensor (MT6797) — 2026-10-07
++
++Last updated: 2026-10-07. Prerequisite for A72 DVFS, GPU devfreq and higher
++A53 caps (docs/cpu-dvfs.md).
++
++## Status
++
++| Step | State |
++|---|---|
++| Driver ported (`thermal1-soc-sensor.patch`), compile-tested (clang, W=1, no warnings), DTB builds | done 2026-10-07 |
++| Conversion checked bit-exact against the vendor formula (7.8 M raw/calibration combinations) | done 2026-10-07 |
++| `bin/gemini-thermal-check.sh pre` on the device (LK devinfo + calibration valid) | pending |
++| First boot: zone reads plausibly (ixoo saw 32–35 °C idle on his unit) | pending |
++| Load test: temperature rises under load, falls after; 85 °C trip throttles the A53s | pending |
++
++## What the patch adds
++
++- **`drivers/thermal/mediatek/auxadc_thermal.c`** (copy of 6.6.157 + MT6797,
++  `MTK_THERMAL_V4`): mainline `mediatek,mt8173-thermal` driver family with
++  MT6797 data. Six banks via PTPCORESEL (vendor bank table: 0 big/A72 =
++  TS_MCU1, 1 GPU = TS_MCU4, 2 SoC = TS_MCU2+3, 3 L, 4 LL, 5 CCI = TS_MCU2),
++  AUXADC channel 11, vendor timing (AHBPOLL 0x30d, MSRCTL0 0x492 = 2-of-4
++  filter, valid mask 0x2c), TS_CON1[5:4] cleared (sensor buffer on), mux
++  values 0..3 + 0x10 (ABB). Init in the vendor order (pause + disable all
++  banks, wait THAHBST0 idle, AUXADC ch11 off, program banks, ch11 on, enable
++  sensing points, release pause). One thermal sensor = hottest of all banks
++  (like the vendor `mtktscpu` zone). Refuses to probe without valid
++  calibration (the defaults read far off). Logs one line:
++  `calibration: ge … oe … degc … slope … vts …`.
++- **Conversion** (`raw_to_mcelsius_v4`) = vendor `raw_to_temperature_roomt()`:
++  gain from ADC GE, offset OE − 512, per-sensor VTS, slope 1663 ± 10·O_SLOPE,
++  ×15/18. Includes ixoo's 2026-09-05 corrections (OE − 512 in both terms,
++  VTS by sensor id via `vts_index`).
++- **Calibration source: `drivers/nvmem/mtk-lk-devinfo.c`**
++  (`mediatek,mt6797-lk-devinfo`, `CONFIG_NVMEM_MTK_LK_DEVINFO=y`). LK copies
++  the efuse devinfo words into `/chosen/atag,devinfo` (103 LE words: size,
++  tag 0x41000804, 100 words, count). The vendor kernel reads its
++  calibration from that copy, never from the efuse block. The provider
++  exposes the payload (byte offset = 4 × index); thermal cell = indexes
++  31..33 = efuse 0x10206180/84/88 = `reg <0x7c 0xc>`. The MT6797 layout is the
++  mainline V1 (MT8173) fuse layout plus ADC OE in word 1 bits 21:12.
++- **Reset: `clk-mt6797.c` registers the INFRACFG_AO reset controller**
++  (set/clear pairs 0x120/0x130/0x140/0x150, like MT8183);
++  `include/dt-bindings/reset/mt6797-resets.h`: thermal = 0 (RST0 bit 0,
++  vendor `tscpu_reset_thermal()`), PMIC wrap = 64 (not used).
++- **DT**: `auxadc` node (disabled — channel 11 belongs to the thermal
++  controller), `thermal` node, `#reset-cells` on infracfg, `#cooling-cells`
++  on all CPUs; board: `/firmware/lk-devinfo`, zone `soc-thermal` (poll 1 s,
++  passive 250 ms), trips **passive 85 °C** (step_wise → cpufreq cooling of
++  policy0 and policy4) and **critical 105 °C** (orderly poweroff).
++- **Config**: `MTK_THERMAL=y`, `MTK_SOC_THERMAL=y`, `NVMEM_MTK_LK_DEVINFO=y`
++  (RESET_CONTROLLER and NVMEM_SYSFS were already on via select/default).
++  Resolved-config diff = exactly these three built-in symbols, so the
++  userdata modules still match (boot-only flash).
++
++## Not done (deliberately)
++
++- No IRQ, no hardware protection (TEMPPROT → RGU reset at 117 °C in the
++  vendor kernel). Needs the watchdog's thermal-reset mode; Linux's critical
++  trip is the protection for now.
++- No per-bank zones (mainline driver has one sensor). An A72-only zone
++  (bank 0) would be a later addition if the max-of-all zone throttles too
++  eagerly.
++- EEM/PTP (shares PTPCORESEL) is not used by our kernel.
++- Standalone IIO AUXADC stays disabled (needs arbitration with thermal).
++
++## Credits / sources
++
++- ixoo/gemini-pda-mainline (Linux 7.1.3): MT6797 V4 data, LK devinfo
++  calibration idea and wire format, V4 corrections (patches 0057, 0057a,
++  0512, 0517, 0541; experiments `2026-07-13-mt6797-thermal-recovery`,
++  `2026-09-03-mt6797-thermal-auxadc-transaction-audit`,
++  `2026-09-04-mt6797-thermal-snapshot`). Their read-only observation passed
++  on their Gemini (corrected V4: 32–35 °C idle across all banks).
++- Vendor kernel gemian/gemini-linux-kernel-3.18:
++  `drivers/misc/mediatek/thermal/mt6797/src/mtk_tc.c`,
++  `.../mt6797/inc/tscpu_settings.h`, `.../common/thermal_zones/mtk_ts_cpu.c`
++  (`init_thermal()`, `tscpu_thermal_initial_all_bank()`), trips in
++  `.../mt6797/inc/tzcpu_initcfg.h` (117 sysrst / 95 / 85 / 65 °C).
++
++## Test
++
++On the Gemini (`to_gemini bin/gemini-thermal-check.sh`):
++
++1. `sh gemini-thermal-check.sh pre` — before flashing. Must say
++   `calibration VALID`.
++2. After booting the thermal image: `sh gemini-thermal-check.sh post` —
++   probe messages, `soc-thermal` temperature, trips, cooling devices.
++3. `sh gemini-thermal-check.sh load 120` — temperature every 2 s under full
++   load + 60 s cooldown. Expect a rise of several °C and a fall afterwards.
++   Trip test without heat: `echo 90000 | sudo tee
++   /sys/class/thermal/thermal_zoneN/emul_temp` → LL/L should step down;
++   `echo 0 | sudo tee …/emul_temp` to end (CONFIG_THERMAL_EMULATION=y).
