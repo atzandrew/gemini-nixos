@@ -436,9 +436,14 @@
  *    clusters (the real SB value is in the comment).
  *  - Lowest points need CKDIV (/2); the clock driver doesn't do that yet,
  *    so LL >= 624 and L >= 650 MHz.
- *  - cpu8/9 (A72): OPP table only (the OPP core's opp-shared lookup needs
- *    one on every CPU), no clocks/supplies, so mediatek-cpufreq leaves them
- *    at 750 MHz (iDVFS via ATF, and no thermal sensor yet).
+ *  - cpu8/9 (A72, 2026-10-07 a72dvfs1): clock = cpu_b_sel (clk-mt6797-mcu;
+ *    the PLL is programmed through ATF), intermediate MAINPLL, NO proc
+ *    supply: VPROC2 stays at the 1.000 V that mt6797-cl2-power switches on
+ *    (mediatek-cpufreq must not enable it at boot, outside cl2-power's
+ *    PWRAP-SPI latch), so only the OPPs whose SB-0119 voltage is <= 1.000 V
+ *    are enabled (845..1495 MHz, each step tested by mt6797-a72clk-step).
+ *    Lower OPPs need CKDIV / posdiv /4 (untested via ATF), higher ones
+ *    voltage scaling (vsram_b + vproc2): a72dvfs2.
  */
 &cpu0 {
 	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
@@ -496,7 +501,11 @@
 	proc-supply = <&vproc1>;
 	sram-supply = <&vsram_l>;
 };
-&cpu8 { operating-points-v2 = <&cluster2_opp>; };
+&cpu8 {
+	clocks = <&mcumixedsys CLK_MCU_B_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+	clock-names = "cpu", "intermediate";
+	operating-points-v2 = <&cluster2_opp>;
+};
 &cpu9 { operating-points-v2 = <&cluster2_opp>; };
 
 / {
@@ -537,74 +546,91 @@
 
 	/*
 	 * A72, cpu8/9 on VPROC2: vendor SB date-code 0119 table, TT segment
-	 * (OPP0/1 = 2587/2431 MHz instead of 2522/2392). Descriptive only for
-	 * now: nothing scales the A72s yet.
+	 * (OPP0/1 = 2587/2431 MHz instead of 2522/2392). a72dvfs1: only
+	 * 845..1495 MHz enabled (fixed VPROC2 1.000 V, see the cpu8 comment);
+	 * the disabled points document the rest of the table.
 	 */
 	cluster2_opp: opp-table-cluster2 {
 		compatible = "operating-points-v2";
 		opp-shared;
 		opp-338000000 {
 			opp-hz = /bits/ 64 <338000000>;
+			status = "disabled";
 			opp-microvolt = <800000>;
 		};
 		opp-676000000 {
 			opp-hz = /bits/ 64 <676000000>;
+			status = "disabled";
 			opp-microvolt = <850000>;
 		};
 		opp-845000000 {
 			opp-hz = /bits/ 64 <845000000>;
+			clock-latency-ns = <500000>;
 			opp-microvolt = <880000>;
 		};
 		opp-1001000000 {
 			opp-hz = /bits/ 64 <1001000000>;
+			clock-latency-ns = <500000>;
 			opp-microvolt = <900000>;
 		};
 		opp-1131000000 {
 			opp-hz = /bits/ 64 <1131000000>;
+			clock-latency-ns = <500000>;
 			opp-microvolt = <930000>;
 		};
 		opp-1378000000 {
 			opp-hz = /bits/ 64 <1378000000>;
+			clock-latency-ns = <500000>;
 			opp-microvolt = <980000>;
 		};
 		opp-1495000000 {
 			opp-hz = /bits/ 64 <1495000000>;
+			clock-latency-ns = <500000>;
 			opp-microvolt = <1000000>;
 		};
 		opp-1677000000 {
 			opp-hz = /bits/ 64 <1677000000>;
+			status = "disabled";
 			opp-microvolt = <1040000>;
 		};
 		opp-1885000000 {
 			opp-hz = /bits/ 64 <1885000000>;
+			status = "disabled";
 			opp-microvolt = <1080000>;
 		};
 		opp-2093000000 {
 			opp-hz = /bits/ 64 <2093000000>;
+			status = "disabled";
 			opp-microvolt = <1110000>;
 		};
 		opp-2158000000 {
 			opp-hz = /bits/ 64 <2158000000>;
+			status = "disabled";
 			opp-microvolt = <1130000>;
 		};
 		opp-2223000000 {
 			opp-hz = /bits/ 64 <2223000000>;
+			status = "disabled";
 			opp-microvolt = <1140000>;
 		};
 		opp-2262000000 {
 			opp-hz = /bits/ 64 <2262000000>;
+			status = "disabled";
 			opp-microvolt = <1150000>;
 		};
 		opp-2327000000 {
 			opp-hz = /bits/ 64 <2327000000>;
+			status = "disabled";
 			opp-microvolt = <1160000>;
 		};
 		opp-2431000000 {
 			opp-hz = /bits/ 64 <2431000000>;
+			status = "disabled";
 			opp-microvolt = <1170000>;
 		};
 		opp-2587000000 {
 			opp-hz = /bits/ 64 <2587000000>;
+			status = "disabled";
 			opp-microvolt = <1200000>;
 		};
 	};
@@ -2116,8 +2142,8 @@
  * 4 * index). One zone = the hottest of the five sensors (A72, GPU, SoC
  * and the A53/CCI banks), like the vendor "mtktscpu" zone.
  * Trips: passive 85 C throttles the A53 clusters (cpufreq cooling,
- * step_wise), critical 105 C = orderly poweroff (vendor: 117 C HW reset).
- * The A72s join the cooling map when they get DVFS.
+ * step_wise; A72s too since a72dvfs1), critical 105 C = orderly poweroff
+ * (vendor: 117 C HW reset).
  */
 / {
 	firmware {
@@ -2162,6 +2188,11 @@
 				map-cpu-l {
 					trip = <&soc_alert>;
 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-cpu-b {
+					trip = <&soc_alert>;
+					cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};

@@ -596,3 +596,21 @@ Plan, each step on its own boot/test:
 3. **a72dvfs2**: `vsram_b` regulator driver over the SRAM-LDO SMCs, real
    SB-0119 voltages (880 mV … 1.2 V), OPPs above 1495 after soak + thermal
    checks under load (`gemini-thermal-check.sh load`).
+
+A72 log:
+- 2026-10-07 15:31 a72clk1 booted: `armpll_b` reads 750 MHz via SMC (cpumhz
+  748/745). `cpu_b_sel` showed clk26m: the clk core cached the mux parent at
+  registration while the cluster was off (field reads 0 then) → fix
+  a72clk1b (B mux reports ARMPLL while the cluster is down).
+- 2026-10-07 15:36–15:37 **step test PASSED**: 750 → 845 → 1001 → 1131 → 1378
+  → 1495 MHz, each exact in the SMC readback and in cpumhz (843/840, 999/996,
+  1129/1126, 1376/1373, 1492/1490), VPROC2 1.000 V throughout, ret 0. So
+  SETFREQ takes the OUTPUT MHz and ATF picks PCW/posdiv; it works while the
+  cluster runs from MAINPLL; whole switch ~0.15 ms.
+- a72dvfs1 (prepared 2026-10-07): mediatek-cpufreq gets a fixed-voltage mode
+  (no "proc" supply → clock-only transitions; needed because enabling VPROC2
+  from cpufreq at boot would switch the rail on outside cl2-power's PWRAP-SPI
+  latch). cpu8: clocks cpu_b_sel + MAINPLL, OPPs 845/1001/1131/1378/1495
+  enabled (others `status = "disabled"`), clock-latency 500 µs, cooling map
+  `map-cpu-b` on the 85 °C trip.
+

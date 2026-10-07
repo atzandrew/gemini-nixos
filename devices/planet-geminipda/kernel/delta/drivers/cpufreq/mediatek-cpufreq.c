@@ -164,6 +164,10 @@ static int mtk_cpufreq_set_voltage(struct mtk_cpu_dvfs_info *info, int vproc)
 	const struct mtk_cpufreq_platform_data *soc_data = info->soc_data;
 	int ret;
 
+	/* Gemini PDA: fixed-voltage cluster (no "proc" supply), see init */
+	if (!info->proc_reg)
+		return 0;
+
 	if (info->need_voltage_tracking)
 		ret = mtk_cpufreq_voltage_tracking(info, vproc);
 	else
@@ -214,6 +218,33 @@ static int mtk_cpufreq_set_target(struct cpufreq_policy *policy,
 	pre_freq_hz = clk_get_rate(cpu_clk);
 
 	mutex_lock(&info->reg_lock);
+
+	/*
+	 * Gemini PDA: a cluster without a "proc" supply runs at a fixed
+	 * voltage that covers every OPP in its table (and the intermediate
+	 * clock): only the clock moves.
+	 */
+	if (!info->proc_reg) {
+		freq_hz = freq_table[index].frequency * 1000;
+		ret = clk_set_parent(cpu_clk, info->inter_clk);
+		if (ret) {
+			dev_err(cpu_dev, "cpu%d: failed to re-parent cpu clock!\n",
+				policy->cpu);
+			goto out;
+		}
+		ret = clk_set_rate(armpll, freq_hz);
+		if (ret)
+			dev_err(cpu_dev, "cpu%d: failed to scale cpu clock rate!\n",
+				policy->cpu);
+		if (clk_set_parent(cpu_clk, armpll)) {
+			dev_err(cpu_dev, "cpu%d: failed to re-parent cpu clock back!\n",
+				policy->cpu);
+			ret = ret ?: -EIO;
+		}
+		if (!ret)
+			info->current_freq = freq_hz;
+		goto out;
+	}
 
 	if (unlikely(info->pre_vproc <= 0))
 		pre_vproc = regulator_get_voltage(info->proc_reg);
@@ -422,6 +453,20 @@ static int mtk_cpu_dvfs_info_init(struct mtk_cpu_dvfs_info *info, int cpu)
 	}
 
 	info->proc_reg = regulator_get_optional(cpu_dev, "proc");
+	if (PTR_ERR_OR_ZERO(info->proc_reg) == -ENODEV) {
+		/*
+		 * Gemini PDA: no "proc" supply = the cluster's rail is owned
+		 * elsewhere and stays at a voltage that covers the whole OPP
+		 * table (the A72s: VPROC2 is switched on by mt6797-cl2-power
+		 * inside the PWRAP SPI reset latch and must NOT be enabled
+		 * here at boot). Frequency-only scaling; the OPP voltages
+		 * are not applied.
+		 */
+		dev_info(cpu_dev, "cpu%d: no proc supply, fixed voltage\n", cpu);
+		info->proc_reg = NULL;
+		info->sram_reg = NULL;
+		goto opp_table;
+	}
 	if (IS_ERR(info->proc_reg)) {
 		ret = PTR_ERR(info->proc_reg);
 		dev_err_probe(cpu_dev, ret,
@@ -451,6 +496,7 @@ static int mtk_cpu_dvfs_info_init(struct mtk_cpu_dvfs_info *info, int cpu)
 		}
 	}
 
+opp_table:
 	/* Get OPP-sharing information from "operating-points-v2" bindings */
 	ret = dev_pm_opp_of_get_sharing_cpus(cpu_dev, &info->cpus);
 	if (ret) {
@@ -540,10 +586,12 @@ out_free_sram_reg:
 		regulator_put(info->sram_reg);
 
 out_disable_proc_reg:
-	regulator_disable(info->proc_reg);
+	if (info->proc_reg)
+		regulator_disable(info->proc_reg);
 
 out_free_proc_reg:
-	regulator_put(info->proc_reg);
+	if (info->proc_reg)
+		regulator_put(info->proc_reg);
 
 out_free_inter_clock:
 	clk_put(info->inter_clk);
@@ -556,8 +604,10 @@ out_free_mux_clock:
 
 static void mtk_cpu_dvfs_info_release(struct mtk_cpu_dvfs_info *info)
 {
-	regulator_disable(info->proc_reg);
-	regulator_put(info->proc_reg);
+	if (info->proc_reg) {
+		regulator_disable(info->proc_reg);
+		regulator_put(info->proc_reg);
+	}
 	if (info->sram_reg) {
 		regulator_disable(info->sram_reg);
 		regulator_put(info->sram_reg);

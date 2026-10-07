@@ -1,0 +1,284 @@
+diff --git a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 5eef0a0..88ca1d6 100644
+--- a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -436,9 +436,14 @@
+  *    clusters (the real SB value is in the comment).
+  *  - Lowest points need CKDIV (/2); the clock driver doesn't do that yet,
+  *    so LL >= 624 and L >= 650 MHz.
+- *  - cpu8/9 (A72): OPP table only (the OPP core's opp-shared lookup needs
+- *    one on every CPU), no clocks/supplies, so mediatek-cpufreq leaves them
+- *    at 750 MHz (iDVFS via ATF, and no thermal sensor yet).
++ *  - cpu8/9 (A72, 2026-10-07 a72dvfs1): clock = cpu_b_sel (clk-mt6797-mcu;
++ *    the PLL is programmed through ATF), intermediate MAINPLL, NO proc
++ *    supply: VPROC2 stays at the 1.000 V that mt6797-cl2-power switches on
++ *    (mediatek-cpufreq must not enable it at boot, outside cl2-power's
++ *    PWRAP-SPI latch), so only the OPPs whose SB-0119 voltage is <= 1.000 V
++ *    are enabled (845..1495 MHz, each step tested by mt6797-a72clk-step).
++ *    Lower OPPs need CKDIV / posdiv /4 (untested via ATF), higher ones
++ *    voltage scaling (vsram_b + vproc2): a72dvfs2.
+  */
+ &cpu0 {
+ 	clocks = <&mcumixedsys CLK_MCU_LL_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
+@@ -496,7 +501,11 @@
+ 	proc-supply = <&vproc1>;
+ 	sram-supply = <&vsram_l>;
+ };
+-&cpu8 { operating-points-v2 = <&cluster2_opp>; };
++&cpu8 {
++	clocks = <&mcumixedsys CLK_MCU_B_SEL>, <&apmixedsys CLK_APMIXED_MAINPLL>;
++	clock-names = "cpu", "intermediate";
++	operating-points-v2 = <&cluster2_opp>;
++};
+ &cpu9 { operating-points-v2 = <&cluster2_opp>; };
+ 
+ / {
+@@ -537,74 +546,91 @@
+ 
+ 	/*
+ 	 * A72, cpu8/9 on VPROC2: vendor SB date-code 0119 table, TT segment
+-	 * (OPP0/1 = 2587/2431 MHz instead of 2522/2392). Descriptive only for
+-	 * now: nothing scales the A72s yet.
++	 * (OPP0/1 = 2587/2431 MHz instead of 2522/2392). a72dvfs1: only
++	 * 845..1495 MHz enabled (fixed VPROC2 1.000 V, see the cpu8 comment);
++	 * the disabled points document the rest of the table.
+ 	 */
+ 	cluster2_opp: opp-table-cluster2 {
+ 		compatible = "operating-points-v2";
+ 		opp-shared;
+ 		opp-338000000 {
+ 			opp-hz = /bits/ 64 <338000000>;
++			status = "disabled";
+ 			opp-microvolt = <800000>;
+ 		};
+ 		opp-676000000 {
+ 			opp-hz = /bits/ 64 <676000000>;
++			status = "disabled";
+ 			opp-microvolt = <850000>;
+ 		};
+ 		opp-845000000 {
+ 			opp-hz = /bits/ 64 <845000000>;
++			clock-latency-ns = <500000>;
+ 			opp-microvolt = <880000>;
+ 		};
+ 		opp-1001000000 {
+ 			opp-hz = /bits/ 64 <1001000000>;
++			clock-latency-ns = <500000>;
+ 			opp-microvolt = <900000>;
+ 		};
+ 		opp-1131000000 {
+ 			opp-hz = /bits/ 64 <1131000000>;
++			clock-latency-ns = <500000>;
+ 			opp-microvolt = <930000>;
+ 		};
+ 		opp-1378000000 {
+ 			opp-hz = /bits/ 64 <1378000000>;
++			clock-latency-ns = <500000>;
+ 			opp-microvolt = <980000>;
+ 		};
+ 		opp-1495000000 {
+ 			opp-hz = /bits/ 64 <1495000000>;
++			clock-latency-ns = <500000>;
+ 			opp-microvolt = <1000000>;
+ 		};
+ 		opp-1677000000 {
+ 			opp-hz = /bits/ 64 <1677000000>;
++			status = "disabled";
+ 			opp-microvolt = <1040000>;
+ 		};
+ 		opp-1885000000 {
+ 			opp-hz = /bits/ 64 <1885000000>;
++			status = "disabled";
+ 			opp-microvolt = <1080000>;
+ 		};
+ 		opp-2093000000 {
+ 			opp-hz = /bits/ 64 <2093000000>;
++			status = "disabled";
+ 			opp-microvolt = <1110000>;
+ 		};
+ 		opp-2158000000 {
+ 			opp-hz = /bits/ 64 <2158000000>;
++			status = "disabled";
+ 			opp-microvolt = <1130000>;
+ 		};
+ 		opp-2223000000 {
+ 			opp-hz = /bits/ 64 <2223000000>;
++			status = "disabled";
+ 			opp-microvolt = <1140000>;
+ 		};
+ 		opp-2262000000 {
+ 			opp-hz = /bits/ 64 <2262000000>;
++			status = "disabled";
+ 			opp-microvolt = <1150000>;
+ 		};
+ 		opp-2327000000 {
+ 			opp-hz = /bits/ 64 <2327000000>;
++			status = "disabled";
+ 			opp-microvolt = <1160000>;
+ 		};
+ 		opp-2431000000 {
+ 			opp-hz = /bits/ 64 <2431000000>;
++			status = "disabled";
+ 			opp-microvolt = <1170000>;
+ 		};
+ 		opp-2587000000 {
+ 			opp-hz = /bits/ 64 <2587000000>;
++			status = "disabled";
+ 			opp-microvolt = <1200000>;
+ 		};
+ 	};
+@@ -2116,8 +2142,8 @@
+  * 4 * index). One zone = the hottest of the five sensors (A72, GPU, SoC
+  * and the A53/CCI banks), like the vendor "mtktscpu" zone.
+  * Trips: passive 85 C throttles the A53 clusters (cpufreq cooling,
+- * step_wise), critical 105 C = orderly poweroff (vendor: 117 C HW reset).
+- * The A72s join the cooling map when they get DVFS.
++ * step_wise; A72s too since a72dvfs1), critical 105 C = orderly poweroff
++ * (vendor: 117 C HW reset).
+  */
+ / {
+ 	firmware {
+@@ -2163,6 +2189,11 @@
+ 					trip = <&soc_alert>;
+ 					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+ 				};
++
++				map-cpu-b {
++					trip = <&soc_alert>;
++					cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
+ 			};
+ 		};
+ 	};
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/cpufreq/mediatek-cpufreq.c b/devices/planet-geminipda/kernel/delta/drivers/cpufreq/mediatek-cpufreq.c
+index 5b66dcc..69994bc 100644
+--- a/devices/planet-geminipda/kernel/delta/drivers/cpufreq/mediatek-cpufreq.c
++++ b/devices/planet-geminipda/kernel/delta/drivers/cpufreq/mediatek-cpufreq.c
+@@ -164,6 +164,10 @@ static int mtk_cpufreq_set_voltage(struct mtk_cpu_dvfs_info *info, int vproc)
+ 	const struct mtk_cpufreq_platform_data *soc_data = info->soc_data;
+ 	int ret;
+ 
++	/* Gemini PDA: fixed-voltage cluster (no "proc" supply), see init */
++	if (!info->proc_reg)
++		return 0;
++
+ 	if (info->need_voltage_tracking)
+ 		ret = mtk_cpufreq_voltage_tracking(info, vproc);
+ 	else
+@@ -215,6 +219,33 @@ static int mtk_cpufreq_set_target(struct cpufreq_policy *policy,
+ 
+ 	mutex_lock(&info->reg_lock);
+ 
++	/*
++	 * Gemini PDA: a cluster without a "proc" supply runs at a fixed
++	 * voltage that covers every OPP in its table (and the intermediate
++	 * clock): only the clock moves.
++	 */
++	if (!info->proc_reg) {
++		freq_hz = freq_table[index].frequency * 1000;
++		ret = clk_set_parent(cpu_clk, info->inter_clk);
++		if (ret) {
++			dev_err(cpu_dev, "cpu%d: failed to re-parent cpu clock!\n",
++				policy->cpu);
++			goto out;
++		}
++		ret = clk_set_rate(armpll, freq_hz);
++		if (ret)
++			dev_err(cpu_dev, "cpu%d: failed to scale cpu clock rate!\n",
++				policy->cpu);
++		if (clk_set_parent(cpu_clk, armpll)) {
++			dev_err(cpu_dev, "cpu%d: failed to re-parent cpu clock back!\n",
++				policy->cpu);
++			ret = ret ?: -EIO;
++		}
++		if (!ret)
++			info->current_freq = freq_hz;
++		goto out;
++	}
++
+ 	if (unlikely(info->pre_vproc <= 0))
+ 		pre_vproc = regulator_get_voltage(info->proc_reg);
+ 	else
+@@ -422,6 +453,20 @@ static int mtk_cpu_dvfs_info_init(struct mtk_cpu_dvfs_info *info, int cpu)
+ 	}
+ 
+ 	info->proc_reg = regulator_get_optional(cpu_dev, "proc");
++	if (PTR_ERR_OR_ZERO(info->proc_reg) == -ENODEV) {
++		/*
++		 * Gemini PDA: no "proc" supply = the cluster's rail is owned
++		 * elsewhere and stays at a voltage that covers the whole OPP
++		 * table (the A72s: VPROC2 is switched on by mt6797-cl2-power
++		 * inside the PWRAP SPI reset latch and must NOT be enabled
++		 * here at boot). Frequency-only scaling; the OPP voltages
++		 * are not applied.
++		 */
++		dev_info(cpu_dev, "cpu%d: no proc supply, fixed voltage\n", cpu);
++		info->proc_reg = NULL;
++		info->sram_reg = NULL;
++		goto opp_table;
++	}
+ 	if (IS_ERR(info->proc_reg)) {
+ 		ret = PTR_ERR(info->proc_reg);
+ 		dev_err_probe(cpu_dev, ret,
+@@ -451,6 +496,7 @@ static int mtk_cpu_dvfs_info_init(struct mtk_cpu_dvfs_info *info, int cpu)
+ 		}
+ 	}
+ 
++opp_table:
+ 	/* Get OPP-sharing information from "operating-points-v2" bindings */
+ 	ret = dev_pm_opp_of_get_sharing_cpus(cpu_dev, &info->cpus);
+ 	if (ret) {
+@@ -540,10 +586,12 @@ out_free_sram_reg:
+ 		regulator_put(info->sram_reg);
+ 
+ out_disable_proc_reg:
+-	regulator_disable(info->proc_reg);
++	if (info->proc_reg)
++		regulator_disable(info->proc_reg);
+ 
+ out_free_proc_reg:
+-	regulator_put(info->proc_reg);
++	if (info->proc_reg)
++		regulator_put(info->proc_reg);
+ 
+ out_free_inter_clock:
+ 	clk_put(info->inter_clk);
+@@ -556,8 +604,10 @@ out_free_mux_clock:
+ 
+ static void mtk_cpu_dvfs_info_release(struct mtk_cpu_dvfs_info *info)
+ {
+-	regulator_disable(info->proc_reg);
+-	regulator_put(info->proc_reg);
++	if (info->proc_reg) {
++		regulator_disable(info->proc_reg);
++		regulator_put(info->proc_reg);
++	}
+ 	if (info->sram_reg) {
+ 		regulator_disable(info->sram_reg);
+ 		regulator_put(info->sram_reg);
+diff --git a/docs/cpu-dvfs.md b/docs/cpu-dvfs.md
+index 812fb64..f36951a 100644
+--- a/docs/cpu-dvfs.md
++++ b/docs/cpu-dvfs.md
+@@ -596,3 +596,21 @@ Plan, each step on its own boot/test:
+ 3. **a72dvfs2**: `vsram_b` regulator driver over the SRAM-LDO SMCs, real
+    SB-0119 voltages (880 mV … 1.2 V), OPPs above 1495 after soak + thermal
+    checks under load (`gemini-thermal-check.sh load`).
++
++A72 log:
++- 2026-10-07 15:31 a72clk1 booted: `armpll_b` reads 750 MHz via SMC (cpumhz
++  748/745). `cpu_b_sel` showed clk26m: the clk core cached the mux parent at
++  registration while the cluster was off (field reads 0 then) → fix
++  a72clk1b (B mux reports ARMPLL while the cluster is down).
++- 2026-10-07 15:36–15:37 **step test PASSED**: 750 → 845 → 1001 → 1131 → 1378
++  → 1495 MHz, each exact in the SMC readback and in cpumhz (843/840, 999/996,
++  1129/1126, 1376/1373, 1492/1490), VPROC2 1.000 V throughout, ret 0. So
++  SETFREQ takes the OUTPUT MHz and ATF picks PCW/posdiv; it works while the
++  cluster runs from MAINPLL; whole switch ~0.15 ms.
++- a72dvfs1 (prepared 2026-10-07): mediatek-cpufreq gets a fixed-voltage mode
++  (no "proc" supply → clock-only transitions; needed because enabling VPROC2
++  from cpufreq at boot would switch the rail on outside cl2-power's PWRAP-SPI
++  latch). cpu8: clocks cpu_b_sel + MAINPLL, OPPs 845/1001/1131/1378/1495
++  enabled (others `status = "disabled"`), clock-latency 500 µs, cooling map
++  `map-cpu-b` on the 85 °C trip.
++
