@@ -260,7 +260,7 @@ static int mcu_pll_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long
 		return ret;
 	}
 	udelay(PLL_SETTLE_US);	/* before anyone switches the cluster back */
-	pr_info("clk-mt6797-mcu: %s -> %lu Hz (CON1 0x%08x, /%u)\n",
+	pr_debug("clk-mt6797-mcu: %s -> %lu Hz (CON1 0x%08x, /%u)\n",
 		clk_hw_get_name(hw), rate, con1, 1u << shift);
 	return 0;
 }
@@ -312,7 +312,7 @@ static int mcu_mux_set_parent(struct clk_hw *hw, u8 index)
 
 	if (ret)
 		return ret;
-	pr_info("clk-mt6797-mcu: %s -> %s (MUXSEL 0x%08x)\n", clk_hw_get_name(hw),
+	pr_debug("clk-mt6797-mcu: %s -> %s (MUXSEL 0x%08x)\n", clk_hw_get_name(hw),
 		clk_hw_get_name(clk_hw_get_parent_by_index(hw, index)) ?: "?", muxsel);
 	return 0;
 }

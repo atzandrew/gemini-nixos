@@ -496,6 +496,7 @@
 	cluster0_opp: opp-table-cluster0 {	/* LL, cpu0-3 */
 		compatible = "operating-points-v2";
 		opp-shared;
+		clock-latency-ns = <500000>;	/* mux+PLL+DA9214 I2C, measured ~0.1-0.5 ms */
 		opp-624000000 {
 			opp-hz = /bits/ 64 <624000000>;
 			opp-microvolt = <1000000>;	/* SB 900 mV, CCI floor */
@@ -599,6 +600,7 @@
 	cluster1_opp: opp-table-cluster1 {	/* L, cpu4-7 */
 		compatible = "operating-points-v2";
 		opp-shared;
+		clock-latency-ns = <500000>;	/* mux+PLL+DA9214 I2C, measured ~0.1-0.5 ms */
 		opp-650000000 {
 			opp-hz = /bits/ 64 <650000000>;
 			opp-microvolt = <1000000>;	/* SB 850 mV, CCI floor */

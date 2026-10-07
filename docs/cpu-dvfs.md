@@ -523,3 +523,17 @@ cl2-up.sh, the timer and sramldo-smc.
   CPUs without a `clocks` property instead of without an OPP table. (Also:
   an earlier flash of this step put the previous image on by mistake —
   check `ls /proc/device-tree/cpus/cpu@0/` after flashing.)
+- 2026-10-07 08:00: **cpufreq works** (boot-cpufreq3): policy0 = cpu0-3
+  (624..1118 MHz), policy4 = cpu4-7 (650..1352 MHz), schedutil. Game test:
+  ~391k LL and ~500k L transitions, no errors, no hang. time_in_state
+  (10 ms units): LL 624 73768 / 1118 66037 (little in between), L 650 84040
+  / 1352 58740. Rails sampled under load: VPROC1 1.00/1.04/1.07, VSRAM_L
+  1.15/1.175 (single reads can mix before/after values of one transition).
+  Problems: (1) the clk driver's pr_info on every switch flooded dmesg;
+  (2) schedutil re-evaluated every 1 ms (mediatek-cpufreq leaves
+  transition_latency 0) so LL ping-ponged 624 <-> 1118 about every
+  millisecond, each time via 1.07 V and two DA9214 writes. Fix: clk logs
+  -> pr_debug; mediatek-cpufreq sets cpuinfo.transition_latency from the
+  OPP table; both tables get clock-latency-ns = 500 us -> schedutil
+  rate_limit 10 ms. Next: FHCTL (no intermediate, no 1.07 V detour), CCI
+  scaling (drops the 1.00 V floor), more OPPs.
