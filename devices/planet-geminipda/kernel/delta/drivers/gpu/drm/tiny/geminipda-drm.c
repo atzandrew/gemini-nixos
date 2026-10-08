@@ -78,6 +78,27 @@
  *    panel rate instead of copy rate.  [2026-10-03] See the comment above
  *    geminipda_drm_vblank_tick().
  *
+ *  - Hardware vblank + vblank-aligned copy ("vsync1", 2026-10-07).  The
+ *    panel runs in DSI VIDEO mode (vendor LCM aeon_ssd2092_fhd_dsi_solomon:
+ *    SYNC_PULSE_VDO_MODE): RDMA0 reads the LK buffer from DRAM every frame
+ *    and raises its frame-done interrupt (INT_STATUS bit 2, vendor
+ *    ddp_irq.c; the vendor kernel maps DISP_PATH_EVENT_IF_VSYNC to
+ *    DDP_IRQ_RDMA0_DONE).  When the DT node points at disp_rdma0
+ *    (mediatek,rdma) this driver takes that interrupt as its vblank.  The
+ *    ONLY registers this driver writes are RDMA0 INT_ENABLE (its own bit or
+ *    0; LK leaves 0x3f) and INT_STATUS (write-0-to-clear) — no panel, DSI,
+ *    OVL or mutex state.  Measured 2026-10-07: 59.17 Hz (16.90 ms), video
+ *    sync-pulse, 120 blank lines (~0.89 ms).  A
+ *    probe-time self-test falls back to the software vblank if the
+ *    interrupt is silent or storms.
+ *    With chase=1 the commit waits for the next frame-done, completes the
+ *    flip with that vblank's timestamp and then copies: a full-frame copy
+ *    (~7 ms) outruns the scan (~16 ms for 2160 lines), so when it starts in
+ *    the vertical blank the beam never overtakes it and the frame is shown
+ *    whole — no tearing, no second buffer.  OVL0 (mediatek,ovl) is only
+ *    read, to log which layer scans out the LK buffer (for the later
+ *    page-flip / zero-copy steps).
+ *
  * CORE RULE 5: this driver never initialises the panel.  LK does that.
  * The shadow blit only writes the already-initialised scanout region, so
  * there is no path from here to the "uninitialised panel" flicker.  The
@@ -87,13 +108,17 @@
 
 #include <linux/backlight.h>
 #include <linux/dma-mapping.h>
+#include <linux/delay.h>
 #include <linux/hrtimer.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <asm/unaligned.h>
 
@@ -120,7 +145,7 @@
 
 #define DRIVER_NAME	"geminipda-drm"
 #define DRIVER_DESC	"Gemini PDA (MT6797) LK framebuffer DRM/KMS driver"
-#define DRIVER_DATE	"20261003"
+#define DRIVER_DATE	"20261007"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -178,6 +203,53 @@ module_param(stat_px_last, uint, 0444);
 static unsigned long stat_full_frames;
 module_param(stat_full_frames, ulong, 0444);
 
+/*
+ * Display engine registers (vendor ddp_reg.h, gemian/gemini-linux-kernel-3.18
+ * drivers/misc/mediatek/video/mt6797/dispsys; same layout as mainline
+ * mtk_disp_rdma.c / mtk_disp_ovl.c).  Only RDMA_INT_ENABLE / RDMA_INT_STATUS
+ * are ever written.
+ */
+#define RDMA_INT_ENABLE		0x000
+#define RDMA_INT_STATUS		0x004	/* write 0 to clear (vendor writes ~sta) */
+#define RDMA_GLOBAL_CON		0x010	/* bit0 engine enable, bit1 memory mode */
+#define RDMA_SIZE_CON_0		0x014
+#define RDMA_SIZE_CON_1		0x018
+#define RDMA_OUT_LINE_CNT	0x0fc
+#define OVL_SRC_CON		0x02c
+#define OVL_L_CON(n)		(0x030 + 0x20 * (n))
+#define OVL_L_PITCH(n)		(0x044 + 0x20 * (n))
+#define OVL_L_ADDR(n)		(0xf40 + 0x20 * (n))
+
+/* Hardware vblank (vsync1).  hw_vblank / vblank_irq_bit apply at probe. */
+static bool hw_vblank = true;
+module_param(hw_vblank, bool, 0444);
+MODULE_PARM_DESC(hw_vblank,
+	"Use RDMA0's frame interrupt as vblank when the DT provides it (default on)");
+
+static unsigned int vblank_irq_bit = 2;
+module_param(vblank_irq_bit, uint, 0444);
+MODULE_PARM_DESC(vblank_irq_bit,
+	"RDMA0 INT_STATUS bit used as vblank: 2 = frame done (default), 1 = frame start");
+
+static bool chase = true;
+module_param(chase, bool, 0644);
+MODULE_PARM_DESC(chase,
+	"With hw vblank: start each copy at frame-done so it stays ahead of the scan");
+
+/* hw vblank statistics (read-only) */
+static unsigned long stat_vblank_irqs;
+module_param(stat_vblank_irqs, ulong, 0444);
+static unsigned int stat_irq_line;	/* RDMA0 OUT_LINE_CNT seen in the IRQ */
+module_param(stat_irq_line, uint, 0444);
+static unsigned int stat_chase_line;	/* OUT_LINE_CNT when a chased copy starts */
+module_param(stat_chase_line, uint, 0444);
+static unsigned int stat_chase_line_max;	/* write 0 to reset */
+module_param(stat_chase_line_max, uint, 0644);
+static unsigned long stat_chased;
+module_param(stat_chased, ulong, 0444);
+static unsigned int stat_hw_period_us;	/* measured at probe */
+module_param(stat_hw_period_us, uint, 0444);
+
 struct geminipda_drm_device {
 	struct drm_device dev;
 	struct drm_plane primary_plane;
@@ -193,6 +265,15 @@ struct geminipda_drm_device {
 	struct hrtimer vblank_timer;
 	u64 vblank_period_ns;
 	bool vblank_on;
+	/* Hardware vblank (RDMA0 frame interrupt), see vsync1 in the header. */
+	void __iomem *rdma;
+	int rdma_irq;
+	u32 rdma_inten_orig;
+	bool hw;		/* RDMA0 IRQ is the vblank source */
+	bool drm_ready;		/* vblank core initialised: IRQ may report */
+	ktime_t hw_last;	/* timestamp of the last frame interrupt */
+	unsigned int selftest_irqs;
+	ktime_t selftest_first;
 };
 
 static struct geminipda_drm_device *
@@ -581,10 +662,33 @@ static enum hrtimer_restart geminipda_drm_vblank_tick(struct hrtimer *timer)
 	return READ_ONCE(sdev->vblank_on) ? HRTIMER_RESTART : HRTIMER_NORESTART;
 }
 
+/*
+ * LK leaves RDMA0 INT_ENABLE = 0x3f (every source) with nobody handling the
+ * line (probe 2026-10-07: INT_STA 0x26 pending).  Once we request the IRQ,
+ * any other enabled source would hold the level line with no handler able
+ * to claim it, so this driver owns INT_ENABLE outright: only its own bit, or
+ * nothing.
+ */
+static void geminipda_drm_rdma_irq_mask(struct geminipda_drm_device *sdev, bool on)
+{
+	if (on) {
+		writel(0, sdev->rdma + RDMA_INT_STATUS);	/* drop stale events */
+		writel(BIT(vblank_irq_bit), sdev->rdma + RDMA_INT_ENABLE);
+	} else {
+		writel(0, sdev->rdma + RDMA_INT_ENABLE);
+	}
+}
+
 static int geminipda_drm_enable_vblank(struct drm_crtc *crtc)
 {
 	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
 	u64 period = geminipda_drm_vblank_period_ns();
+
+	if (sdev->hw) {
+		drm_calc_timestamping_constants(crtc, &crtc->mode);
+		geminipda_drm_rdma_irq_mask(sdev, true);
+		return 0;
+	}
 
 	drm_calc_timestamping_constants(crtc, &crtc->mode);
 	geminipda_drm_set_period(sdev, period);
@@ -598,6 +702,10 @@ static void geminipda_drm_disable_vblank(struct drm_crtc *crtc)
 {
 	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
 
+	if (sdev->hw) {
+		geminipda_drm_rdma_irq_mask(sdev, false);
+		return;
+	}
 	WRITE_ONCE(sdev->vblank_on, false);
 	hrtimer_try_to_cancel(&sdev->vblank_timer);
 }
@@ -612,6 +720,13 @@ static bool geminipda_drm_get_vblank_timestamp(struct drm_crtc *crtc,
 
 	if (!READ_ONCE(vblank->enabled)) {
 		*vblank_time = ktime_get();
+		return true;
+	}
+
+	if (sdev->hw) {
+		ktime_t t = READ_ONCE(sdev->hw_last);
+
+		*vblank_time = t ? t : ktime_get();
 		return true;
 	}
 
@@ -736,19 +851,61 @@ static const struct drm_connector_funcs geminipda_drm_connector_funcs = {
 };
 
 /*
- * drm_atomic_helper_commit_tail() minus the wait-for-vblank when
- * refresh_hz == 0 (uncapped; see the software vblank comment).
+ * Vblank-aligned copy (hw vblank + chase): wait for RDMA0's frame-done,
+ * complete the flip with that vblank's timestamp, then let the plane update
+ * copy while the panel is still in its vertical blank.  Only for plain page
+ * flips on an active CRTC (no modeset).  Returns true when the event was
+ * consumed here.
+ */
+static bool geminipda_drm_chase(struct geminipda_drm_device *sdev,
+				struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc = &sdev->crtc;
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(old_state, crtc);
+	struct drm_pending_vblank_event *event;
+	unsigned int line;
+
+	if (!sdev->hw || !READ_ONCE(chase) || !READ_ONCE(refresh_hz) || !cs ||
+	    !cs->active || drm_atomic_crtc_needs_modeset(cs) ||
+	    !drm_atomic_get_new_plane_state(old_state, &sdev->primary_plane))
+		return false;
+
+	drm_crtc_wait_one_vblank(crtc);
+
+	line = readl(sdev->rdma + RDMA_OUT_LINE_CNT) & 0xffff;
+	WRITE_ONCE(stat_chase_line, line);
+	if (line > stat_chase_line_max)
+		WRITE_ONCE(stat_chase_line_max, line);
+	stat_chased++;
+
+	event = cs->event;
+	if (event) {
+		cs->event = NULL;
+		spin_lock_irq(&crtc->dev->event_lock);
+		drm_crtc_send_vblank_event(crtc, event);
+		spin_unlock_irq(&crtc->dev->event_lock);
+	}
+	return true;
+}
+
+/*
+ * drm_atomic_helper_commit_tail() plus the vblank-aligned copy, minus the
+ * wait-for-vblank when refresh_hz == 0 (uncapped; see the software vblank
+ * comment) or when the flip event was already sent at the chased vblank.
  */
 static void geminipda_drm_commit_tail(struct drm_atomic_state *old_state)
 {
 	struct drm_device *dev = old_state->dev;
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(dev);
+	bool chased;
 
 	drm_atomic_helper_commit_modeset_disables(dev, old_state);
+	chased = geminipda_drm_chase(sdev, old_state);
 	drm_atomic_helper_commit_planes(dev, old_state, 0);
 	drm_atomic_helper_commit_modeset_enables(dev, old_state);
 	drm_atomic_helper_fake_vblank(old_state);
 	drm_atomic_helper_commit_hw_done(old_state);
-	if (READ_ONCE(refresh_hz))
+	if (READ_ONCE(refresh_hz) && !chased)
 		drm_atomic_helper_wait_for_vblanks(dev, old_state);
 	drm_atomic_helper_cleanup_planes(dev, old_state);
 }
@@ -773,6 +930,151 @@ static struct drm_display_mode geminipda_drm_mode(unsigned int width,
 	};
 
 	return mode;
+}
+
+/*
+ * RDMA0 frame interrupt.  Before the vblank core is up (probe self-test) it
+ * only counts; afterwards it is the CRTC's vblank.
+ */
+static irqreturn_t geminipda_drm_rdma_irq(int irq, void *arg)
+{
+	struct geminipda_drm_device *sdev = arg;
+	u32 sta = readl(sdev->rdma + RDMA_INT_STATUS);
+	ktime_t now = ktime_get();
+
+	if (!(sta & BIT(vblank_irq_bit)))
+		return IRQ_NONE;
+	writel(~sta, sdev->rdma + RDMA_INT_STATUS);
+
+	WRITE_ONCE(sdev->hw_last, now);
+	stat_vblank_irqs++;
+	WRITE_ONCE(stat_irq_line, readl(sdev->rdma + RDMA_OUT_LINE_CNT) & 0xffff);
+
+	if (READ_ONCE(sdev->drm_ready)) {
+		drm_crtc_handle_vblank(&sdev->crtc);
+	} else {
+		if (!sdev->selftest_irqs++)
+			sdev->selftest_first = now;
+		/* storm guard: a frame IRQ can't come 100x in 200 ms */
+		if (sdev->selftest_irqs > 100)
+			writel(0, sdev->rdma + RDMA_INT_ENABLE);
+	}
+	return IRQ_HANDLED;
+}
+
+/* Read-only: which OVL0 layer scans out the LK buffer (logged for later). */
+static void geminipda_drm_report_ovl(struct device *dev, u64 fb_base, u32 fb_size)
+{
+	struct device_node *np = of_parse_phandle(dev->of_node, "mediatek,ovl", 0);
+	void __iomem *ovl;
+	u32 src;
+	int n;
+
+	if (!np)
+		return;
+	ovl = of_iomap(np, 0);
+	of_node_put(np);
+	if (!ovl)
+		return;
+	src = readl(ovl + OVL_SRC_CON);
+	for (n = 0; n < 4; n++) {
+		u32 addr = readl(ovl + OVL_L_ADDR(n));
+
+		dev_info(dev, "ovl0 L%d: en=%u con=0x%08x pitch=%u addr=0x%08x%s\n",
+			 n, (src >> n) & 1, readl(ovl + OVL_L_CON(n)),
+			 readl(ovl + OVL_L_PITCH(n)) & 0xffff, addr,
+			 (addr >= fb_base && addr < fb_base + fb_size) ?
+			 " <- LK framebuffer" : "");
+	}
+	iounmap(ovl);
+}
+
+/*
+ * Map RDMA0 from the mediatek,rdma phandle, take its interrupt and check it
+ * ticks at a plausible frame rate.  Any failure leaves sdev->hw false (the
+ * software vblank is used) and RDMA0 INT_ENABLE as it was.
+ */
+static void geminipda_drm_hw_vblank_init(struct geminipda_drm_device *sdev)
+{
+	struct device *dev = sdev->dev.dev;
+	struct device_node *np;
+	u32 con, bit;
+	unsigned int n, period_us = 0;
+	int ret;
+
+	if (!hw_vblank || vblank_irq_bit > 5)
+		return;
+	np = of_parse_phandle(dev->of_node, "mediatek,rdma", 0);
+	if (!np) {
+		dev_info(dev, "no mediatek,rdma in DT: software vblank\n");
+		return;
+	}
+	sdev->rdma = devm_of_iomap(dev, np, 0, NULL);
+	sdev->rdma_irq = irq_of_parse_and_map(np, 0);
+	of_node_put(np);
+	if (IS_ERR(sdev->rdma) || !sdev->rdma_irq) {
+		dev_warn(dev, "rdma0 map/irq failed: software vblank\n");
+		sdev->rdma = NULL;
+		return;
+	}
+
+	con = readl(sdev->rdma + RDMA_GLOBAL_CON);
+	sdev->rdma_inten_orig = readl(sdev->rdma + RDMA_INT_ENABLE);
+	dev_info(dev, "rdma0: global_con=0x%08x size=%ux%u int_en=0x%x line=%u\n",
+		 con, readl(sdev->rdma + RDMA_SIZE_CON_0) & 0x1fff,
+		 readl(sdev->rdma + RDMA_SIZE_CON_1) & 0xfffff,
+		 sdev->rdma_inten_orig,
+		 readl(sdev->rdma + RDMA_OUT_LINE_CNT) & 0xffff);
+	if (!(con & 1)) {
+		dev_warn(dev, "rdma0 not running: software vblank\n");
+		return;
+	}
+
+	bit = BIT(vblank_irq_bit);
+	/* all sources off and acknowledged before the line is requested */
+	writel(0, sdev->rdma + RDMA_INT_ENABLE);
+	writel(0, sdev->rdma + RDMA_INT_STATUS);
+	ret = devm_request_irq(dev, sdev->rdma_irq, geminipda_drm_rdma_irq, 0,
+			       "geminipda-drm-vblank", sdev);
+	if (ret) {
+		dev_warn(dev, "request_irq(%d): %d: software vblank\n",
+			 sdev->rdma_irq, ret);
+		return;
+	}
+
+	/* Self-test: ~200 ms of frame interrupts. */
+	writel(bit, sdev->rdma + RDMA_INT_ENABLE);
+	msleep(200);
+	writel(0, sdev->rdma + RDMA_INT_ENABLE);
+	n = READ_ONCE(sdev->selftest_irqs);
+	if (n > 1)
+		period_us = div_u64(ktime_us_delta(READ_ONCE(sdev->hw_last),
+						   sdev->selftest_first), n - 1);
+	stat_hw_period_us = period_us;
+
+	if (n < 5 || n > 30 || period_us < 8000 || period_us > 34000) {
+		dev_warn(dev, "rdma0 bit %u self-test: %u irqs in 200 ms (period %u us): software vblank\n",
+			 vblank_irq_bit, n, period_us);
+		devm_free_irq(dev, sdev->rdma_irq, sdev);
+		return;
+	}
+
+	sdev->hw = true;
+	dev_info(dev, "hardware vblank: rdma0 bit %u, %u irqs in 200 ms, period %u us (%u.%02u Hz), line at irq %u\n",
+		 vblank_irq_bit, n, period_us, 1000000 / period_us,
+		 (100000000 / period_us) % 100, stat_irq_line);
+}
+
+static void geminipda_drm_hw_vblank_fini(struct geminipda_drm_device *sdev)
+{
+	if (!sdev->hw)
+		return;
+	WRITE_ONCE(sdev->drm_ready, false);
+	/*
+	 * Not LK's 0x3f: the IRQ stays requested until devm teardown, and
+	 * with nobody handling the line afterwards the sources are unused.
+	 */
+	writel(0, sdev->rdma + RDMA_INT_ENABLE);
 }
 
 static struct geminipda_drm_device *
@@ -925,6 +1227,11 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 	if (ret)
 		return ERR_PTR(ret);
 
+	/* Hardware vblank from RDMA0 if the DT wires it (falls back above). */
+	geminipda_drm_report_ovl(dev->dev, fb_base, fb_size);
+	geminipda_drm_hw_vblank_init(sdev);
+	WRITE_ONCE(sdev->drm_ready, true);
+
 	drm_mode_config_reset(dev);
 
 	return sdev;
@@ -970,6 +1277,7 @@ static int geminipda_drm_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
+	geminipda_drm_hw_vblank_fini(sdev);
 	sdev->vblank_on = false;
 	hrtimer_cancel(&sdev->vblank_timer);
 
@@ -981,6 +1289,7 @@ static void geminipda_drm_shutdown(struct platform_device *pdev)
 	struct geminipda_drm_device *sdev = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&sdev->dev);
+	geminipda_drm_hw_vblank_fini(sdev);
 	sdev->vblank_on = false;
 	hrtimer_cancel(&sdev->vblank_timer);
 }

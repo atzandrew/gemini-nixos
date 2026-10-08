@@ -20,9 +20,9 @@
 #            lsflash                 list $FLASHDIR with sizes + sha256
 
 # ---- machine addresses (edit here) -----------------------------------------
-GEMINI_IP=10.0.20.216     # target device (Wi-Fi)
-HYDRA_IP=10.0.20.128      # dev/build machine (no SSH server)
-DRAGON_IP=10.0.20.129     # flashing machine (USB to the Gemini, mtkclient)
+GEMINI_IP=192.168.0.139   # target device (Wi-Fi)                  [home; other network: 10.0.20.216]
+HYDRA_IP=192.168.0.218    # dev/build machine (no SSH server)      [home; other network: 10.0.20.128]
+DRAGON_IP=192.168.0.8     # flashing machine (USB, mtkclient)      [home; other network: 10.0.20.129]
 
 GUSER=atzero
 FLASHDIR=/home/atzero/readytoflash      # images to flash, on Dragon (absolute: mtk wants it)

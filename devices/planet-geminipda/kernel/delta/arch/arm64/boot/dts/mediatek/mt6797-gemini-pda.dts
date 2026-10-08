@@ -95,6 +95,15 @@
 		compatible = "planet,geminipda-drm";
 		/* scanout runs in MM; holding it keeps genpd from switching it off */
 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+		/*
+		 * vsync1 (2026-10-07): RDMA0's frame-done interrupt is the
+		 * vblank (the driver only writes RDMA0 INT_ENABLE/INT_STATUS);
+		 * OVL0 is read-only (logs which layer scans out the LK fb). No
+		 * driver binds disp_rdma0/disp_ovl0 themselves (DRM_MEDIATEK is
+		 * hard-banned), so nothing else owns these registers.
+		 */
+		mediatek,rdma = <&disp_rdma0>;
+		mediatek,ovl = <&disp_ovl0>;
 	};
 
 	reserved-memory {
