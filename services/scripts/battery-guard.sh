@@ -98,6 +98,29 @@ g_fcc_last=""
 g_dis_since=0
 CAP=?
 SRC=bq
+# Charger input limit (uA). The BQ25896 falls back to 500 mA whenever it
+# re-detects its input (plug-in, or a VBUS dip without a new plug-in event),
+# and then the device drains while "charging" (seen 2026-10-08: 500 mA in,
+# battery -480 mA). The udev rule only fires on plug-in; restore it here on
+# every poll while a charger is online. 0 = leave the limit alone.
+ILIM_UA=${BATTERY_GUARD_INPUT_LIMIT_UA:-2500000}
+
+# Put the charger input limit back to ILIM_UA if the chip reset it.
+enforce_ilim() {
+    [ "$ILIM_UA" -gt 0 ] 2>/dev/null || return 0
+    local p cur
+    for p in $PSY_GLOB; do
+        [ -w "$p/input_current_limit" ] || continue
+        [ "$(cat "$p/online" 2>/dev/null)" = 1 ] || continue
+        cur=$(cat "$p/input_current_limit" 2>/dev/null) || continue
+        case "$cur" in (*[!0-9]*|'') continue ;; esac
+        if [ "$cur" -lt "$ILIM_UA" ]; then
+            if echo "$ILIM_UA" > "$p/input_current_limit" 2>/dev/null; then
+                log "charger input limit was ${cur} uA -> restored ${ILIM_UA} uA"
+            fi
+        fi
+    done
+}
 
 mkdir -p "$RUNDIR"
 if [ ! -s "$HIST" ]; then
@@ -374,6 +397,7 @@ while :; do
         log "state: ${prev_guard:-<init>} -> ${GUARD} (online=${ONLINE} status=${STATUS} vbat=${VBAT_MV}mV)"
         prev_guard=$GUARD
     fi
+    enforce_ilim
     write_state
     echo "$(date '+%F %T'),${ONLINE},${STATUS},${CHGT:-?},${VBAT_MV},${IBAT},${TEMP},${GUARD},${SRC},${CAP}" >> "$HIST"
     rotate_hist
