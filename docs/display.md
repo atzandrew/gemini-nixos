@@ -1,6 +1,16 @@
 # Gemini PDA — framebuffer, vblank and tearing
 
-Started 2026-10-07 (evening). Goal: tear-free display on Debian/Plasma without touching panel init (CORE RULE 5). Status (2026-10-07 ~18:30): research done; **step 0 probe** (`bin/gemini-disp-probe.py`) and **step 1 `vsync1-hw-vblank.patch`** (repo root, on `01425eb`) ready — both untested on the device.
+Started 2026-10-07 (evening). Goal: tear-free display on Debian/Plasma without touching panel init (CORE RULE 5).
+
+**Status 2026-10-07 20:35: vsync1 WORKS — tearing gone (user: "so much smoother", the darkening artifacts on the power-off/Leave screen are gone too).** Boot image `boot-vsync1-20261007.img` (= bthid1 + vsync1) + the matching `geminipda-drm.ko` (old module backed up as `~/geminipda-drm.ko.bak-bthid1` on the Gemini). Next: zero-copy (step 3).
+
+## vsync1 on the device (2026-10-07 20:30)
+
+- dmesg: `ovl0 L0 … addr=0x7dfb0000 <- LK framebuffer`, `ovl0 L3 … addr=0x7e8b8000` (page 1), `rdma0: global_con=0x00000101 size=1080x2160 int_en=0x3f`, **`hardware vblank: rdma0 bit 2, 12 irqs in 200 ms, period 16899 us (59.17 Hz), line at irq 2160`**.
+- /proc/interrupts: `MT_SYSIRQ 217 Level geminipda-drm-vblank`. CmaTotal 98304 kB.
+- Stats after ~45 s of Plasma: stat_chased 2131 / stat_commits 2132 (all full frames — KWin sends full damage), **stat_chase_line_max 2160** (OUT_LINE_CNT holds 2160 through the blank → every copy started inside the blank, none late), copy ~2.9 ms typical, max 11.0 ms.
+- The only kernel WARN in that boot was the known wlan `dev_addr_check` one (old wlan_gen3.ko), unrelated.
+- Follow-ups: try dropping `KWIN_DRM_OVERRIDE_SAFETY_MARGIN=12000` (flip events now come at the real vblank, not after the copy); A/B `chase=0` for the record; worst-case copy 11 ms is still under the 16.9 ms scan but a heavy-load late start could tear — zero-copy removes that.
 
 ## How it works today (geminipda-drm, gemini-nixos `kernel/delta/drivers/gpu/drm/tiny/geminipda-drm.c`)
 
