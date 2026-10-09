@@ -93,6 +93,16 @@ G_CAP0_MV=${BATTERY_GUARD_GAUGE_CAP0_MV:-3500}
 G_FLOOR_MV=${BATTERY_GUARD_GAUGE_FLOOR_MV:-3100}
 G_R_MOHM=${BATTERY_GUARD_GAUGE_R_MOHM:-250}
 FCC_SAVE=/var/lib/gemini-gauge/charge_full
+# Charge across power-offs (2026-10-09): after a real power-off the gauge
+# starts from a voltage estimate taken under boot load, which on this worn
+# cell reads far too low (100 % at night -> ~40 % next morning, then lower).
+# Save the charge while running and at shutdown; at start, give the gauge
+# max(saved, its own estimate) — "max" so charge gained while switched off
+# (the charging screen) is not thrown away. Older than CHG_SAVE_MAX_AGE_S
+# (or another battery) -> the gauge's estimate stands.
+CHG_SAVE=/var/lib/gemini-gauge/charge_now
+CHG_SAVE_MAX_AGE_S=${BATTERY_GUARD_CHARGE_SAVE_MAX_AGE_S:-1209600}
+g_chg_saved=""
 g_seen=0
 g_fcc_last=""
 g_dis_since=0
@@ -173,6 +183,45 @@ alert() {
 
 # gauge_poll — battery decisions from the MT6351 gauge (see header).
 # Sets ONLINE STATUS CHGT VBAT_MV IBAT TEMP CAP GUARD; may power off.
+# Give the gauge back the charge saved before the last shutdown, if that is
+# more than its own start estimate.
+restore_charge() {
+    local saved at cur age
+    [ -s "$CHG_SAVE" ] && [ -w "$GAUGE/charge_now" ] || return 0
+    read -r saved at < "$CHG_SAVE" 2>/dev/null || return 0
+    case "$saved$at" in (*[!0-9]*|'') return 0 ;; esac
+    age=$(( $(now) - at ))
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$CHG_SAVE_MAX_AGE_S" ]; then
+        log "gauge: saved charge is $((age / 3600)) h old — keeping the gauge's own estimate"
+        return 0
+    fi
+    cur=$(cat "$GAUGE/charge_now" 2>/dev/null || echo 0)
+    case "$cur" in (*[!0-9]*|'') cur=0 ;; esac
+    if [ "$saved" -gt "$cur" ]; then
+        if echo "$saved" > "$GAUGE/charge_now" 2>/dev/null; then
+            log "gauge: restored charge ${saved} uAh saved $((age / 60)) min ago (start estimate was ${cur} uAh)"
+        else
+            log "gauge: could not restore charge ${saved} uAh (old gauge module?)"
+        fi
+    else
+        log "gauge: start estimate ${cur} uAh >= saved ${saved} uAh — kept (charged while off?)"
+    fi
+}
+
+# Save the charge (uAh + time) when it changed by >= 1 % of charge_full, or
+# always with "force" (shutdown).
+save_charge() {
+    local c f
+    c=$(cat "$GAUGE/charge_now" 2>/dev/null) || return 0
+    case "$c" in (*[!0-9]*|'') return 0 ;; esac
+    if [ "${1:-}" != force ] && [ -n "$g_chg_saved" ]; then
+        f=$(cat "$GAUGE/charge_full" 2>/dev/null || echo 2600000)
+        [ $(( c > g_chg_saved ? c - g_chg_saved : g_chg_saved - c )) -lt $((f / 100)) ] && return 0
+    fi
+    mkdir -p "${CHG_SAVE%/*}" && echo "$c $(now)" > "$CHG_SAVE.tmp" && mv -f "$CHG_SAVE.tmp" "$CHG_SAVE"
+    g_chg_saved=$c
+}
+
 gauge_poll() {
     local gst v f
     SRC=gauge
@@ -186,6 +235,7 @@ gauge_poll() {
                 log "gauge: could not restore charge_full ${f} uAh (out of range?)"
             fi
         fi
+        restore_charge
         log "gauge mode: using $GAUGE (warn <=${G_WARN_PCT}% or <${G_WARN_MV}mV, crit <${G_CRIT_MV}mV or 0% & <${G_CAP0_MV}mV)"
     fi
     f=$(cat "$GAUGE/charge_full" 2>/dev/null || echo "")
@@ -194,6 +244,8 @@ gauge_poll() {
         [ -n "$g_fcc_last" ] && log "gauge: charge_full ${g_fcc_last} -> ${f} uAh (saved)"
         g_fcc_last=$f
     fi
+
+    save_charge
 
     gst=$(cat "$GAUGE/status" 2>/dev/null || echo Unknown)
     CAP=$(cat "$GAUGE/capacity" 2>/dev/null || echo "?")
@@ -269,6 +321,7 @@ gauge_poll() {
             crit_strikes=0
             return
         fi
+        save_charge force
         exec systemctl poweroff
     fi
     alert CRIT "battery critical: ${CAP}%, ${VBAT_MV} mV (${VCOMP_MV} mV compensated) — will power off on the next sample unless the charger is connected"
@@ -306,6 +359,9 @@ rotate_hist() {
         echo 'ts,online,status,charge_type,vbat_mv,ibat_uA,temp_10c,guard,source,capacity' > "$HIST"
     fi
 }
+
+# systemd stops us at shutdown/reboot: save the charge one last time.
+trap '[ "$g_seen" = 1 ] && save_charge force; log "battery-guard stopping (charge saved)"; exit 0' TERM INT
 
 log "battery-guard started (poll=${POLL_S}s warn<${WARN_LOW_MV}mV crit<${CRIT_MV}mV)"
 
@@ -409,5 +465,5 @@ while :; do
     write_state
     echo "$(date '+%F %T'),${ONLINE},${STATUS},${CHGT:-?},${VBAT_MV},${IBAT},${TEMP},${GUARD},${SRC},${CAP}" >> "$HIST"
     rotate_hist
-    sleep "$POLL_S"
+    sleep "$POLL_S" & wait $!       # wait: lets the TERM trap run at once
 done

@@ -30,6 +30,13 @@ CHG_IINLIM=2500000        # BQ input current limit (uA); Debian's udev rule isn'
 CHG_BL_TIMEOUT=15         # s without a key before the backlight goes off
 CHG_MIN_START_PCT=3       # below this a start needs a second long-press
 CHG_POLL=1                # s per loop
+# While the charging screen runs, take CPU1-7 (A53s) offline and hold every
+# cluster at its lowest clock: the SoC has no idle states yet, so idle cores
+# still burn power and the device got hot on the charger (2026-10-09). The
+# A72s (CPU8-9) stay online at their lowest clock: the kernel can't power
+# that cluster back up once both are offline (docs/cpu-dvfs.md). Undone on
+# "continue to Debian".
+CHG_CPUS_OFF="1 2 3 4 5 6 7"
 CHG_UI=${CHG_UI:-/bin/charger-ui}   # graphical screen (charger-ui.c); text screen if missing/failing
 CHG_UI_ON=0
 
@@ -200,7 +207,44 @@ chg_ui() {
     return 1
 }
 
+# chg_cpus_low: idempotent; call every poll (policy8 appears ~2 s into boot,
+# when the kernel brings the A72s up).
+chg_cpus_low() {
+    local c p n
+    for c in $CHG_CPUS_OFF; do
+        [ "$(chg_read "$CHG_SYS/devices/system/cpu/cpu$c/online")" = 1 ] || continue
+        echo 0 > "$CHG_SYS/devices/system/cpu/cpu$c/online" 2>/dev/null &&
+            echo "$c" >> "$CHG_RUN/chg-cpus-off"
+    done
+    for p in "$CHG_SYS"/devices/system/cpu/cpufreq/policy*; do
+        [ -f "$p/scaling_max_freq" ] || continue
+        n=${p##*/}
+        [ -f "$CHG_RUN/chg-maxf.$n" ] && continue
+        chg_read "$p/scaling_max_freq" > "$CHG_RUN/chg-maxf.$n"
+        chg_read "$p/cpuinfo_min_freq" > "$p/scaling_max_freq" 2>/dev/null
+        chg_log "$n held at $(chg_read "$p/scaling_max_freq") kHz while charging"
+    done
+}
+
+chg_cpus_restore() {
+    local c p n
+    if [ -f "$CHG_RUN/chg-cpus-off" ]; then
+        for c in $(cat "$CHG_RUN/chg-cpus-off"); do
+            echo 1 > "$CHG_SYS/devices/system/cpu/cpu$c/online" 2>/dev/null ||
+                chg_log "cpu$c did not come back online"
+        done
+        rm -f "$CHG_RUN/chg-cpus-off"
+    fi
+    for p in "$CHG_SYS"/devices/system/cpu/cpufreq/policy*; do
+        n=${p##*/}
+        [ -f "$CHG_RUN/chg-maxf.$n" ] || continue
+        cat "$CHG_RUN/chg-maxf.$n" > "$p/scaling_max_freq" 2>/dev/null
+        rm -f "$CHG_RUN/chg-maxf.$n"
+    done
+}
+
 chg_leave() {   # restore the console for the normal boot
+    chg_cpus_restore
     chg_stop_readers
     chg_bl on
     [ "$CHG_UI_ON" = 1 ] && "$CHG_UI" --text-mode 2>/dev/null
@@ -273,6 +317,7 @@ charger_main() {
     logkey=""; logged_at=0
     while :; do
         now=$(cut -d. -f1 /proc/uptime)
+        chg_cpus_low
 
         # -- keys
         start=0

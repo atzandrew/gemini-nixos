@@ -22,7 +22,10 @@
  *  - Then pure coulomb counting (CAR deltas).
  *  - Full: VBUS present, cell current tapered below full_ma, voltage at
  *    least full_mv, for two polls -> status Full, charge_now = charge_full.
- *  - Near empty (estimated OCV < 3.70 V, where the curve is steep): pull
+ *  - charge_now is writable: battery-guard restores the charge saved
+ *    before a power-off (the start estimate under boot load is poor).
+ *  - Near empty (estimated OCV < 3.70 V, where the curve is steep, and the
+ *    current below steep_max_ma so the estimate is trustworthy): pull
  *    charge_now toward the curve by at most 1 % of charge_full per poll.
  *  - charge_full learning: after a Full anchor, the first steep-region
  *    reading with >= 40 % of charge_full counted out gives an estimate
@@ -135,6 +138,10 @@ MODULE_PARM_DESC(chg_thresh_ma, "|current| above this = Charging/Discharging whi
 static unsigned int idle_drain_ma = 300;
 module_param(idle_drain_ma, uint, 0644);
 MODULE_PARM_DESC(idle_drain_ma, "on VBUS, a cell drain smaller than this is the charger idling after termination (loads on the BQ BAT node), not real discharging (mA)");
+
+static unsigned int steep_max_ma = 700;
+module_param(steep_max_ma, uint, 0644);
+MODULE_PARM_DESC(steep_max_ma, "near-empty correction only while the battery current is below this (mA, default 700; blanked idle is ~550): under heavier load the OCV estimate of the worn cell reads too low");
 
 static unsigned int vlow_mv = 3450;
 module_param(vlow_mv, uint, 0644);
@@ -413,7 +420,7 @@ static void soc_update_locked(struct mt6351_gauge *g)
 		g->charge_nah = g->fcc_nah;
 
 	/* ---- steep-region correction + capacity learning (on battery) ---- */
-	if (!g->vbus && g->ocv_mv < 3700) {
+	if (!g->vbus && g->ocv_mv < 3700 && abs(ua) <= (int)steep_max_ma * 1000) {
 		s64 target = div_s64(g->fcc_nah * our_soc_x100(g->ocv_mv), 10000);
 		s64 step = div_s64(g->fcc_nah, 100);
 		s64 diff = target - g->charge_nah;
@@ -646,6 +653,19 @@ static int gauge_set_property(struct power_supply *psy, enum power_supply_proper
 {
 	struct mt6351_gauge *g = power_supply_get_drvdata(psy);
 
+	if (psp == POWER_SUPPLY_PROP_CHARGE_NOW) {
+		/* userspace restores the charge saved before a power-off
+		 * (battery-guard): the start estimate under boot load is poor */
+		if (val->intval < 0)
+			return -ERANGE;
+		mutex_lock(&g->lock);
+		g->charge_nah = clamp_t(s64, (s64)val->intval * 1000, 0, g->fcc_nah);
+		g->disp_pct = pct_of(g);
+		mutex_unlock(&g->lock);
+		pr_info("mt6351_gauge: charge_now set to %d mAh (%d%%)\n", val->intval / 1000, g->disp_pct);
+		power_supply_changed(psy);
+		return 0;
+	}
 	if (psp != POWER_SUPPLY_PROP_CHARGE_FULL)
 		return -EINVAL;
 	if (val->intval < FCC_MIN_UAH || val->intval > FCC_MAX_UAH)
@@ -667,7 +687,7 @@ static int gauge_set_property(struct power_supply *psy, enum power_supply_proper
 
 static int gauge_writeable(struct power_supply *psy, enum power_supply_property psp)
 {
-	return psp == POWER_SUPPLY_PROP_CHARGE_FULL;
+	return psp == POWER_SUPPLY_PROP_CHARGE_FULL || psp == POWER_SUPPLY_PROP_CHARGE_NOW;
 }
 
 static const struct power_supply_desc gauge_desc = {
