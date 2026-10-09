@@ -28,8 +28,12 @@
  *    reading with >= 40 % of charge_full counted out gives an estimate
  *    (blended 1/4 into charge_full, bounded 2000..4600 mAh).
  *  - Displayed %: 99 % max on the charger until the real Full event.
- *    Safety: on battery, a loaded voltage below vlow_mv (3450) for two
- *    polls caps the % at 5; below v0_mv (3400) it reads 0 (Critical).
+ *    Safety: on battery, an IR-compensated voltage (V + |I| x r_bat_mohm,
+ *    the same estimate as ocv_mv) below vlow_mv (3450) for two polls caps
+ *    the % at 5; below v0_mv (3400) it reads 0 (Critical). A raw loaded
+ *    voltage below vfloor_mv (3100) counts too, whatever the current.
+ *    (Raw loaded voltage alone tripped the 5 % cap at 68 % under a ~1.2 A
+ *    load on the worn cell, 2026-10-08.)
  *  - OCV estimates use r_bat_mohm on battery and the larger r_chg_mohm
  *    while charging (polarization), so a start on the charger is not
  *    over-optimistic.
@@ -134,11 +138,15 @@ MODULE_PARM_DESC(idle_drain_ma, "on VBUS, a cell drain smaller than this is the 
 
 static unsigned int vlow_mv = 3450;
 module_param(vlow_mv, uint, 0644);
-MODULE_PARM_DESC(vlow_mv, "on battery: loaded voltage below this (2 polls) caps the percentage at 5 (mV, default 3450)");
+MODULE_PARM_DESC(vlow_mv, "on battery: IR-compensated voltage below this (2 polls) caps the percentage at 5 (mV, default 3450)");
+
+static unsigned int vfloor_mv = 3100;
+module_param(vfloor_mv, uint, 0644);
+MODULE_PARM_DESC(vfloor_mv, "on battery: a RAW loaded voltage below this counts as empty for the caps even under load (mV, default 3100)");
 
 static unsigned int v0_mv = 3400;
 module_param(v0_mv, uint, 0644);
-MODULE_PARM_DESC(v0_mv, "on battery: loaded voltage below this (2 polls) reads 0 percent, Critical (mV, default 3400)");
+MODULE_PARM_DESC(v0_mv, "on battery: IR-compensated voltage below this (2 polls) reads 0 percent, Critical (mV, default 3400)");
 
 /* ---- vendor 25 C OCV profile (battery_profile_t2): {DOD %, mV} --------- */
 static const u16 ocv_dod[][2] = {
@@ -449,8 +457,11 @@ static void soc_update_locked(struct mt6351_gauge *g)
 	if (g->vbus && !g->full && pct > 99)
 		pct = 99;
 	if (!g->vbus) {
-		g->low_hits = g->vbat_mv < (int)vlow_mv ? g->low_hits + 1 : 0;
-		g->zero_hits = g->vbat_mv < (int)v0_mv ? g->zero_hits + 1 : 0;
+		/* compensated: ocv_mv = V - I*r_bat (I < 0 on battery) */
+		bool raw_empty = g->vbat_mv < (int)vfloor_mv;
+
+		g->low_hits = (g->ocv_mv < (int)vlow_mv || raw_empty) ? g->low_hits + 1 : 0;
+		g->zero_hits = (g->ocv_mv < (int)v0_mv || raw_empty) ? g->zero_hits + 1 : 0;
 		if (g->zero_hits >= 2)
 			pct = 0;
 		else if (g->low_hits >= 2)

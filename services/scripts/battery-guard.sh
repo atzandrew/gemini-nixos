@@ -96,6 +96,7 @@ FCC_SAVE=/var/lib/gemini-gauge/charge_full
 g_seen=0
 g_fcc_last=""
 g_dis_since=0
+g_low_hits=0
 CAP=?
 SRC=bq
 # Charger input limit (uA). The BQ25896 falls back to 500 mA whenever it
@@ -243,7 +244,14 @@ gauge_poll() {
         crit_strikes=$((crit_strikes + 1))
     else
         crit_strikes=0
+        # Warn only on the second low poll in a row: one low sample can be
+        # a load spike (2026-10-08: one reading of 5 % at 68 %).
         if { [ "$CAP" != "?" ] && [ "$CAP" -le "$G_WARN_PCT" ]; } || [ "$VCOMP_MV" -lt "$G_WARN_MV" ]; then
+            g_low_hits=$((g_low_hits + 1))
+        else
+            g_low_hits=0
+        fi
+        if [ "$g_low_hits" -ge 2 ]; then
             GUARD=LOW
             alert WARN "battery low: ${CAP}% (${VBAT_MV} mV under load, ${VCOMP_MV} mV compensated) — connect the charger"
         fi
