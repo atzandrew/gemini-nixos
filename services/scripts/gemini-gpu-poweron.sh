@@ -119,11 +119,24 @@ power_on_mfg() {
 # have the EN bit (0x80) clear — VGPU is OFF — and the MFG MTCMOS domains
 # cannot power on without it (proven 2026-08-31: status bits never assert
 # until EN is set). VSEL0 = 0x33 (918 mV), VSEL1 = 0x50 (1.1 V) are the
-# boot states the preloader leaves; we just enable both. The rail resets
-# to EN=0 on every power cycle, so this must run before the MTCMOS steps.
+# boot states the preloader leaves. The rail resets to EN=0 on every power
+# cycle, so it must be on before the MTCMOS steps.
+#
+# [2026-10-12] Kernels with the fan53555 RT5735 driver own the rail (DT
+# &vgpu, regulator-always-on): the kernel enables it at probe (EN in VSEL0
+# only) and this script only checks it. Older boot images have no driver:
+# then we enable both VSEL registers from userspace as before, so this
+# script works with either boot image.
 # [corrected 2026-09-04] Adapter NUMBERS shift when i2c nodes are enabled
 # (enabling i2c6 moved the RT5735 from i2c-2 to i2c-3) — resolve the bus by
 # controller base 0x11010000 instead of a hardcoded index.
+vgpu_reg() {
+    local r
+    for r in /sys/class/regulator/regulator.*; do
+        [ "$(cat "$r/name" 2>/dev/null)" = vgpu ] && { echo "$r"; return 0; }
+    done
+    return 1
+}
 rt5735_bus() {
     local d h want=11010000
     for d in /sys/class/i2c-adapter/i2c-*/of_node/reg; do
@@ -133,16 +146,27 @@ rt5735_bus() {
     done
     return 1
 }
-VGPU_BUS=$(rt5735_bus)
 VGPU_ENABLED=0
-if [ -n "$VGPU_BUS" ] && command -v i2cset >/dev/null 2>&1; then
-    i2cset -y "$VGPU_BUS" 0x1c 0x11 0xb3 2>/dev/null && \
-    i2cset -y "$VGPU_BUS" 0x1c 0x10 0xd0 2>/dev/null && VGPU_ENABLED=1
-fi
-if (( VGPU_ENABLED )); then
-    ok "VGPU rail enabled (RT5735 VSEL0=0x$(rd 0 >/dev/null; i2cget -y "$VGPU_BUS" 0x1c 0x11 2>/dev/null))"
+if [ -d /sys/bus/i2c/drivers/fan53555-regulator ]; then
+    # Kernel driver present: wait (up to 5 s) for the vgpu regulator.
+    for i in $(seq 50); do VGPU=$(vgpu_reg) && break; sleep 0.1; done
+    if [ -n "$VGPU" ] && [ "$(cat "$VGPU/state" 2>/dev/null)" = enabled ]; then
+        VGPU_ENABLED=1
+        ok "VGPU rail kernel-owned ($VGPU: $(cat "$VGPU/microvolts") uV, enabled)"
+    else
+        echo "GPU-POWERON: WARNING: fan53555 driver present but vgpu regulator ${VGPU:+not enabled ($VGPU)}${VGPU:-not found}"
+    fi
 else
-    echo "GPU-POWERON: WARNING: i2cset not available or VGPU enable failed (bus=$VGPU_BUS)"
+    VGPU_BUS=$(rt5735_bus)
+    if [ -n "$VGPU_BUS" ] && command -v i2cset >/dev/null 2>&1; then
+        i2cset -y "$VGPU_BUS" 0x1c 0x11 0xb3 2>/dev/null && \
+        i2cset -y "$VGPU_BUS" 0x1c 0x10 0xd0 2>/dev/null && VGPU_ENABLED=1
+    fi
+    if (( VGPU_ENABLED )); then
+        ok "VGPU rail enabled from userspace (RT5735 VSEL0=0x$(rd 0 >/dev/null; i2cget -y "$VGPU_BUS" 0x1c 0x11 2>/dev/null))"
+    else
+        echo "GPU-POWERON: WARNING: i2cset not available or VGPU enable failed (bus=$VGPU_BUS)"
+    fi
 fi
 sleep 0.2
 

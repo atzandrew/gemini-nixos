@@ -20,11 +20,12 @@
 #            lsflash                 list $FLASHDIR with sizes + sha256
 
 # ---- machine addresses (edit here) -----------------------------------------
-GEMINI_IP=10.0.20.63  # target device (Wi-Fi)                  [other network; home: 192.168.0.139]
-HYDRA_IP=10.0.20.128   # dev/build machine (no SSH server)      [other network; home: 192.168.0.218]
-DRAGON_IP=10.0.20.129    # flashing machine (USB, mtkclient)      [other network; home: 192.168.0.8]
+GEMINI_IP=192.168.0.210  # target device (Wi-Fi)                [home; other network: 10.0.20.63]
+HYDRA_IP=192.168.0.218   # dev/build machine (no SSH server)    [home; other network: 10.0.20.128]
+DRAGON_IP=192.168.0.8    # flashing machine (USB, mtkclient)    [home; other network: 10.0.20.129]
 
-GUSER=atzero
+GEMINI_USER=andrew      # login on the Gemini
+DRAGON_USER=atzero      # login on Dragon
 FLASHDIR=/home/atzero/readytoflash      # images to flash, on Dragon (absolute: mtk wants it)
 BACKUPDIR=/home/atzero/gemini-backup    # partition backups, on Dragon
 MTK=${MTK:-mtk}
@@ -32,9 +33,9 @@ MTK=${MTK:-mtk}
 # per-machine overrides (optional), e.g. GEMINI_IP=192.168.0.139 at home
 [ -f "$HOME/.gemini-env.local" ] && . "$HOME/.gemini-env.local"
 
-GEMINI=$GUSER@$GEMINI_IP
-DRAGON=$GUSER@$DRAGON_IP
-export GEMINI_IP HYDRA_IP DRAGON_IP GUSER GEMINI DRAGON FLASHDIR BACKUPDIR MTK
+GEMINI=$GEMINI_USER@$GEMINI_IP
+DRAGON=$DRAGON_USER@$DRAGON_IP
+export GEMINI_IP HYDRA_IP DRAGON_IP GEMINI_USER DRAGON_USER GEMINI DRAGON FLASHDIR BACKUPDIR MTK
 
 # ---- helpers ---------------------------------------------------------------
 _gerr() { echo "gemini-env: $*" >&2; return 1; }
@@ -78,7 +79,7 @@ to_gemini() {
     local src="$1" dest="${2:-}"
     [ -n "$src" ] || { _gerr "usage: to_gemini FILE [DEST]"; return 1; }
     [ -f "$src" ] || { _gerr "no such file: $src"; return 1; }
-    [ -n "$dest" ] || dest="/home/$GUSER/$(basename "$src")"
+    [ -n "$dest" ] || dest="/home/$GEMINI_USER/$(basename "$src")"
     case "$dest" in */) dest="$dest$(basename "$src")";; esac
     ssh "$GEMINI" "rm -f '$dest'" || return 1
     scp "$src" "$GEMINI:$dest" || return 1

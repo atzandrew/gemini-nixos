@@ -36,3 +36,4 @@ pkgs/gemshell/target/
 # Do not add a `keys/` or `*.key` rule here.
 spm-fw/
 spm-fw.tgz
+.aider*

@@ -1085,7 +1085,7 @@
 	};
 };
 
-/* i2c7: RT5735 VPROC buck regulator */
+/* i2c7 ("gpupm" bus): RT5735 VGPU buck regulator */
 &i2c7 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c7_pins_a>;
@@ -1093,20 +1093,25 @@
 	status = "okay";
 
 	/*
-	 * RT5735 VPROC regulator at 0x1c.
-	 * Enabled once fan53555 RT5735 patch is tested on hardware.
-	 * (The old fixed "vproc" placeholder is gone: the CPU rails are the
-	 * DA9214 on i2c6 + vsram_l, docs/cpu-dvfs.md.)
+	 * Richtek RT5735 at 0x1c powers the Mali-T880 (vendor VGPU_SET_BY_EXTIC).
+	 * PROGVSEL0 (0x11) is the active register (the vendor only ever writes
+	 * it); 600 mV + 6.25 mV steps. Both EN bits are clear at power-on, so
+	 * always-on makes the kernel enable the rail at probe. The range spans
+	 * this chip's vendor table (efuse type 12, opp_plus_tbl_e1_1:
+	 * 238 MHz/0.8467 V .. 900 MHz/1.1545 V) on 6.25 mV steps; the
+	 * preloader's 918.75 mV is inside it, so nothing is changed at probe.
+	 * TIME/COMMAND/LIMCONF (0x13/0x14/0x16) already hold the vendor init
+	 * values (DVS-up 32 mV/us, auto PFM/PWM): no ramp-delay or mode
+	 * properties here, so the driver leaves them alone.
 	 */
-	vproc: regulator@1c {
+	vgpu: regulator@1c {
 		compatible = "richtek,rt5735";
 		reg = <0x1c>;
-		regulator-name = "vproc";
-		regulator-min-microvolt = <600000>;
-		regulator-max-microvolt = <1393750>;
-		richtek,dvs-up-microvolt-per-usec = <32000>;
-		richtek,dvs-down-microvolt-per-usec = <4000>;
-		status = "disabled";
+		regulator-name = "vgpu";
+		regulator-min-microvolt = <843750>;
+		regulator-max-microvolt = <1156250>;
+		regulator-always-on;
+		regulator-boot-on;
 	};
 };
 
@@ -2090,15 +2095,13 @@
 
 	/*
 	 * Mali-T880 MP4 (GPU_ID 0x08801008, verified 2026-08-31).
-	 * Power is NOT kernel-managed (yet): the VGPU rail is the Richtek
-	 * RT5735 on i2c7 (the "gpupm" bus, node intentionally disabled)
-	 * and the six MFG MTCMOS domains (MFG_ASYNC 0x334, MFG 0x338,
-	 * MFG_CORE0-3 0x340-0x34c) are brought up by build/gpu-poweron.sh
-	 * after boot, using the vendor clk-mt6797-pg.c sequences. On this
-	 * unit VGPU was found OFF at stock boot (RT5735 EN bits clear), so
-	 * the GPU cannot power on until the script has run — hence NO
-	 * power-domains property here (the kernel doesn't own those
-	 * domains) and panfrost is a module, loaded after power-on.
+	 * The VGPU rail (Richtek RT5735 on i2c7, &vgpu) is kernel-owned and
+	 * enabled at boot. The six MFG MTCMOS domains (MFG_ASYNC 0x334,
+	 * MFG 0x338, MFG_CORE0-3 0x340-0x34c) are NOT: gemini-gpu-poweron.sh
+	 * brings them up after boot using the vendor clk-mt6797-pg.c
+	 * sequences — hence NO power-domains property here, and panfrost is
+	 * a module, loaded after power-on. No mali-supply / OPPs yet
+	 * (devfreq is the next step).
 	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll) is left as LK set it.
 	 */
 	gpu: mali@13040000 {
