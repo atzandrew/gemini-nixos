@@ -191,17 +191,6 @@ wr 0x10001fbc 0x1ff        # VGPU_SRAM LDO enable (0xff at ext_ic_init,
                            #  0x1ff at power_on)
 ok "VGPU SRAM LDO enabled + voltage config (0x10001fbc=$(rd 0x10001fbc))"
 
-# --- MFG timing + PMU enable (vendor mtk_pm_callback_power_on) ----------
-# 0x1300001c |= async_value (0x5 for mfg < 780 MHz — we run 500.5 MHz).
-# 0x130003e0-0x3f0 = PMU enable (hardware implements bits [9:0] only).
-setb 0x1300001c 0x5
-wr 0x130003e0 0xffffffff
-wr 0x130003e4 0xffffffff
-wr 0x130003e8 0xffffffff
-wr 0x130003ec 0xffffffff
-wr 0x130003f0 0xffffffff
-ok "MFG timing + PMU enabled (0x1300001c=$(rd 0x1300001c) 0x130003e0=$(rd 0x130003e0))"
-
 # --- MFG bus protection release (vendor spm_topaxi_protect(MFG_PROT_MASK,
 #     0) in power_on; MFG_PROT_MASK = bit 21 per clk-mt6797-pg.h). Boot
 #     leaves it clear on this unit, but release explicitly for robustness. --
@@ -219,6 +208,23 @@ power_on 0x1000634c $((1 <<  8)) $((1 << 23)) && ok "MFG_CORE3 ON"
 
 wr "$MFGCFG_CLR" 1                                 # open BG3D clock gate
 ok "mfg_bg3d gate opened (0x13000000=$(rd 0x13000000))"
+
+# --- MFG timing + PMU enable (vendor mtk_pm_callback_power_on) ----------
+# Vendor order: MTCMOS domains + mfg_main (BG3D) on, topaxi protection
+# released, THEN these MFGCFG writes. [corrected 2026-10-12] They used to
+# run before the domains were powered: the writes were lost and the probe
+# read 0x1300001c = 0 (the GPU had never run with the timing value).
+# 0x1300001c |= async_value (vendor: 0x5 when the top OPP < 780 MHz,
+# 0xa at >= 780 MHz). 0x130003e0-0x3f0 = PMU enable (hardware implements
+# bits [9:0] only).
+setb 0x1300001c 0x5
+wr 0x130003e0 0xffffffff
+wr 0x130003e4 0xffffffff
+wr 0x130003e8 0xffffffff
+wr 0x130003ec 0xffffffff
+wr 0x130003f0 0xffffffff
+ok "MFG timing + PMU enabled (0x1300001c=$(rd 0x1300001c) 0x130003e0=$(rd 0x130003e0))"
+
 
 echo "GPU-POWERON: status after:  0x180=$(rd 0x10006180) 0x184=$(rd 0x10006184)"
 for r in 0x10006334 0x10006338 0x1000633c 0x10006340 0x10006344 0x10006348 0x1000634c; do

@@ -1,0 +1,176 @@
+diff --git a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 30c9728..5fdd944 100644
+--- a/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/devices/planet-geminipda/kernel/delta/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -680,21 +680,37 @@
+ 	};
+ 
+ 	/*
+-	 * Mali-T880 OPPs. This chip is efuse table type 12 (vendor
++	 * Mali-T880 OPPs: this chip's vendor table (efuse type 12,
+ 	 * mt_gpufreq.c opp_plus_tbl_e1_1: 900/1.1545, 780/1.1032,
+ 	 * 610/1.0134, 520/0.9750, 442.5/0.9365, 365/0.9108, 238/0.8467
+-	 * MHz/V). For now a single OPP at the rate LK leaves (500.5 MHz,
+-	 * MFGPLL post-div /4): its voltage is the vendor's 520 MHz point, and
+-	 * the rate is exact, so panfrost's initial dev_pm_opp_set_opp() only
+-	 * sets VGPU and the clock core leaves MFGPLL alone. More OPPs need
+-	 * the MFG mux re-parenting for post-div changes first.
++	 * MHz/V), voltages rounded UP to the RT5735's 6.25 mV steps (the
++	 * regulator rejects an exact voltage it cannot hit). 780/900 MHz need
++	 * MFG timing 0xa + a thermal soak; 238 MHz is left out for now.
++	 * MFGPLL post-div is /4 below 500 MHz and /2 above (mainline fmin
++	 * 1000 MHz); post-div changes are made with mfg_sel parked on clk26m
++	 * (clk-mt6797.c mux notifier).
+ 	 */
+ 	gpu_opp_table: opp-table-gpu {
+ 		compatible = "operating-points-v2";
+ 
+-		opp-500500000 {
+-			opp-hz = /bits/ 64 <500500000>;
+-			opp-microvolt = <975000>;
++		opp-365000000 {
++			opp-hz = /bits/ 64 <365000000>;
++			opp-microvolt = <912500>;	/* vendor 910.8 mV */
++		};
++
++		opp-442500000 {
++			opp-hz = /bits/ 64 <442500000>;
++			opp-microvolt = <937500>;	/* vendor 936.5 mV */
++		};
++
++		opp-520000000 {
++			opp-hz = /bits/ 64 <520000000>;
++			opp-microvolt = <975000>;	/* vendor 975.0 mV */
++		};
++
++		opp-610000000 {
++			opp-hz = /bits/ 64 <610000000>;
++			opp-microvolt = <1018750>;	/* vendor 1013.4 mV */
+ 		};
+ 	};
+ };
+@@ -1133,6 +1149,10 @@
+ 		regulator-max-microvolt = <1156250>;
+ 		regulator-always-on;
+ 		regulator-boot-on;
++		/* DVS-up field 6 = the value already in TIME (0x13) */
++		regulator-ramp-delay = <32000>;
++		/* vendor mt_gpufreq.c waits 350 us after every voltage raise */
++		regulator-settling-time-up-us = <350>;
+ 	};
+ };
+ 
+@@ -2123,8 +2143,7 @@
+ 	 * up after boot using the vendor clk-mt6797-pg.c sequences — hence
+ 	 * NO power-domains property here, and panfrost is a module, loaded
+ 	 * after power-on.
+-	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll) stays as LK set it
+-	 * (500.5 MHz, the only OPP).
++	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll_ck) is set by devfreq.
+ 	 */
+ 	gpu: mali@13040000 {
+ 		compatible = "arm,mali-t880", "arm,mali-midgard";
+@@ -2137,6 +2156,7 @@
+ 		clock-names = "clk_mali";
+ 		mali-supply = <&vgpu>;
+ 		operating-points-v2 = <&gpu_opp_table>;
++		#cooling-cells = <2>;
+ 	};
+ };
+ 
+@@ -2230,6 +2250,11 @@
+ 					trip = <&soc_alert>;
+ 					cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+ 				};
++
++				map-gpu {
++					trip = <&soc_alert>;
++					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
+ 			};
+ 		};
+ 	};
+diff --git a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c
+index 4c13690..68adbc0 100644
+--- a/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c
++++ b/devices/planet-geminipda/kernel/delta/drivers/clk/mediatek/clk-mt6797.c
+@@ -9,6 +9,7 @@
+ 
+ #include "clk-gate.h"
+ #include "clk-mtk.h"
++#include "clk-mux.h"
+ #include "clk-pll.h"
+ #include "reset.h"
+ 
+@@ -334,7 +335,6 @@ static const struct mtk_composite top_muxes[] = {
+ 	MUX_GATE(CLK_TOP_MUX_PWM, "pwm_sel", pwm_parents, 0x0050, 0, 3, 7),
+ 	MUX_GATE(CLK_TOP_MUX_VDEC, "vdec_sel", vdec_parents, 0x0050, 8, 3, 15),
+ 	MUX_GATE(CLK_TOP_MUX_VENC, "venc_sel", venc_parents, 0x0050, 16, 2, 23),
+-	MUX_GATE(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents, 0x0050, 24, 2, 31),
+ 	MUX_GATE(CLK_TOP_MUX_CAMTG, "camtg_sel", camtg, 0x0060, 0, 2, 7),
+ 	MUX_GATE(CLK_TOP_MUX_UART, "uart_sel", uart_parents, 0x0060, 8, 1, 15),
+ 	MUX_GATE(CLK_TOP_MUX_SPI, "spi_sel", spi_parents, 0x0060, 16, 2, 23),
+@@ -380,11 +380,45 @@ static const struct mtk_composite top_muxes[] = {
+ 	    0x0104, 1, 2),
+ };
+ 
++/*
++ * The GPU mux is a set/clr/update mux like the vendor kernel's
++ * MUX_CLR_SET_UPD(TOP_MUX_MFG, ...): CLK_CFG_1 0x50 (SET 0x54, CLR 0x58),
++ * and a parent change only takes effect after CLK_CFG_UPDATE (0x04) bit 7
++ * is written. NO_REPARENT: the GPU always runs from mfgpll_ck; the other
++ * parents are only used for parking (below).
++ */
++static const struct mtk_mux top_mtk_muxes[] = {
++	MUX_GATE_CLR_SET_UPD_FLAGS(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents,
++				   0x0050, 0x0054, 0x0058, 24, 2, 31,
++				   0x0004, 7,
++				   CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT),
++};
++
++/*
++ * Park mfg_sel on clk26m while MFGPLL changes rate (the PLL output
++ * glitches on a post-divider change), as the vendor kernel does
++ * (gpufreq clk_sub_parent = clk26m) and as MT8183/MT8186 do.
++ */
++static int mt6797_reg_mfg_mux_notifier(struct device *dev, struct clk *clk)
++{
++	struct mtk_mux_nb *mfg_mux_nb;
++
++	mfg_mux_nb = devm_kzalloc(dev, sizeof(*mfg_mux_nb), GFP_KERNEL);
++	if (!mfg_mux_nb)
++		return -ENOMEM;
++
++	mfg_mux_nb->ops = top_mtk_muxes[0].ops;
++	mfg_mux_nb->bypass_index = 0;	/* clk26m */
++
++	return devm_mtk_clk_mux_notifier_register(dev, clk, mfg_mux_nb);
++}
++
+ static int mtk_topckgen_init(struct platform_device *pdev)
+ {
+ 	struct clk_hw_onecell_data *clk_data;
+ 	void __iomem *base;
+ 	struct device_node *node = pdev->dev.of_node;
++	int ret;
+ 
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+@@ -401,6 +435,17 @@ static int mtk_topckgen_init(struct platform_device *pdev)
+ 				    ARRAY_SIZE(top_muxes), base,
+ 				    &mt6797_clk_lock, clk_data);
+ 
++	ret = mtk_clk_register_muxes(&pdev->dev, top_mtk_muxes,
++				     ARRAY_SIZE(top_mtk_muxes), node,
++				     &mt6797_clk_lock, clk_data);
++	if (ret)
++		return ret;
++
++	ret = mt6797_reg_mfg_mux_notifier(&pdev->dev,
++					  clk_data->hws[CLK_TOP_MUX_MFG]->clk);
++	if (ret)
++		return ret;
++
+ 	return of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
+ }
+ 
