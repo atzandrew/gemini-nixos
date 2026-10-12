@@ -678,6 +678,25 @@
 			clock-latency-ns = <500000>;
 		};
 	};
+
+	/*
+	 * Mali-T880 OPPs. This chip is efuse table type 12 (vendor
+	 * mt_gpufreq.c opp_plus_tbl_e1_1: 900/1.1545, 780/1.1032,
+	 * 610/1.0134, 520/0.9750, 442.5/0.9365, 365/0.9108, 238/0.8467
+	 * MHz/V). For now a single OPP at the rate LK leaves (500.5 MHz,
+	 * MFGPLL post-div /4): its voltage is the vendor's 520 MHz point, and
+	 * the rate is exact, so panfrost's initial dev_pm_opp_set_opp() only
+	 * sets VGPU and the clock core leaves MFGPLL alone. More OPPs need
+	 * the MFG mux re-parenting for post-div changes first.
+	 */
+	gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp-500500000 {
+			opp-hz = /bits/ 64 <500500000>;
+			opp-microvolt = <975000>;
+		};
+	};
 };
 
 /*
@@ -1094,12 +1113,14 @@
 
 	/*
 	 * Richtek RT5735 at 0x1c powers the Mali-T880 (vendor VGPU_SET_BY_EXTIC).
-	 * PROGVSEL0 (0x11) is the active register (the vendor only ever writes
-	 * it); 600 mV + 6.25 mV steps. Both EN bits are clear at power-on, so
-	 * always-on makes the kernel enable the rail at probe. The range spans
-	 * this chip's vendor table (efuse type 12, opp_plus_tbl_e1_1:
-	 * 238 MHz/0.8467 V .. 900 MHz/1.1545 V) on 6.25 mV steps; the
-	 * preloader's 918.75 mV is inside it, so nothing is changed at probe.
+	 * PROGVSEL0 (0x11) is the active register (verified 2026-10-12: GPU
+	 * powers up with only its EN bit set); 600 mV + 6.25 mV steps. The
+	 * preloader leaves 0x11 = 0x10 (700 mV) with EN clear (0x10 = 0x50,
+	 * 1.1 V, EN clear), so always-on makes the kernel enable the rail at
+	 * probe, raised to the 843.75 mV floor; panfrost then sets the OPP
+	 * voltage. The range spans this chip's vendor table (efuse type 12,
+	 * opp_plus_tbl_e1_1: 238 MHz/0.8467 V .. 900 MHz/1.1545 V) on
+	 * 6.25 mV steps.
 	 * TIME/COMMAND/LIMCONF (0x13/0x14/0x16) already hold the vendor init
 	 * values (DVS-up 32 mV/us, auto PFM/PWM): no ramp-delay or mode
 	 * properties here, so the driver leaves them alone.
@@ -2095,14 +2116,15 @@
 
 	/*
 	 * Mali-T880 MP4 (GPU_ID 0x08801008, verified 2026-08-31).
-	 * The VGPU rail (Richtek RT5735 on i2c7, &vgpu) is kernel-owned and
-	 * enabled at boot. The six MFG MTCMOS domains (MFG_ASYNC 0x334,
-	 * MFG 0x338, MFG_CORE0-3 0x340-0x34c) are NOT: gemini-gpu-poweron.sh
-	 * brings them up after boot using the vendor clk-mt6797-pg.c
-	 * sequences — hence NO power-domains property here, and panfrost is
-	 * a module, loaded after power-on. No mali-supply / OPPs yet
-	 * (devfreq is the next step).
-	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll) is left as LK set it.
+	 * The VGPU rail (Richtek RT5735 on i2c7, &vgpu) is kernel-owned:
+	 * enabled at boot, voltage set by panfrost from &gpu_opp_table
+	 * (devfreq). The six MFG MTCMOS domains (MFG_ASYNC 0x334, MFG 0x338,
+	 * MFG_CORE0-3 0x340-0x34c) are NOT: gemini-gpu-poweron.sh brings them
+	 * up after boot using the vendor clk-mt6797-pg.c sequences — hence
+	 * NO power-domains property here, and panfrost is a module, loaded
+	 * after power-on.
+	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll) stays as LK set it
+	 * (500.5 MHz, the only OPP).
 	 */
 	gpu: mali@13040000 {
 		compatible = "arm,mali-t880", "arm,mali-midgard";
@@ -2113,6 +2135,8 @@
 		interrupt-names = "job", "mmu", "gpu";
 		clocks = <&topckgen CLK_TOP_MUX_MFG>;
 		clock-names = "clk_mali";
+		mali-supply = <&vgpu>;
+		operating-points-v2 = <&gpu_opp_table>;
 	};
 };
 

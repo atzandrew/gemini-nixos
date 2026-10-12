@@ -118,13 +118,16 @@ power_on_mfg() {
 # the GPU (vendor: VGPU_SET_BY_EXTIC). At stock boot BOTH VSEL registers
 # have the EN bit (0x80) clear — VGPU is OFF — and the MFG MTCMOS domains
 # cannot power on without it (proven 2026-08-31: status bits never assert
-# until EN is set). VSEL0 = 0x33 (918 mV), VSEL1 = 0x50 (1.1 V) are the
-# boot states the preloader leaves. The rail resets to EN=0 on every power
+# until EN is set). The preloader leaves VSEL0 = 0x10 (700 mV) and
+# VSEL1 = 0x50 (1.1 V), both with EN clear [corrected 2026-10-12: the
+# 918.75 mV seen before came from this script's own 0xb3 write]. VSEL0 is
+# the live register (2026-10-12). The rail resets to EN=0 on every power
 # cycle, so it must be on before the MTCMOS steps.
 #
 # [2026-10-12] Kernels with the fan53555 RT5735 driver own the rail (DT
 # &vgpu, regulator-always-on): the kernel enables it at probe (EN in VSEL0
-# only) and this script only checks it. Older boot images have no driver:
+# only, at the 843.75 mV regulator floor) and panfrost sets the OPP voltage
+# when it loads; this script only checks the rail is on. Older boot images have no driver:
 # then we enable both VSEL registers from userspace as before, so this
 # script works with either boot image.
 # [corrected 2026-09-04] Adapter NUMBERS shift when i2c nodes are enabled
