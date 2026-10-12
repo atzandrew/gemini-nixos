@@ -9,6 +9,7 @@
 
 #include "clk-gate.h"
 #include "clk-mtk.h"
+#include "clk-mux.h"
 #include "clk-pll.h"
 #include "reset.h"
 
@@ -334,7 +335,6 @@ static const struct mtk_composite top_muxes[] = {
 	MUX_GATE(CLK_TOP_MUX_PWM, "pwm_sel", pwm_parents, 0x0050, 0, 3, 7),
 	MUX_GATE(CLK_TOP_MUX_VDEC, "vdec_sel", vdec_parents, 0x0050, 8, 3, 15),
 	MUX_GATE(CLK_TOP_MUX_VENC, "venc_sel", venc_parents, 0x0050, 16, 2, 23),
-	MUX_GATE(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents, 0x0050, 24, 2, 31),
 	MUX_GATE(CLK_TOP_MUX_CAMTG, "camtg_sel", camtg, 0x0060, 0, 2, 7),
 	MUX_GATE(CLK_TOP_MUX_UART, "uart_sel", uart_parents, 0x0060, 8, 1, 15),
 	MUX_GATE(CLK_TOP_MUX_SPI, "spi_sel", spi_parents, 0x0060, 16, 2, 23),
@@ -380,11 +380,45 @@ static const struct mtk_composite top_muxes[] = {
 	    0x0104, 1, 2),
 };
 
+/*
+ * The GPU mux is a set/clr/update mux like the vendor kernel's
+ * MUX_CLR_SET_UPD(TOP_MUX_MFG, ...): CLK_CFG_1 0x50 (SET 0x54, CLR 0x58),
+ * and a parent change only takes effect after CLK_CFG_UPDATE (0x04) bit 7
+ * is written. NO_REPARENT: the GPU always runs from mfgpll_ck; the other
+ * parents are only used for parking (below).
+ */
+static const struct mtk_mux top_mtk_muxes[] = {
+	MUX_GATE_CLR_SET_UPD_FLAGS(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents,
+				   0x0050, 0x0054, 0x0058, 24, 2, 31,
+				   0x0004, 7,
+				   CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT),
+};
+
+/*
+ * Park mfg_sel on clk26m while MFGPLL changes rate (the PLL output
+ * glitches on a post-divider change), as the vendor kernel does
+ * (gpufreq clk_sub_parent = clk26m) and as MT8183/MT8186 do.
+ */
+static int mt6797_reg_mfg_mux_notifier(struct device *dev, struct clk *clk)
+{
+	struct mtk_mux_nb *mfg_mux_nb;
+
+	mfg_mux_nb = devm_kzalloc(dev, sizeof(*mfg_mux_nb), GFP_KERNEL);
+	if (!mfg_mux_nb)
+		return -ENOMEM;
+
+	mfg_mux_nb->ops = top_mtk_muxes[0].ops;
+	mfg_mux_nb->bypass_index = 0;	/* clk26m */
+
+	return devm_mtk_clk_mux_notifier_register(dev, clk, mfg_mux_nb);
+}
+
 static int mtk_topckgen_init(struct platform_device *pdev)
 {
 	struct clk_hw_onecell_data *clk_data;
 	void __iomem *base;
 	struct device_node *node = pdev->dev.of_node;
+	int ret;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -400,6 +434,17 @@ static int mtk_topckgen_init(struct platform_device *pdev)
 	mtk_clk_register_composites(&pdev->dev, top_muxes,
 				    ARRAY_SIZE(top_muxes), base,
 				    &mt6797_clk_lock, clk_data);
+
+	ret = mtk_clk_register_muxes(&pdev->dev, top_mtk_muxes,
+				     ARRAY_SIZE(top_mtk_muxes), node,
+				     &mt6797_clk_lock, clk_data);
+	if (ret)
+		return ret;
+
+	ret = mt6797_reg_mfg_mux_notifier(&pdev->dev,
+					  clk_data->hws[CLK_TOP_MUX_MFG]->clk);
+	if (ret)
+		return ret;
 
 	return of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
 }

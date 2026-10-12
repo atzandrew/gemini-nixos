@@ -680,21 +680,37 @@
 	};
 
 	/*
-	 * Mali-T880 OPPs. This chip is efuse table type 12 (vendor
+	 * Mali-T880 OPPs: this chip's vendor table (efuse type 12,
 	 * mt_gpufreq.c opp_plus_tbl_e1_1: 900/1.1545, 780/1.1032,
 	 * 610/1.0134, 520/0.9750, 442.5/0.9365, 365/0.9108, 238/0.8467
-	 * MHz/V). For now a single OPP at the rate LK leaves (500.5 MHz,
-	 * MFGPLL post-div /4): its voltage is the vendor's 520 MHz point, and
-	 * the rate is exact, so panfrost's initial dev_pm_opp_set_opp() only
-	 * sets VGPU and the clock core leaves MFGPLL alone. More OPPs need
-	 * the MFG mux re-parenting for post-div changes first.
+	 * MHz/V), voltages rounded UP to the RT5735's 6.25 mV steps (the
+	 * regulator rejects an exact voltage it cannot hit). 780/900 MHz need
+	 * MFG timing 0xa + a thermal soak; 238 MHz is left out for now.
+	 * MFGPLL post-div is /4 below 500 MHz and /2 above (mainline fmin
+	 * 1000 MHz); post-div changes are made with mfg_sel parked on clk26m
+	 * (clk-mt6797.c mux notifier).
 	 */
 	gpu_opp_table: opp-table-gpu {
 		compatible = "operating-points-v2";
 
-		opp-500500000 {
-			opp-hz = /bits/ 64 <500500000>;
-			opp-microvolt = <975000>;
+		opp-365000000 {
+			opp-hz = /bits/ 64 <365000000>;
+			opp-microvolt = <912500>;	/* vendor 910.8 mV */
+		};
+
+		opp-442500000 {
+			opp-hz = /bits/ 64 <442500000>;
+			opp-microvolt = <937500>;	/* vendor 936.5 mV */
+		};
+
+		opp-520000000 {
+			opp-hz = /bits/ 64 <520000000>;
+			opp-microvolt = <975000>;	/* vendor 975.0 mV */
+		};
+
+		opp-610000000 {
+			opp-hz = /bits/ 64 <610000000>;
+			opp-microvolt = <1018750>;	/* vendor 1013.4 mV */
 		};
 	};
 };
@@ -1133,6 +1149,10 @@
 		regulator-max-microvolt = <1156250>;
 		regulator-always-on;
 		regulator-boot-on;
+		/* DVS-up field 6 = the value already in TIME (0x13) */
+		regulator-ramp-delay = <32000>;
+		/* vendor mt_gpufreq.c waits 350 us after every voltage raise */
+		regulator-settling-time-up-us = <350>;
 	};
 };
 
@@ -2123,8 +2143,7 @@
 	 * up after boot using the vendor clk-mt6797-pg.c sequences — hence
 	 * NO power-domains property here, and panfrost is a module, loaded
 	 * after power-on.
-	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll) stays as LK set it
-	 * (500.5 MHz, the only OPP).
+	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll_ck) is set by devfreq.
 	 */
 	gpu: mali@13040000 {
 		compatible = "arm,mali-t880", "arm,mali-midgard";
@@ -2137,6 +2156,7 @@
 		clock-names = "clk_mali";
 		mali-supply = <&vgpu>;
 		operating-points-v2 = <&gpu_opp_table>;
+		#cooling-cells = <2>;
 	};
 };
 
@@ -2229,6 +2249,11 @@
 				map-cpu-b {
 					trip = <&soc_alert>;
 					cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-gpu {
+					trip = <&soc_alert>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
