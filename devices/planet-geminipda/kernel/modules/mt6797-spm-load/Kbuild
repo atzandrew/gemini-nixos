@@ -1,0 +1,3 @@
+# Kbuild for the MT6797 SPM firmware loader, step 2a (built by ./default.nix:
+#   nix build .#packages.aarch64-linux.mt6797-spm-load).
+obj-m := mt6797-spm-load.o

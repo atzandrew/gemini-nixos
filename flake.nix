@@ -286,6 +286,17 @@
         mt6797-dvfs-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-dvfs-probe {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # READ-ONLY MT6797 SPM probe (claude/idle-power.md, SPM port step 1):
+        # PCM state/FSM/PC, wake mask+status, PWR_STATUS, CPU_PWR_STATUS,
+        # SW_RSV regs; im=1 identifies a resident PCM program by crc32.
+        mt6797-spm-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-spm-probe {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
+        # SPM step 2: load a PCM blob into the SPM IM (kicks only with stage=2)
+        # (stage=0 parse only, stage=1 IM fetch, stage=2 kick-and-park, stage=3 + CPU wake event, stage=4 standby entry, stage=5 + PCM timer wake; claude/idle-power.md).
+        mt6797-spm-load = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-spm-load {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # A72 cluster power-on in the vendor order (test module for moving
         # cl2-up.sh into the kernel; docs/cpu-dvfs.md).
         mt6797-cl2-on = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cl2-on {
