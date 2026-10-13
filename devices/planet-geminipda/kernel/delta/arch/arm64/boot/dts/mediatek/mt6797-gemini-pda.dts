@@ -684,8 +684,10 @@
 	 * mt_gpufreq.c opp_plus_tbl_e1_1: 900/1.1545, 780/1.1032,
 	 * 610/1.0134, 520/0.9750, 442.5/0.9365, 365/0.9108, 238/0.8467
 	 * MHz/V), voltages rounded UP to the RT5735's 6.25 mV steps (the
-	 * regulator rejects an exact voltage it cannot hit). 780/900 MHz need
-	 * MFG timing 0xa + a thermal soak; 238 MHz is left out for now.
+	 * regulator rejects an exact voltage it cannot hit). With 780/900 MHz
+	 * in the table the MFG timing value is 0xa (vendor: async_value =
+	 * 0xa when the top OPP >= 780 MHz; gemini-gpu-poweron.sh writes it).
+	 * 238 MHz is left out for now.
 	 * MFGPLL post-div is /4 below 500 MHz and /2 above (mainline fmin
 	 * 1000 MHz); post-div changes are made with mfg_sel parked on clk26m
 	 * (clk-mt6797.c mux notifier).
@@ -711,6 +713,16 @@
 		opp-610000000 {
 			opp-hz = /bits/ 64 <610000000>;
 			opp-microvolt = <1018750>;	/* vendor 1013.4 mV */
+		};
+
+		opp-780000000 {
+			opp-hz = /bits/ 64 <780000000>;
+			opp-microvolt = <1106250>;	/* vendor 1103.2 mV */
+		};
+
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <1156250>;	/* vendor 1154.5 mV */
 		};
 	};
 };

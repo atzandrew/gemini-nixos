@@ -214,10 +214,13 @@ ok "mfg_bg3d gate opened (0x13000000=$(rd 0x13000000))"
 # released, THEN these MFGCFG writes. [corrected 2026-10-12] They used to
 # run before the domains were powered: the writes were lost and the probe
 # read 0x1300001c = 0 (the GPU had never run with the timing value).
-# 0x1300001c |= async_value (vendor: 0x5 when the top OPP < 780 MHz,
-# 0xa at >= 780 MHz). 0x130003e0-0x3f0 = PMU enable (hardware implements
-# bits [9:0] only).
-setb 0x1300001c 0x5
+# 0x1300001c |= async_value (vendor mtk_config_platform.c r12p1:
+# async_value = max_freq >= 780 MHz ? 0xa : 0x5; the register is 0 after
+# the domains power up, so the OR leaves exactly that value). This chip's
+# table (efuse type 12) and our OPPs top out at 900 MHz -> 0xa, used by
+# the vendor at every OPP. 0x130003e0-0x3f0 = PMU enable (hardware
+# implements bits [9:0] only).
+setb 0x1300001c 0xa
 wr 0x130003e0 0xffffffff
 wr 0x130003e4 0xffffffff
 wr 0x130003e8 0xffffffff

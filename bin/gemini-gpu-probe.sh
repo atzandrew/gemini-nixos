@@ -79,7 +79,7 @@ sel=$(( (CFG1 >> 24) & 3 )); gate=$(( (CFG1 >> 31) & 1 ))
 echo "mfg_sel parent index=$sel (0 clk26m, 1 mfgpll_ck, 2 syspll_d3, 3 univpll_d3), gate(pdn)=$gate"
 
 # --- 4. MFG timing register -------------------------------------------
-hr "4. MFG timing 0x1300001c (vendor: |= 0x5 below 780 MHz max, 0xa at >= 780) + PMU enable"
+hr "4. MFG timing 0x1300001c (expect 0xa: top OPP >= 780 MHz) + PMU enable"
 echo "0x1300001c=$(rd 0x1300001c)  PMU enable 0x130003e0=$(rd 0x130003e0) (expect 0x3ff)"
 
 # --- 5. What the kernel thinks ------------------------------------------
