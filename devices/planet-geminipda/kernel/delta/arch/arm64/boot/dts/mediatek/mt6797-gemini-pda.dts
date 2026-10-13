@@ -2277,3 +2277,39 @@
 	nvmem-cell-names = "calibration-data";
 	status = "okay";
 };
+
+/*
+ * Lid (Hall) sensor. Vendor: drivers/input/hall/hall.c + DWS
+ * (aeon6797_6m_n.dws): HALL = EINT5 on GPIO66, level, polarity low,
+ * 64 ms debounce, pin pulled up -> magnet near (lid closed) pulls the
+ * line low. The vendor driver reported SW_LID through the keypad's
+ * input device. pinctrl-mt6797 has no EINT yet (B-11), so poll the
+ * pin as a plain GPIO with gpio-keys-polled instead; switch to
+ * gpio-keys with an interrupt once EINT lands.
+ */
+&pio {
+	hall_pins: hall {
+		pins-hall {
+			pinmux = <MT6797_GPIO66__FUNC_GPIO66>;
+			input-enable;
+			bias-pull-up;
+		};
+	};
+};
+
+/ {
+	lid-switch {
+		compatible = "gpio-keys-polled";
+		pinctrl-names = "default";
+		pinctrl-0 = <&hall_pins>;
+		poll-interval = <200>;
+
+		lid {
+			label = "Lid";
+			gpios = <&pio 66 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
+			debounce-interval = <64>;
+		};
+	};
+};
