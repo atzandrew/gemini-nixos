@@ -86,8 +86,8 @@
  *    DDP_IRQ_RDMA0_DONE).  When the DT node points at disp_rdma0
  *    (mediatek,rdma) this driver takes that interrupt as its vblank.  The
  *    ONLY registers this driver writes are RDMA0 INT_ENABLE (its own bit or
- *    0; LK leaves 0x3f) and INT_STATUS (write-0-to-clear) — no panel, DSI,
- *    OVL or mutex state.  Measured 2026-10-07: 59.17 Hz (16.90 ms), video
+ *    0; LK leaves 0x3f), INT_STATUS (write-0-to-clear) and OVL0 SRC_CON
+ *    bit 3 (see "ovl-l3" below) — no panel, DSI or mutex state.  Measured 2026-10-07: 59.17 Hz (16.90 ms), video
  *    sync-pulse, 120 blank lines (~0.89 ms).  A
  *    probe-time self-test falls back to the software vblank if the
  *    interrupt is silent or storms.
@@ -95,9 +95,19 @@
  *    flip with that vblank's timestamp and then copies: a full-frame copy
  *    (~7 ms) outruns the scan (~16 ms for 2160 lines), so when it starts in
  *    the vertical blank the beam never overtakes it and the frame is shown
- *    whole — no tearing, no second buffer.  OVL0 (mediatek,ovl) is only
- *    read, to log which layer scans out the LK buffer (for the later
- *    page-flip / zero-copy steps).
+ *    whole — no tearing, no second buffer.  OVL0 (mediatek,ovl) is read
+ *    to log which layer scans out the LK buffer (for the later page-flip /
+ *    zero-copy steps).
+ *
+ *  - OVL0 layer 3 off ("ovl-l3", 2026-10-12).  LK leaves a second OVL0
+ *    layer enabled on top of ours: L3 = vram page 1 (fb + 0x908000), pitch
+ *    4320, fully transparent (0 of 2332800 px with alpha != 0, checked with
+ *    bin/scanout-idle-test.py).  It still costs a second full-frame DRAM
+ *    read every frame, screen on or blanked (video mode keeps scanning):
+ *    ~20 mA in a 4-round on/off A/B.  With ovl_l3_off=1 (default) probe
+ *    clears SRC_CON bit 3 if L3 points into LK's vram, is not the layer
+ *    showing fb_base, and a sample of its rows is transparent; remove and
+ *    shutdown put LK's SRC_CON back.  Nothing visible changes.
  *
  * CORE RULE 5: this driver never initialises the panel.  LK does that.
  * The shadow blit only writes the already-initialised scanout region, so
@@ -207,7 +217,7 @@ module_param(stat_full_frames, ulong, 0444);
  * Display engine registers (vendor ddp_reg.h, gemian/gemini-linux-kernel-3.18
  * drivers/misc/mediatek/video/mt6797/dispsys; same layout as mainline
  * mtk_disp_rdma.c / mtk_disp_ovl.c).  Only RDMA_INT_ENABLE / RDMA_INT_STATUS
- * are ever written.
+ * and OVL_SRC_CON (layer 3 enable only) are ever written.
  */
 #define RDMA_INT_ENABLE		0x000
 #define RDMA_INT_STATUS		0x004	/* write 0 to clear (vendor writes ~sta) */
@@ -219,6 +229,14 @@ module_param(stat_full_frames, ulong, 0444);
 #define OVL_L_CON(n)		(0x030 + 0x20 * (n))
 #define OVL_L_PITCH(n)		(0x044 + 0x20 * (n))
 #define OVL_L_ADDR(n)		(0xf40 + 0x20 * (n))
+#define OVL_L_SRC_SIZE(n)	(0x038 + 0x20 * (n))
+#define OVL_L3			3
+
+/* ovl-l3: switch off LK's transparent OVL0 layer 3 (applies at probe). */
+static bool ovl_l3_off = true;
+module_param(ovl_l3_off, bool, 0444);
+MODULE_PARM_DESC(ovl_l3_off,
+	"Disable LK's transparent OVL0 layer 3 (saves a full-frame DRAM read per frame; default on)");
 
 /* Hardware vblank (vsync1).  hw_vblank / vblank_irq_bit apply at probe. */
 static bool hw_vblank = true;
@@ -274,6 +292,10 @@ struct geminipda_drm_device {
 	ktime_t hw_last;	/* timestamp of the last frame interrupt */
 	unsigned int selftest_irqs;
 	ktime_t selftest_first;
+	/* OVL0 (mediatek,ovl), see ovl-l3 in the header. */
+	void __iomem *ovl;
+	u32 ovl_src_orig;
+	bool ovl_l3_cleared;	/* SRC_CON bit 3 cleared by us: restore on exit */
 };
 
 static struct geminipda_drm_device *
@@ -962,9 +984,54 @@ static irqreturn_t geminipda_drm_rdma_irq(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
-/* Read-only: which OVL0 layer scans out the LK buffer (logged for later). */
-static void geminipda_drm_report_ovl(struct device *dev, u64 fb_base, u32 fb_size)
+/*
+ * ovl-l3: is LK's layer 3 safe to switch off?  It must point into LK's vram
+ * (not at fb_base, which is the layer we draw into), fit inside it, and be
+ * transparent: every 4th pixel of every 8th row must have alpha 0 (ARGB8888
+ * little-endian, alpha = top byte; ~73k reads through the WC mapping).
+ */
+static bool geminipda_drm_ovl_l3_idle(struct geminipda_drm_device *sdev,
+				      u64 fb_base, u32 fb_size)
 {
+	struct device *dev = sdev->dev.dev;
+	u32 addr = readl(sdev->ovl + OVL_L_ADDR(OVL_L3));
+	u32 size = readl(sdev->ovl + OVL_L_SRC_SIZE(OVL_L3));
+	u32 pitch = readl(sdev->ovl + OVL_L_PITCH(OVL_L3)) & 0xffff;
+	u32 w = size & 0xffff, h = size >> 16, x, y;
+	u64 off;
+
+	if (addr == fb_base || addr < fb_base || addr >= fb_base + fb_size) {
+		dev_info(dev, "ovl0 L3 at 0x%08x is not LK's spare page: left on\n", addr);
+		return false;
+	}
+	off = addr - fb_base;
+	if (!w || !h || w * 4 > pitch || off + (u64)pitch * h > fb_size) {
+		dev_info(dev, "ovl0 L3 %ux%u pitch %u doesn't fit LK's vram: left on\n",
+			 w, h, pitch);
+		return false;
+	}
+	for (y = 0; y < h; y += 8) {
+		void __iomem *row = sdev->screen_base + off + (u64)y * pitch;
+
+		for (x = 0; x < w; x += 4) {
+			if (readl(row + x * 4) & 0xff000000) {
+				dev_info(dev, "ovl0 L3 not transparent (x %u y %u): left on\n",
+					 x, y);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/*
+ * Log which OVL0 layer scans out the LK buffer (for the zero-copy work) and,
+ * with ovl_l3_off, switch off LK's transparent layer 3 (see the header).
+ */
+static void geminipda_drm_ovl_init(struct geminipda_drm_device *sdev,
+				   u64 fb_base, u32 fb_size)
+{
+	struct device *dev = sdev->dev.dev;
 	struct device_node *np = of_parse_phandle(dev->of_node, "mediatek,ovl", 0);
 	void __iomem *ovl;
 	u32 src;
@@ -972,11 +1039,15 @@ static void geminipda_drm_report_ovl(struct device *dev, u64 fb_base, u32 fb_siz
 
 	if (!np)
 		return;
-	ovl = of_iomap(np, 0);
+	ovl = devm_of_iomap(dev, np, 0, NULL);
 	of_node_put(np);
-	if (!ovl)
+	if (IS_ERR(ovl)) {
+		dev_warn(dev, "ovl0 map failed (%ld): L3 left on\n", PTR_ERR(ovl));
 		return;
+	}
+	sdev->ovl = ovl;
 	src = readl(ovl + OVL_SRC_CON);
+	sdev->ovl_src_orig = src;
 	for (n = 0; n < 4; n++) {
 		u32 addr = readl(ovl + OVL_L_ADDR(n));
 
@@ -986,7 +1057,30 @@ static void geminipda_drm_report_ovl(struct device *dev, u64 fb_base, u32 fb_siz
 			 (addr >= fb_base && addr < fb_base + fb_size) ?
 			 " <- LK framebuffer" : "");
 	}
-	iounmap(ovl);
+
+	if (!ovl_l3_off || !(src & BIT(OVL_L3)))
+		return;
+	/* Only ever turn L3 off while our layer (L0) is on and showing fb_base. */
+	if (!(src & BIT(0)) || readl(ovl + OVL_L_ADDR(0)) != fb_base) {
+		dev_info(dev, "ovl0 L0 is not LK's fb: L3 left on\n");
+		return;
+	}
+	if (!geminipda_drm_ovl_l3_idle(sdev, fb_base, fb_size))
+		return;
+	writel(src & ~BIT(OVL_L3), ovl + OVL_SRC_CON);
+	sdev->ovl_l3_cleared = true;
+	dev_info(dev, "ovl0 L3 (transparent) off: SRC_CON 0x%x -> 0x%x\n",
+		 src, readl(ovl + OVL_SRC_CON));
+}
+
+/* Put LK's SRC_CON back (remove / shutdown). */
+static void geminipda_drm_ovl_fini(struct geminipda_drm_device *sdev)
+{
+	if (!sdev->ovl_l3_cleared)
+		return;
+	writel(readl(sdev->ovl + OVL_SRC_CON) | BIT(OVL_L3),
+	       sdev->ovl + OVL_SRC_CON);
+	sdev->ovl_l3_cleared = false;
 }
 
 /*
@@ -1228,7 +1322,7 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 		return ERR_PTR(ret);
 
 	/* Hardware vblank from RDMA0 if the DT wires it (falls back above). */
-	geminipda_drm_report_ovl(dev->dev, fb_base, fb_size);
+	geminipda_drm_ovl_init(sdev, fb_base, fb_size);
 	geminipda_drm_hw_vblank_init(sdev);
 	WRITE_ONCE(sdev->drm_ready, true);
 
@@ -1278,6 +1372,7 @@ static int geminipda_drm_remove(struct platform_device *pdev)
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
 	geminipda_drm_hw_vblank_fini(sdev);
+	geminipda_drm_ovl_fini(sdev);
 	sdev->vblank_on = false;
 	hrtimer_cancel(&sdev->vblank_timer);
 
@@ -1290,6 +1385,7 @@ static void geminipda_drm_shutdown(struct platform_device *pdev)
 
 	drm_atomic_helper_shutdown(&sdev->dev);
 	geminipda_drm_hw_vblank_fini(sdev);
+	geminipda_drm_ovl_fini(sdev);
 	sdev->vblank_on = false;
 	hrtimer_cancel(&sdev->vblank_timer);
 }
