@@ -1,13 +1,14 @@
 #!/bin/sh
 # SPM step 3d-3: A/B/A gauge run with Wi-Fi off, per-cycle log synced to disk.
 # usage (as root, from the Gemini's own keyboard, lid open):
-#   systemd-inhibit --what=handle-lid-switch:sleep:idle sh /home/andrew/gauge-ab2.sh CYCLES [AWAKE_S] [WIFI on|off] [WAKE_UNMASK] [FLAGS] [BLANK yes|no]
+#   systemd-inhibit --what=handle-lid-switch:sleep:idle sh /home/andrew/gauge-ab2.sh CYCLES [AWAKE_S] [WIFI on|off] [WAKE_UNMASK] [FLAGS] [BLANK yes|no] [SRC_MASK]
 CYC=${1:-25}
 AW=${2:-55}
 WIFI=${3:-off}
 WAKE=${4:-0x1}
 FLAGS=${5:-0xffc102ff}
 BLANK=${6:-no}		# "yes": wait 20 s, then require OVL0 L0 off (screen blanked) or abort
+SRC=${7:-0xffffffff}	# SPM_SRC_MASK during the sleeps (3e1 module); 0xffffffff = keep LK, vendor suspend 0x10aa007e
 P=/sys/class/power_supply/mt6351-battery
 L=/home/andrew/spm-live.txt
 log() { echo "$*" >> $L; sync $L; echo "$*"; }
@@ -31,9 +32,9 @@ if [ "$BLANK" = yes ]; then
 fi
 [ "$WIFI" = off ] && nmcli radio wifi off
 sleep 5
-log "$(date +%T) $(cat $P/status) online=$(cat /sys/devices/system/cpu/online) cycles=$CYC awake=${AW}s wifi=$WIFI wake=$WAKE flags=$FLAGS blank=$BLANK SRC_CON=$(busybox devmem 0x1400b02c 32)"
+log "$(date +%T) $(cat $P/status) online=$(cat /sys/devices/system/cpu/online) cycles=$CYC awake=${AW}s wifi=$WIFI wake=$WAKE flags=$FLAGS blank=$BLANK src_mask=$SRC SRC_CON=$(busybox devmem 0x1400b02c 32)"
 [ "$AW" -gt 0 ] && m sleep $AW
-m insmod /home/andrew/mt6797-spm-load.ko stage=6 io_en=0x81 acinactm=3 sleep_ms=2000 cycles=$CYC wake_unmask=$WAKE flags=$FLAGS
+m insmod /home/andrew/mt6797-spm-load.ko stage=6 io_en=0x81 acinactm=3 sleep_ms=2000 cycles=$CYC wake_unmask=$WAKE flags=$FLAGS src_mask=$SRC
 rmmod mt6797-spm-load
 [ "$AW" -gt 0 ] && m sleep $AW
 log "$(date +%T) done"
