@@ -1,0 +1,89 @@
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c b/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
+index 8e45d12..e821dc0 100644
+--- a/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
++++ b/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
+@@ -176,6 +176,18 @@ static uint src2_mask = ~0U;
+ module_param(src2_mask, uint, 0444);
+ MODULE_PARM_DESC(src2_mask, "stage=6: SPM_SRC2_MASK (0x0C0) during the run; default 0xffffffff = keep LK's (vendor suspend 0x00f1001f)");
+ 
++static bool clk_init;
++module_param(clk_init, bool, 0444);
++MODULE_PARM_DESC(clk_init, "stage=6: SPM_CLK_CON |= vendor boot init (0x0801104C) + SPM_LOCK_INFRA_DCM during the run (restored after)");
++
++static bool settle;
++module_param(settle, bool, 0444);
++MODULE_PARM_DESC(settle, "stage=6: vendor spm_set_sysclk_settle(): SYS_SETTLE_SEL, SPM_CLK_SETTLE = 99 - md_settle (~3 ms) (restored after)");
++
++static bool srcclken_low;
++module_param(srcclken_low, bool, 0444);
++MODULE_PARM_DESC(srcclken_low, "stage=6: do not force SPM_FLAG_DIS_SRCCLKEN_LOW (default: forced on)");
++
+ static bool axi_test;
+ module_param(axi_test, bool, 0444);
+ MODULE_PARM_DESC(axi_test, "stage=0: SMC 0x82000201 no-op write test on MP0/MP1 AXI_CONFIG");
+@@ -724,6 +736,10 @@ static void kick_test(const struct pcm_tail *t)
+ #define PCM_PWRIO_EN_R7		BIT(7)
+ #define SPM_CLK_CON		0x00C
+ #define SPM_CLK_SETTLE		0x010
++#define SYS_SETTLE_SEL		BIT(4)
++#define SPM_LOCK_INFRA_DCM	BIT(5)
++#define CLK_CON_VENDOR_INIT	0x0801104C	/* CC_SYSCLK1_EN_0/1, CC_SRCLKENA_MASK_0, CLKSQ1_SEL_CTRL, SYSCLK0_SRC_MASK_B, CC_SYSCLK1_SRC_MASK_B_MD2_SRCCLKENA */
++#define SPM_SYSCLK_SETTLE	99		/* 32 kHz ticks = 3 ms (vendor mt_spm_sleep.c) */
+ #define MP2_CPUSYS_PWR_CON	0x218
+ #define CPU_EXT_BUCK_ISO	0x290
+ 
+@@ -954,7 +970,7 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	static struct sleep_ctx c;
+ 	static struct sleep_res res[60];
+ 	u32 sv_apsb, sv_wfi[10], sv_flag, sv_rsv0, sv_mp1, sv_mp2, sv_ini, sv_vec[16], sv_wmask, sv_cwe;
+-	u32 sv_pw[32], sv_irqm, sv_tval, sv_wdtv, sv_bsi[3], sv_dbg, sv_src, sv_src2;
++	u32 sv_pw[32], sv_irqm, sv_tval, sv_wdtv, sv_bsi[3], sv_dbg, sv_src, sv_src2, sv_clkcon, sv_settle, md_settle = 0;
+ 	struct device_node *np;
+ 	struct of_phandle_args oa = { .args_count = 3, .args = { 0, SPM_IRQ_SPI, IRQ_TYPE_LEVEL_LOW } };
+ 	void __iomem *gicd;
+@@ -1025,6 +1041,8 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	sv_dbg = rd(SPM_SW_DEBUG);
+ 	sv_src = rd(SPM_SRC_MASK);
+ 	sv_src2 = rd(SPM_SRC2_MASK);
++	sv_clkcon = rd(SPM_CLK_CON);
++	sv_settle = rd(SPM_CLK_SETTLE);
+ 	sv_mp1 = rd(SPM_MAS_PAUSE_MASK_B);
+ 	sv_mp2 = rd(SPM_MAS_PAUSE2_MASK_B);
+ 	sv_ini = rd(PCM_REG_DATA_INI);
+@@ -1043,15 +1061,26 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 		wr(SPM_SRC_MASK, src_mask);
+ 	if (src2_mask != ~0U)
+ 		wr(SPM_SRC2_MASK, src2_mask);
++	if (clk_init)	/* vendor spm_module_init (bits 2,3,6,12,16,27) + infra_dcm_lock while the PCM runs */
++		wr(SPM_CLK_CON, rd(SPM_CLK_CON) | CLK_CON_VENDOR_INIT | SPM_LOCK_INFRA_DCM);
++	if (settle) {	/* vendor spm_set_sysclk_settle() */
++		wr(SPM_CLK_CON, rd(SPM_CLK_CON) | SYS_SETTLE_SEL);
++		wr(SPM_CLK_SETTLE, 0);
++		md_settle = rd(SPM_CLK_SETTLE);
++		if (md_settle < SPM_SYSCLK_SETTLE)
++			wr(SPM_CLK_SETTLE, SPM_SYSCLK_SETTLE - md_settle);
++	}
+ 	enable_irq(irq);
+ 
+ 	c.t = t;
+-	c.swflag = flags | SPM_FLAG_DIS_SRCCLKEN_LOW;
++	c.swflag = flags | (srcclken_low ? 0 : SPM_FLAG_DIS_SRCCLKEN_LOW);
+ 	pr_info("mt6797-spm-load: stage 6: %u x %u ms sleep (gap %u ms), PWR_IO_EN %02x, SW_FLAG %08x, wake_unmask %08x, ACINACTM mask %x, SPM irq %u (GIC prio %02x -> %02x), PMR %02x -> %02x in WFI\n",
+ 		cycles, sleep_ms, gap_ms, io_en, c.swflag, wake_unmask, acinactm, irq, sv_prio,
+ 		readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI), gic_read_pmr(), SLEEP_PMR);
+ 	pr_info("mt6797-spm-load: stage 6: SRC_REQ %08x SRC_MASK %08x -> %08x SRC2_MASK %08x -> %08x\n",
+ 		rd(SPM_SRC_REQ), sv_src, rd(SPM_SRC_MASK), sv_src2, rd(SPM_SRC2_MASK));
++	pr_info("mt6797-spm-load: stage 6: SPM_CLK_CON %08x -> %08x SPM_CLK_SETTLE %08x -> %08x (md_settle %u)\n",
++		sv_clkcon, rd(SPM_CLK_CON), sv_settle, rd(SPM_CLK_SETTLE), md_settle);
+ 
+ 	for (n = 0; n < cycles; n++) {
+ 		if (n && im_load(t, im_ptr, words)) {
+@@ -1091,6 +1120,8 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	wr(SPM_SW_DEBUG, sv_dbg);
+ 	wr(SPM_SRC_MASK, sv_src);
+ 	wr(SPM_SRC2_MASK, sv_src2);
++	wr(SPM_CLK_SETTLE, sv_settle);
++	wr(SPM_CLK_CON, sv_clkcon);
+ 	for (i = 0; i < 10; i++)
+ 		wr(MP0_CPU0_WFI_EN + 4 * i, sv_wfi[i]);
+ 	wr(AP_STANDBY_CON, sv_apsb);
