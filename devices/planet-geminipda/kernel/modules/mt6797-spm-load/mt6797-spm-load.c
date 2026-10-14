@@ -43,6 +43,34 @@
  *               __spm_set_wakeup_event: PCM_TIMER_VAL = timer_ticks, PCM_CON1
  *               TIMER_EN, R12 bit0 PCM_TIMER unmasked) instead of the CPU wake
  *               event (which pcm_suspend_v20 ignored in 2d).
+ *   stage=6     3: FIRST REAL SLEEP (outputs on). Requires cpu0 to be the only
+ *               online CPU (offline cpu1-9 first). Per cycle (cycles x sleep_ms,
+ *               gap_ms awake between): IM reload, same setup as stage 5 (PCM
+ *               timer wake = sleep_ms, cpu0-only standby, SW_FLAG = flags |
+ *               DIS_SRCCLKEN_LOW, pwrap table -> HWCID), plus
+ *                 - PCM_PWR_IO_EN = io_en right before the kick (vendor
+ *                   __spm_kick_pcm_to_run); only 0x80 (r7) or 0x81 (r0+r7);
+ *                   refused unless r0/r7 equal POWER_ON_VAL0/1 at that moment
+ *                   (= enabling the outputs changes nothing until the
+ *                   firmware sleeps);
+ *                 - SPM IRQ (GIC SPI 180, level-low via sysirq) requested and
+ *                   given GIC priority 0x80; cpu0 WFIs with ICC_PMR_EL1 = 0x90,
+ *                   so only the SPM IRQ (PCM_RETURN) can end the WFI (vendor:
+ *                   mt_irq_mask_all + unmask SPM_IRQ0); SPM IRQ_MASK = all but
+ *                   PCM_RETURN;
+ *                 - with r0 (CPU/ARM PLL clock off): ACINACTM on the clusters
+ *                   in acinactm (bit0 MP0, bit1 MP1; bit2 MP2 refused until
+ *                   0x1022220C is confirmed) through ATF SMC
+ *                   0x82000201 (vendor dpidle/SODI MCUSYS_SMC_WRITE), cleared
+ *                   after the wake; r0 is refused without acinactm.
+ *               After PCM_RETURN: wake status; with r0, r0 -> POWER_ON_VAL0 (vendor
+ *               mem-control backup, kept after the module); clean-after-wakeup, PWR_IO_EN = 0,
+ *               PCM reset. No PCM_RETURN by sleep_ms + 2 s (only checked when the
+ *               WFI returns, i.e. never if the SPM IRQ never comes) -> PWR_IO_EN = 0
+ *               first (outputs back to POWER_ON_VAL), then reset (abort path).
+ *               No SYS_CIRQ, no PSCI/dormant, PCM WDT off, toprgu untouched.
+ *   axi_test=1  (stage=0 only) ATF SMC 0x82000201 no-op test: write MP0/MP1
+ *               AXI_CONFIG back with the value just read, report a0 + readback.
  *   verify=1    (with stage>=1) read the IM back through PCM_IM_HOST_RW_PTR/DAT
  *               (bit31 HOST_EN, W_EN = 0) and compare with the blob. Unvalidated
  *               protocol (no vendor user) — separate run.
@@ -67,12 +95,18 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/arm-smccc.h>
+#include <linux/cpumask.h>
+#include <linux/interrupt.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/smp.h>
 #include <linux/workqueue.h>
 #include <asm/unaligned.h>
 #include <asm/barrier.h>
 #include <asm/sysreg.h>
+#include <asm/arch_gicv3.h>
 
 static char *fw = "mt6797-spm/pcm_suspend.bin";
 module_param(fw, charp, 0444);
@@ -80,7 +114,7 @@ MODULE_PARM_DESC(fw, "PCM firmware under /lib/firmware");
 
 static int stage;
 module_param(stage, int, 0444);
-MODULE_PARM_DESC(stage, "0 parse only (no writes), 1 load into IM (no kick), 2 kick-and-park, 3 = 2 + CPU wake event, 4 = standby entry (one WFI) with wake pending, 5 = 4 with PCM timer wake");
+MODULE_PARM_DESC(stage, "0 parse only (no writes), 1 load into IM (no kick), 2 kick-and-park, 3 = 2 + CPU wake event, 4 = standby entry (one WFI) with wake pending, 5 = 4 with PCM timer wake, 6 = real sleep (PWR_IO_EN = io_en; cpu0 alone)");
 
 static bool verify;
 module_param(verify, bool, 0444);
@@ -113,6 +147,30 @@ MODULE_PARM_DESC(timer_ticks, "stage=5: PCM timer wake after this many 32 kHz ti
 static uint wake_unmask = 0x1;
 module_param(wake_unmask, uint, 0444);
 MODULE_PARM_DESC(wake_unmask, "stage=3: R12 wake bits unmasked during the run (bit0 = PCM_TIMER/CPU wake, vendor MCDI/vcorefs)");
+
+static uint io_en = 0x80;
+module_param(io_en, uint, 0444);
+MODULE_PARM_DESC(io_en, "stage=6: PCM_PWR_IO_EN during the sleep: 0x80 = r7 only (default), 0x81 = r0 + r7");
+
+static uint sleep_ms = 100;
+module_param(sleep_ms, uint, 0444);
+MODULE_PARM_DESC(sleep_ms, "stage=6: PCM timer per cycle (ms, 1..5000, default 100)");
+
+static uint cycles = 1;
+module_param(cycles, uint, 0444);
+MODULE_PARM_DESC(cycles, "stage=6: sleep cycles (1..60, default 1)");
+
+static uint gap_ms = 200;
+module_param(gap_ms, uint, 0444);
+MODULE_PARM_DESC(gap_ms, "stage=6: awake time between cycles (ms, >= 50, default 200)");
+
+static uint acinactm;
+module_param(acinactm, uint, 0444);
+MODULE_PARM_DESC(acinactm, "stage=6: clusters whose ACINACTM is set around the WFI (bit0 MP0, bit1 MP1, bit2 MP2; required with r0)");
+
+static bool axi_test;
+module_param(axi_test, bool, 0444);
+MODULE_PARM_DESC(axi_test, "stage=0: SMC 0x82000201 no-op write test on MP0/MP1 AXI_CONFIG");
 
 
 
@@ -644,6 +702,464 @@ static void kick_test(const struct pcm_tail *t)
 		 stage == 3 ? "after stage 3" : "after stage 2");
 }
 
+/* ------------------------------------------------------------------ stage 6 */
+/*
+ * First real sleep: the PCM's r7 (and optionally r0) outputs drive hardware.
+ * See the header. Everything not listed there is as in stage 5.
+ */
+#define PCM_REG0_DATA		0x100
+#define PCM_REG7_DATA		0x11C
+#define PCM_PWRIO_EN_R0		BIT(0)
+#define PCM_PWRIO_EN_R7		BIT(7)
+#define SPM_CLK_CON		0x00C
+#define SPM_CLK_SETTLE		0x010
+#define MP2_CPUSYS_PWR_CON	0x218
+#define CPU_EXT_BUCK_ISO	0x290
+
+#define MCUCFG_PHYS		0x10220000
+#define MP0_AXI_CONFIG		0x02C
+#define MP1_AXI_CONFIG		0x22C
+#define MP2_AXI_CONFIG		0x220C	/* MCUCFG2 0x10222000 + 0x20C (mt_spm_sleep.c); dpidle's 0x1022020C read 0a0a090a = not it (3a) */
+#define MCUCFG_MAP_LEN		0x3000
+#define ACINACTM		BIT(4)
+#define ACINACTM_MP2		0x11
+#define SMC_MCUSYS_WRITE	0x82000201	/* MTK_SIP_KERNEL_MCUSYS_WRITE (phys, val) */
+
+#define GICD_PHYS		0x19000000
+#define GICD_IPRIORITYR		0x400
+#define SPM_IRQ_SPI		180		/* vendor DT sleep@10006000, level-low */
+#define SPM_IRQ_PRIO		0x80		/* NS view; Linux default 0xa0 */
+#define SLEEP_PMR		0x90		/* passes 0x80, blocks 0xa0 */
+
+static const u32 axi_off[3] = { MP0_AXI_CONFIG, MP1_AXI_CONFIG, MP2_AXI_CONFIG };
+static const u32 axi_bits[3] = { ACINACTM, ACINACTM, ACINACTM_MP2 };
+
+static unsigned long mcusys_smc_write(u32 off, u32 val)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(SMC_MCUSYS_WRITE, MCUCFG_PHYS + off, val, 0, 0, 0, 0, 0, &res);
+	return res.a0;
+}
+
+static int im_load(const struct pcm_tail *t, u32 im_ptr, u32 words)
+{
+	u32 con0, con1, i;
+	int ret = pcm_reset();
+
+	if (ret)
+		return ret;
+	wr(PCM_CON0, KEY | PCM_CK_EN | EN_IM_SLEEP_DVS);
+	con1 = saved_con1 & (PCM_WDT_EN | PCM_WDT_WAKE_MODE | SRCCLKEN_FAST_RESP);
+	wr(PCM_CON1, con1 | KEY | EVENT_LOCK_EN | SPM_SRAM_ISOINT_B | SPM_SRAM_SLEEP_B |
+		     (t->replace ? 0 : IM_NONRP_EN) | MIF_APBEN | SCP_APB_INTERNAL_EN);
+	wr(PCM_IM_PTR, im_ptr);
+	wr(PCM_IM_LEN, words - 1);
+	con0 = rd(PCM_CON0) & 0xffff & ~(IM_KICK_L | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN | IM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN);
+	for (i = 0; i < 10000; i++) {
+		if (rd(PCM_FSM_STA) & FSM_IM_REDY)
+			return 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+struct sleep_res {
+	int ran, refused, returned, abort_reset;
+	u32 exits, r0_pre, r7_pre, r0_ret, r7_ret, pc_ret, fsm_ret, val0_pre;
+	u32 ws[16];
+	u64 ticks;		/* CNTVCT across the WFI loop */
+	u32 axi_pre[3], axi_set[3];
+	unsigned long smc_ret[3];
+	u32 pmr_old;
+};
+
+struct sleep_ctx {
+	const struct pcm_tail *t;
+	u32 swflag;
+	struct sleep_res r;
+};
+
+static irqreturn_t spm_isr(int irq, void *dev)
+{
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);	/* W1C: TWAM, PCM_RETURN, RET_IRQ0-9 */
+	wr(SPM_SW_INT_CLEAR, 0x3ff);			/* IRQ_STA bit4 (SW_INT0) seen at return in 2e4 */
+	return IRQ_HANDLED;
+}
+
+static void __iomem *mcucfg;
+
+static long sleep_work(void *arg)
+{
+	struct sleep_ctx *c = arg;
+	struct sleep_res *r = &c->r;
+	u32 con0, i, isr;
+	u64 a, b, limit;
+
+	preempt_disable();
+	if (smp_processor_id() != 0 || num_online_cpus() != 1) {
+		r->refused = 1;
+		preempt_enable();
+		return 0;
+	}
+	local_irq_disable();
+	r->ran = 1;
+
+	/* __spm_init_pcm_register(): r0 <- POWER_ON_VAL0, r7 <- POWER_ON_VAL1 */
+	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL0));
+	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R0);
+	wr(PCM_PWR_IO_EN, 0);
+	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL1));
+	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R7);
+	wr(PCM_PWR_IO_EN, 0);
+	for (i = 0; i < 16; i++)
+		wr(PCM_EVENT_VECTOR0 + 4 * i, c->t->vec[i]);
+	/* power control as stage 5: standby = cpu0 WFI only */
+	wr(AP_STANDBY_CON, (rd(AP_STANDBY_CON) & ~0x7fU) | 0x7f);
+	for (i = 0; i < 10; i++)
+		wr(MP0_CPU0_WFI_EN + 4 * i, i == 0);
+	/* __spm_set_wakeup_event(): PCM timer; SPM ISR: only PCM_RETURN */
+	wr(PCM_TIMER_VAL, sleep_ms * 32768 / 1000);
+	wr(PCM_CON1, (rd(PCM_CON1) & 0xffff) | KEY | PCM_TIMER_EN);
+	wr(SPM_WAKEUP_EVENT_MASK, ~wake_unmask);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	wr(SPM_SW_INT_CLEAR, 0x3ff);
+	wr(SPM_IRQ_MASK, ISRM_TWAM | ISRM_RET_IRQ_AUX);
+	/* __spm_kick_pcm_to_run() */
+	wr(SPM_MAS_PAUSE_MASK_B, 0xffffffff);
+	wr(SPM_MAS_PAUSE2_MASK_B, 0xffffffff);
+	wr(PCM_REG_DATA_INI, 0);
+	wr(SPM_SW_FLAG, c->swflag);
+	wr(SPM_SW_RSV_0, 0);
+
+	/* outputs may only be enabled while they equal the power-on values */
+	r->r0_pre = rd(PCM_REG0_DATA);
+	r->r7_pre = rd(PCM_REG7_DATA);
+	if (r->r0_pre != rd(SPM_POWER_ON_VAL0) || r->r7_pre != rd(SPM_POWER_ON_VAL1)) {
+		r->refused = 2;
+		goto out;
+	}
+	/* ACINACTM (vendor: right before the WFI; done before the kick so a failed write never sleeps) */
+	for (i = 0; i < 3; i++) {
+		if (!(acinactm & BIT(i)))
+			continue;
+		r->axi_pre[i] = readl(mcucfg + axi_off[i]);
+		r->smc_ret[i] = mcusys_smc_write(axi_off[i], r->axi_pre[i] | axi_bits[i]);
+		r->axi_set[i] = readl(mcucfg + axi_off[i]);
+		if ((r->axi_set[i] & axi_bits[i]) != axi_bits[i])
+			r->refused = 3;
+	}
+	if (r->refused)
+		goto out_axi;
+
+	wr(PCM_PWR_IO_EN, io_en);
+	con0 = rd(PCM_CON0) & 0xffff & ~(IM_KICK_L | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN);
+
+	/* WFI until PCM_RETURN: with PMR 0x90 only the SPM IRQ (prio 0x80) ends it */
+	r->pmr_old = gic_read_pmr();
+	gic_write_pmr(SLEEP_PMR);
+	isb();
+	dsb(sy);
+	a = read_sysreg(cntvct_el0);
+	limit = (u64)(sleep_ms + 2000) * read_sysreg(cntfrq_el0) / 1000;
+	for (r->exits = 0; ; r->exits++) {
+		dsb(sy);
+		wfi();
+		if (rd(SPM_IRQ_STA) & ISRS_PCM_RETURN) {
+			r->returned = 1;
+			break;
+		}
+		if (read_sysreg(cntvct_el0) - a > limit)
+			break;	/* only reached if WFI keeps returning without PCM_RETURN */
+	}
+	b = read_sysreg(cntvct_el0);
+	r->ticks = b - a;
+	gic_write_pmr(r->pmr_old);
+	isb();
+
+	if (!r->returned) {
+		/* abort: outputs back to POWER_ON_VAL0/1 first, then the reset below */
+		wr(PCM_PWR_IO_EN, 0);
+		r->abort_reset = 1;
+	}
+	r->r0_ret = rd(PCM_REG0_DATA);
+	r->r7_ret = rd(PCM_REG7_DATA);
+	/*
+	 * 3c: after PCM_RETURN r0 = 0xe8000000 (DPY_VREF_CH0_EN, DPY_DLL_EN,
+	 * DPY_2ND_DLL_EN, DPY_DLL_CK_CH0_EN). With r0 driven, dropping
+	 * PWR_IO_EN would switch those DRAM-PHY lines back to POWER_ON_VAL0 (0).
+	 * Vendor __spm_reset_and_init_pcm: "backup mem control from r0 to
+	 * POWER_ON_VAL0" before PWR_IO_EN = 0 — do the same, and keep it.
+	 */
+	r->val0_pre = rd(SPM_POWER_ON_VAL0);
+	if (r->returned && (io_en & PCM_PWRIO_EN_R0) && r->r0_ret != r->val0_pre)
+		wr(SPM_POWER_ON_VAL0, r->r0_ret);
+	r->pc_ret = rd(PCM_REG15_DATA);
+	r->fsm_ret = rd(PCM_FSM_STA);
+	/* __spm_get_wakeup_status() */
+	r->ws[0] = rd(PCM_REG_DATA_INI);
+	r->ws[1] = rd(SPM_SW_RSV_0);
+	r->ws[2] = rd(PCM_REG12_EXT_DATA);
+	r->ws[3] = rd(SPM_WAKEUP_STA);
+	r->ws[4] = rd(SPM_WAKEUP_EXT_STA);
+	r->ws[5] = rd(SPM_BSI_D0_SR);
+	r->ws[6] = rd(SPM_BSI_D1_SR);
+	r->ws[7] = rd(PCM_REG13_DATA);
+	r->ws[8] = rd(SUBSYS_IDLE_STA);
+	r->ws[9] = rd(SPM_SW_DEBUG);
+	r->ws[10] = rd(SPM_BSI_D2_SR);
+	isr = rd(SPM_IRQ_STA);
+	r->ws[11] = isr;
+	r->ws[12] = rd(SPM_WAKEUP_MISC);
+	r->ws[13] = rd(PCM_EVENT_REG_STA);
+	r->ws[14] = rd(PCM_TIMER_OUT);
+	r->ws[15] = rd(PCM_CON1);
+
+out_axi:
+	for (i = 0; i < 3; i++)
+		if (acinactm & BIT(i) && r->axi_pre[i] != r->axi_set[i])
+			mcusys_smc_write(axi_off[i], r->axi_pre[i]);
+out:
+	/* __spm_clean_after_wakeup() + PCM timer off, outputs off, PCM reset */
+	wr(SPM_CPU_WAKEUP_EVENT, 0);
+	wr(SPM_WAKEUP_EVENT_MASK, ~0U);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	wr(SPM_SW_INT_CLEAR, 0x3ff);
+	wr(PCM_CON1, KEY | (rd(PCM_CON1) & 0xffff & ~PCM_TIMER_EN));
+	wr(PCM_PWR_IO_EN, 0);
+	pcm_reset();
+	local_irq_enable();
+	preempt_enable();
+	return 0;
+}
+
+static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+{
+	static struct sleep_ctx c;
+	static struct sleep_res res[60];
+	u32 sv_apsb, sv_wfi[10], sv_flag, sv_rsv0, sv_mp1, sv_mp2, sv_ini, sv_vec[16], sv_wmask, sv_cwe;
+	u32 sv_pw[32], sv_irqm, sv_tval, sv_wdtv, sv_bsi[3];
+	struct device_node *np;
+	struct of_phandle_args oa = { .args_count = 3, .args = { 0, SPM_IRQ_SPI, IRQ_TYPE_LEVEL_LOW } };
+	void __iomem *gicd;
+	unsigned int irq = 0;
+	u8 sv_prio = 0;
+	u64 tot_ticks = 0, frq = read_sysreg(cntfrq_el0);
+	u32 tot_timer = 0, n, i, ok = 0;
+	int ret;
+
+	if (io_en != 0x80 && io_en != 0x81) {
+		pr_err("mt6797-spm-load: stage 6: io_en must be 0x80 or 0x81\n");
+		return;
+	}
+	if (acinactm & ~3U) {
+		pr_err("mt6797-spm-load: stage 6: acinactm bit2 (MP2) not allowed until its register is confirmed\n");
+		return;
+	}
+	if ((io_en & PCM_PWRIO_EN_R0) && !(acinactm & 1)) {
+		pr_err("mt6797-spm-load: stage 6: r0 (CPU clock off) needs acinactm (at least bit0 = MP0)\n");
+		return;
+	}
+	if (num_online_cpus() != 1 || !cpu_online(0)) {
+		pr_err("mt6797-spm-load: stage 6: offline cpu1-9 first (%u online)\n", num_online_cpus());
+		return;
+	}
+	if (sleep_ms < 1 || sleep_ms > 5000 || cycles < 1 || cycles > 60 || gap_ms < 50) {
+		pr_err("mt6797-spm-load: stage 6: sleep_ms 1..5000, cycles 1..60, gap_ms >= 50\n");
+		return;
+	}
+	if (gic_read_pmr() <= SPM_IRQ_PRIO + 0x20) {
+		pr_err("mt6797-spm-load: stage 6: ICC_PMR_EL1 = %02x (expected Linux default 0xf0) — refusing\n", gic_read_pmr());
+		return;
+	}
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6797-sysirq");
+	if (!np) {
+		pr_err("mt6797-spm-load: stage 6: no mediatek,mt6797-sysirq node\n");
+		return;
+	}
+	oa.np = np;
+	irq = irq_create_of_mapping(&oa);
+	of_node_put(np);
+	gicd = ioremap(GICD_PHYS, 0x1000);
+	mcucfg = ioremap(MCUCFG_PHYS, MCUCFG_MAP_LEN);
+	if (!irq || !gicd || !mcucfg) {
+		pr_err("mt6797-spm-load: stage 6: irq %u / map failed\n", irq);
+		goto out_unmap;
+	}
+	ret = request_irq(irq, spm_isr, IRQF_NO_AUTOEN, "mt6797-spm", NULL);
+	if (ret) {
+		pr_err("mt6797-spm-load: stage 6: request_irq(%u) = %d\n", irq, ret);
+		irq_dispose_mapping(irq);
+		irq = 0;
+		goto out_unmap;
+	}
+
+	sv_apsb = rd(AP_STANDBY_CON);
+	sv_irqm = rd(SPM_IRQ_MASK);
+	sv_tval = rd(PCM_TIMER_VAL);
+	sv_wdtv = rd(PCM_WDT_VAL_OFF);
+	for (i = 0; i < 3; i++)
+		sv_bsi[i] = rd(SPM_BSI_D0_SR + 4 * i);
+	sv_wmask = rd(SPM_WAKEUP_EVENT_MASK);
+	sv_cwe = rd(SPM_CPU_WAKEUP_EVENT);
+	for (i = 0; i < 10; i++)
+		sv_wfi[i] = rd(MP0_CPU0_WFI_EN + 4 * i);
+	sv_flag = rd(SPM_SW_FLAG);
+	sv_rsv0 = rd(SPM_SW_RSV_0);
+	sv_mp1 = rd(SPM_MAS_PAUSE_MASK_B);
+	sv_mp2 = rd(SPM_MAS_PAUSE2_MASK_B);
+	sv_ini = rd(PCM_REG_DATA_INI);
+	for (i = 0; i < 16; i++)
+		sv_vec[i] = rd(PCM_EVENT_VECTOR0 + 4 * i);
+	for (i = 0; i < 32; i++)
+		sv_pw[i] = readl(pwrap + PWRAP_DVFS_ADR0 + 4 * i);
+	for (i = 0; i < 16; i++) {	/* SPM PMIC commands -> read-only HWCID */
+		writel(0x0200, pwrap + PWRAP_DVFS_ADR0 + 8 * i);
+		writel(0, pwrap + PWRAP_DVFS_ADR0 + 8 * i + 4);
+	}
+	sv_prio = readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	writeb(SPM_IRQ_PRIO, gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	enable_irq(irq);
+
+	c.t = t;
+	c.swflag = flags | SPM_FLAG_DIS_SRCCLKEN_LOW;
+	pr_info("mt6797-spm-load: stage 6: %u x %u ms sleep (gap %u ms), PWR_IO_EN %02x, SW_FLAG %08x, wake_unmask %08x, ACINACTM mask %x, SPM irq %u (GIC prio %02x -> %02x), PMR %02x -> %02x in WFI\n",
+		cycles, sleep_ms, gap_ms, io_en, c.swflag, wake_unmask, acinactm, irq, sv_prio,
+		readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI), gic_read_pmr(), SLEEP_PMR);
+
+	for (n = 0; n < cycles; n++) {
+		if (n && im_load(t, im_ptr, words)) {
+			pr_err("mt6797-spm-load: cycle %u: IM reload failed — stopping\n", n);
+			break;
+		}
+		memset(&c.r, 0, sizeof(c.r));
+		work_on_cpu(0, sleep_work, &c);
+		res[n] = c.r;
+		/* one line per cycle right away (3d-3 hang: the end-of-run summary never got out) */
+		pr_info("mt6797-spm-load: cyc %u/%u: %s r12 %08x timer_out %u (~%u ms) wfi %llu ms exits %u r0 %08x r7 %08x\n",
+			n + 1, cycles, c.r.refused ? "REFUSED" : c.r.returned ? "ret" : "NO-RET",
+			c.r.ws[1], c.r.ws[6], c.r.ws[6] * 1000 / 32768,
+			frq ? div64_u64(c.r.ticks * 1000, frq) : 0, c.r.exits, c.r.r0_ret, c.r.r7_ret);
+		if (!c.r.ran || c.r.refused || !c.r.returned)
+			break;
+		ok++;
+		tot_ticks += c.r.ticks;
+		tot_timer += c.r.ws[6];
+		msleep(gap_ms);
+	}
+
+	disable_irq(irq);
+	free_irq(irq, NULL);
+	irq_dispose_mapping(irq);
+	writeb(sv_prio, gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	/* restore (CON0/CON1/IM_* by rmmod) */
+	wr(PCM_PWR_IO_EN, 0);
+	for (i = 0; i < 16; i++)
+		wr(PCM_EVENT_VECTOR0 + 4 * i, sv_vec[i]);
+	wr(PCM_REG_DATA_INI, sv_ini);
+	wr(SPM_MAS_PAUSE_MASK_B, sv_mp1);
+	wr(SPM_MAS_PAUSE2_MASK_B, sv_mp2);
+	wr(SPM_SW_RSV_0, sv_rsv0);
+	wr(SPM_SW_FLAG, sv_flag);
+	for (i = 0; i < 10; i++)
+		wr(MP0_CPU0_WFI_EN + 4 * i, sv_wfi[i]);
+	wr(AP_STANDBY_CON, sv_apsb);
+	wr(SPM_CPU_WAKEUP_EVENT, sv_cwe);
+	wr(SPM_WAKEUP_EVENT_MASK, sv_wmask);
+	wr(SPM_IRQ_MASK, sv_irqm);
+	wr(PCM_TIMER_VAL, sv_tval);
+	wr(PCM_WDT_VAL_OFF, sv_wdtv);
+	for (i = 0; i < 3; i++)
+		wr(SPM_BSI_D0_SR + 4 * i, sv_bsi[i]);
+	for (i = 0; i < 32; i++)
+		writel(sv_pw[i], pwrap + PWRAP_DVFS_ADR0 + 4 * i);
+
+	for (i = 0; i < cycles && i < n + 1 && i < ARRAY_SIZE(res); i++) {
+		struct sleep_res *r = &res[i];
+
+		if (!r->ran && !r->refused)
+			break;
+		pr_info("mt6797-spm-load: cycle %u: %s%s, %u WFI exits, %llu ticks (~%llu ms) in WFI loop, r0 %08x->%08x r7 %08x->%08x, PC %08x FSM %08x\n",
+			i, r->refused ? "REFUSED " : r->returned ? "PCM_RETURN" : "NO RETURN — aborted",
+			r->refused == 1 ? "(not alone on cpu0)" : r->refused == 2 ? "(r0/r7 != POWER_ON_VAL)" :
+			r->refused == 3 ? "(ACINACTM write did not stick)" : "",
+			r->exits, r->ticks, frq ? div64_u64(r->ticks * 1000, frq) : 0,
+			r->r0_pre, r->r0_ret, r->r7_pre, r->r7_ret, r->pc_ret, r->fsm_ret);
+		if (io_en & PCM_PWRIO_EN_R0)
+			pr_info("mt6797-spm-load:   POWER_ON_VAL0 %08x -> %08x (r0 backup, kept)\n",
+				r->val0_pre, rd(SPM_POWER_ON_VAL0));
+		if (acinactm)
+			pr_info("mt6797-spm-load:   ACINACTM: MP0 %08x->%08x (smc %ld) MP1 %08x->%08x (smc %ld) MP2 %08x->%08x (smc %ld)\n",
+				r->axi_pre[0], r->axi_set[0], (long)r->smc_ret[0],
+				r->axi_pre[1], r->axi_set[1], (long)r->smc_ret[1],
+				r->axi_pre[2], r->axi_set[2], (long)r->smc_ret[2]);
+		if (r->refused)
+			continue;
+		pr_info("mt6797-spm-load:   wake: r12 %08x r12_ext %08x raw %08x raw_ext %08x misc(D0) %08x timer_out(D1) %u (~%u ms) event(D2) %08x\n",
+			r->ws[1], r->ws[2], r->ws[3], r->ws[4], r->ws[5], r->ws[6], r->ws[6] * 1000 / 32768, r->ws[10]);
+		pr_info("mt6797-spm-load:   r13 %08x idle %08x SW_DEBUG %08x IRQ_STA %08x WAKEUP_MISC %08x EVENT_REG %08x TIMER_OUT %08x CON1 %08x assert_pc %08x\n",
+			r->ws[7], r->ws[8], r->ws[9], r->ws[11], r->ws[12], r->ws[13], r->ws[14], r->ws[15], r->ws[0]);
+	}
+	pr_info("mt6797-spm-load: stage 6: %u of %u cycles returned; asleep (PCM timer_out) %u ms, cpu0 in WFI loop %llu ms\n",
+		ok, cycles, (u32)div_u64((u64)tot_timer * 1000, 32768),
+		frq ? div64_u64(tot_ticks * 1000, frq) : 0);
+	show_pcm("after stage 6");
+	goto out_unmap_only;
+
+out_unmap:
+	if (irq)
+		irq_dispose_mapping(irq);
+out_unmap_only:
+	if (gicd)
+		iounmap(gicd);
+	if (mcucfg)
+		iounmap(mcucfg);
+	mcucfg = NULL;
+}
+
+/* stage 0 extras: read-only state for step 3 (+ optional SMC no-op test) */
+static void stage0_extras(void)
+{
+	void __iomem *mc = ioremap(MCUCFG_PHYS, MCUCFG_MAP_LEN);
+	void __iomem *gd = ioremap(GICD_PHYS, 0x1000);
+	u32 i;
+
+	pr_info("mt6797-spm-load: online cpus %*pbl; SPM_CLK_CON %08x CLK_SETTLE %08x MP2_CPUSYS_PWR_CON %08x CPU_EXT_BUCK_ISO %08x PWR_IO_EN %08x\n",
+		cpumask_pr_args(cpu_online_mask), rd(SPM_CLK_CON), rd(SPM_CLK_SETTLE),
+		rd(MP2_CPUSYS_PWR_CON), rd(CPU_EXT_BUCK_ISO), rd(PCM_PWR_IO_EN));
+	pr_info("mt6797-spm-load: ICC_PMR_EL1 %02x (this cpu %d)\n", gic_read_pmr(), raw_smp_processor_id());
+	if (gd)
+		pr_info("mt6797-spm-load: GICD_CTLR %08x, prio SPI %u = %02x, SPI 169 (APXGPT) = %02x, GICD_ISENABLER(SPI %u word) %08x\n",
+			readl(gd), SPM_IRQ_SPI, readb(gd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI),
+			readb(gd + GICD_IPRIORITYR + 32 + 169), SPM_IRQ_SPI,
+			readl(gd + 0x100 + 4 * ((32 + SPM_IRQ_SPI) / 32)));
+	if (mc) {
+		for (i = 0; i < 3; i++)
+			pr_info("mt6797-spm-load: MP%u_AXI_CONFIG (0x%08x) %08x\n", i,
+				MCUCFG_PHYS + axi_off[i], readl(mc + axi_off[i]));
+		pr_info("mt6797-spm-load: 0x1022020c (dpidle's MP2 guess) %08x, MCUCFG2 0x10222000 %08x 0x1022200c %08x 0x1022202c %08x\n",
+			readl(mc + 0x20C), readl(mc + 0x2000), readl(mc + 0x200C), readl(mc + 0x202C));
+		if (axi_test)
+			for (i = 0; i < 2; i++) {
+				u32 v = readl(mc + axi_off[i]);
+				unsigned long a0 = mcusys_smc_write(axi_off[i], v);
+
+				pr_info("mt6797-spm-load: axi_test: SMC 0x%x(0x%08x, %08x) = %ld, readback %08x\n",
+					SMC_MCUSYS_WRITE, MCUCFG_PHYS + axi_off[i], v, (long)a0,
+					readl(mc + axi_off[i]));
+			}
+	}
+	if (mc)
+		iounmap(mc);
+	if (gd)
+		iounmap(gd);
+}
+
 static int __init spm_load_init(void)
 {
 	const struct firmware *f;
@@ -654,8 +1170,8 @@ static int __init spm_load_init(void)
 	char ver[64];
 	int ret;
 
-	if (stage < 0 || stage > 5) {
-		pr_err("mt6797-spm-load: stage must be 0..5\n");
+	if (stage < 0 || stage > 6) {
+		pr_err("mt6797-spm-load: stage must be 0..6\n");
 		return -EINVAL;
 	}
 
@@ -729,7 +1245,9 @@ static int __init spm_load_init(void)
 		goto out_map;
 	}
 	if (stage == 0) {
-		pr_info("mt6797-spm-load: stage 0 done, nothing written\n");
+		stage0_extras();
+		pr_info("mt6797-spm-load: stage 0 done, nothing written%s\n",
+			axi_test ? " (except the SMC no-op AXI_CONFIG writes)" : "");
 		ret = 0;
 		goto out_keep;	/* stays loaded so rmmod is symmetrical; no writes */
 	}
@@ -783,10 +1301,12 @@ static int __init spm_load_init(void)
 		int vret = 0;
 
 		/* compare against our aligned copy (blob words sit at offset 2); always before a kick */
-		if (verify || stage == 2)
+		if (verify || stage == 2 || stage == 6)
 			vret = do_verify(page_address(page), words);
 		if (stage >= 2) {
-			if (ready && !vret)
+			if (ready && !vret && stage == 6)
+				sleep_test(t, im_ptr, words);
+			else if (ready && !vret)
 				kick_test(t);
 			else
 				pr_err("mt6797-spm-load: stage %d: IM not ready or verify failed — NOT kicking\n", stage);
@@ -847,5 +1367,5 @@ static void __exit spm_load_exit(void)
 
 module_init(spm_load_init);
 module_exit(spm_load_exit);
-MODULE_DESCRIPTION("MT6797 SPM PCM firmware load into IM, no kick (step 2a; Gemini PDA)");
+MODULE_DESCRIPTION("MT6797 SPM PCM firmware loader + suspend-firmware test stages (SPM port steps 2-3; Gemini PDA)");
 MODULE_LICENSE("GPL");

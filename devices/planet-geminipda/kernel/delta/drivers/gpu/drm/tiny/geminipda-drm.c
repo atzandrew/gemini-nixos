@@ -109,6 +109,16 @@
  *    showing fb_base, and a sample of its rows is transparent; remove and
  *    shutdown put LK's SRC_CON back.  Nothing visible changes.
  *
+ *  - OVL0 layer 0 off while the display is off ("blank-l0", 2026-10-13).
+ *    Video mode keeps RDMA0/DSI scanning while blanked, and L0 is then the
+ *    only DRAM reader of the pipe (RDMA0 is direct-link).  With blank_l0=1
+ *    (default) CRTC disable clears SRC_CON bit 0 (OVL outputs its black
+ *    background; DSI timing, RDMA0 and its vblank IRQ keep running) and
+ *    CRTC enable sets it again — only if probe saw L0 on and showing
+ *    fb_base.  devmem A/B, screen lit: ~50-90 mA.  Also a prerequisite for
+ *    SPM DRAM self-refresh (claude/idle-power.md, SPM step 3).  remove /
+ *    shutdown turn L0 back on.
+ *
  * CORE RULE 5: this driver never initialises the panel.  LK does that.
  * The shadow blit only writes the already-initialised scanout region, so
  * there is no path from here to the "uninitialised panel" flicker.  The
@@ -217,7 +227,7 @@ module_param(stat_full_frames, ulong, 0444);
  * Display engine registers (vendor ddp_reg.h, gemian/gemini-linux-kernel-3.18
  * drivers/misc/mediatek/video/mt6797/dispsys; same layout as mainline
  * mtk_disp_rdma.c / mtk_disp_ovl.c).  Only RDMA_INT_ENABLE / RDMA_INT_STATUS
- * and OVL_SRC_CON (layer 3 enable only) are ever written.
+ * and OVL_SRC_CON (layer 3 and layer 0 enable bits only) are ever written.
  */
 #define RDMA_INT_ENABLE		0x000
 #define RDMA_INT_STATUS		0x004	/* write 0 to clear (vendor writes ~sta) */
@@ -237,6 +247,12 @@ static bool ovl_l3_off = true;
 module_param(ovl_l3_off, bool, 0444);
 MODULE_PARM_DESC(ovl_l3_off,
 	"Disable LK's transparent OVL0 layer 3 (saves a full-frame DRAM read per frame; default on)");
+
+/* blank-l0: OVL0 layer 0 off while the CRTC is off (see the header). */
+static bool blank_l0 = true;
+module_param(blank_l0, bool, 0644);
+MODULE_PARM_DESC(blank_l0,
+	"Switch OVL0 layer 0 (the LK scanout layer) off while the display is off: no DRAM scanout when blanked (default on)");
 
 /* Hardware vblank (vsync1).  hw_vblank / vblank_irq_bit apply at probe. */
 static bool hw_vblank = true;
@@ -296,6 +312,8 @@ struct geminipda_drm_device {
 	void __iomem *ovl;
 	u32 ovl_src_orig;
 	bool ovl_l3_cleared;	/* SRC_CON bit 3 cleared by us: restore on exit */
+	bool ovl_l0_ours;	/* probe: L0 on and showing fb_base -> blank_l0 may use it */
+	bool ovl_l0_off;	/* SRC_CON bit 0 cleared by blank_l0 */
 };
 
 static struct geminipda_drm_device *
@@ -785,9 +803,26 @@ static void geminipda_drm_set_backlight(bool on)
 	put_device(&bd->dev);
 }
 
+/* blank-l0: L0 off while the CRTC is off, on again before it is shown. */
+static void geminipda_drm_ovl_l0(struct geminipda_drm_device *sdev, bool on)
+{
+	u32 src;
+
+	if (!sdev->ovl || !sdev->ovl_l0_ours)
+		return;
+	if (!on && (!READ_ONCE(blank_l0) || sdev->ovl_l0_off))
+		return;
+	if (on && !sdev->ovl_l0_off)
+		return;
+	src = readl(sdev->ovl + OVL_SRC_CON);
+	writel(on ? (src | BIT(0)) : (src & ~BIT(0)), sdev->ovl + OVL_SRC_CON);
+	sdev->ovl_l0_off = !on;
+}
+
 static void geminipda_drm_crtc_helper_atomic_enable(struct drm_crtc *crtc,
 						    struct drm_atomic_state *state)
 {
+	geminipda_drm_ovl_l0(geminipda_drm_device_of_dev(crtc->dev), true);
 	drm_crtc_vblank_on(crtc);
 	/* always unblank: the param may have changed while off */
 	geminipda_drm_set_backlight(true);
@@ -799,6 +834,7 @@ static void geminipda_drm_crtc_helper_atomic_disable(struct drm_crtc *crtc,
 	drm_crtc_vblank_off(crtc);
 	if (READ_ONCE(blank_backlight))
 		geminipda_drm_set_backlight(false);
+	geminipda_drm_ovl_l0(geminipda_drm_device_of_dev(crtc->dev), false);
 }
 
 /*
@@ -1058,6 +1094,7 @@ static void geminipda_drm_ovl_init(struct geminipda_drm_device *sdev,
 			 " <- LK framebuffer" : "");
 	}
 
+	sdev->ovl_l0_ours = (src & BIT(0)) && readl(ovl + OVL_L_ADDR(0)) == fb_base;
 	if (!ovl_l3_off || !(src & BIT(OVL_L3)))
 		return;
 	/* Only ever turn L3 off while our layer (L0) is on and showing fb_base. */
@@ -1076,6 +1113,7 @@ static void geminipda_drm_ovl_init(struct geminipda_drm_device *sdev,
 /* Put LK's SRC_CON back (remove / shutdown). */
 static void geminipda_drm_ovl_fini(struct geminipda_drm_device *sdev)
 {
+	geminipda_drm_ovl_l0(sdev, true);	/* blank-l0: leave LK's layer on */
 	if (!sdev->ovl_l3_cleared)
 		return;
 	writel(readl(sdev->ovl + OVL_SRC_CON) | BIT(OVL_L3),
