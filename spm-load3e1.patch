@@ -1,0 +1,100 @@
+diff --git a/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c b/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
+index 34d021f..8e45d12 100644
+--- a/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
++++ b/devices/planet-geminipda/kernel/modules/mt6797-spm-load/mt6797-spm-load.c
+@@ -168,6 +168,14 @@ static uint acinactm;
+ module_param(acinactm, uint, 0444);
+ MODULE_PARM_DESC(acinactm, "stage=6: clusters whose ACINACTM is set around the WFI (bit0 MP0, bit1 MP1, bit2 MP2; required with r0)");
+ 
++static uint src_mask = ~0U;
++module_param(src_mask, uint, 0444);
++MODULE_PARM_DESC(src_mask, "stage=6: SPM_SRC_MASK (0x0BC) during the run; default 0xffffffff = keep LK's (vendor suspend 0x10aa007e)");
++
++static uint src2_mask = ~0U;
++module_param(src2_mask, uint, 0444);
++MODULE_PARM_DESC(src2_mask, "stage=6: SPM_SRC2_MASK (0x0C0) during the run; default 0xffffffff = keep LK's (vendor suspend 0x00f1001f)");
++
+ static bool axi_test;
+ module_param(axi_test, bool, 0444);
+ MODULE_PARM_DESC(axi_test, "stage=0: SMC 0x82000201 no-op write test on MP0/MP1 AXI_CONFIG");
+@@ -380,6 +388,9 @@ static int do_verify(const u32 *prog, u32 words)
+ #define PCM_TIMER_OUT		0x150
+ #define PCM_TIMER_EN		BIT(5)
+ #define PCM_WDT_VAL_OFF		0x034
++#define SPM_SRC_REQ		0x0B8
++#define SPM_SRC_MASK		0x0BC
++#define SPM_SRC2_MASK		0x0C0
+ #define SPM_WAKEUP_EVENT_MASK	0x0C4
+ #define PCM_REG12_EXT_DATA	0x144
+ #define PCM_REG13_DATA		0x134
+@@ -833,6 +844,7 @@ static long sleep_work(void *arg)
+ 	wr(PCM_REG_DATA_INI, 0);
+ 	wr(SPM_SW_FLAG, c->swflag);
+ 	wr(SPM_SW_RSV_0, 0);
++	wr(SPM_SW_DEBUG, 0);	/* 3e: firmware step bits (SPM_DBG_DEBUG_IDX_*) per cycle, not cumulative */
+ 
+ 	/* outputs may only be enabled while they equal the power-on values */
+ 	r->r0_pre = rd(PCM_REG0_DATA);
+@@ -942,7 +954,7 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	static struct sleep_ctx c;
+ 	static struct sleep_res res[60];
+ 	u32 sv_apsb, sv_wfi[10], sv_flag, sv_rsv0, sv_mp1, sv_mp2, sv_ini, sv_vec[16], sv_wmask, sv_cwe;
+-	u32 sv_pw[32], sv_irqm, sv_tval, sv_wdtv, sv_bsi[3];
++	u32 sv_pw[32], sv_irqm, sv_tval, sv_wdtv, sv_bsi[3], sv_dbg, sv_src, sv_src2;
+ 	struct device_node *np;
+ 	struct of_phandle_args oa = { .args_count = 3, .args = { 0, SPM_IRQ_SPI, IRQ_TYPE_LEVEL_LOW } };
+ 	void __iomem *gicd;
+@@ -1010,6 +1022,9 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 		sv_wfi[i] = rd(MP0_CPU0_WFI_EN + 4 * i);
+ 	sv_flag = rd(SPM_SW_FLAG);
+ 	sv_rsv0 = rd(SPM_SW_RSV_0);
++	sv_dbg = rd(SPM_SW_DEBUG);
++	sv_src = rd(SPM_SRC_MASK);
++	sv_src2 = rd(SPM_SRC2_MASK);
+ 	sv_mp1 = rd(SPM_MAS_PAUSE_MASK_B);
+ 	sv_mp2 = rd(SPM_MAS_PAUSE2_MASK_B);
+ 	sv_ini = rd(PCM_REG_DATA_INI);
+@@ -1024,6 +1039,10 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	sv_prio = readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+ 	writeb(SPM_IRQ_PRIO, gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+ 	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
++	if (src_mask != ~0U)
++		wr(SPM_SRC_MASK, src_mask);
++	if (src2_mask != ~0U)
++		wr(SPM_SRC2_MASK, src2_mask);
+ 	enable_irq(irq);
+ 
+ 	c.t = t;
+@@ -1031,6 +1050,8 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	pr_info("mt6797-spm-load: stage 6: %u x %u ms sleep (gap %u ms), PWR_IO_EN %02x, SW_FLAG %08x, wake_unmask %08x, ACINACTM mask %x, SPM irq %u (GIC prio %02x -> %02x), PMR %02x -> %02x in WFI\n",
+ 		cycles, sleep_ms, gap_ms, io_en, c.swflag, wake_unmask, acinactm, irq, sv_prio,
+ 		readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI), gic_read_pmr(), SLEEP_PMR);
++	pr_info("mt6797-spm-load: stage 6: SRC_REQ %08x SRC_MASK %08x -> %08x SRC2_MASK %08x -> %08x\n",
++		rd(SPM_SRC_REQ), sv_src, rd(SPM_SRC_MASK), sv_src2, rd(SPM_SRC2_MASK));
+ 
+ 	for (n = 0; n < cycles; n++) {
+ 		if (n && im_load(t, im_ptr, words)) {
+@@ -1041,10 +1062,11 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 		work_on_cpu(0, sleep_work, &c);
+ 		res[n] = c.r;
+ 		/* one line per cycle right away (3d-3 hang: the end-of-run summary never got out) */
+-		pr_info("mt6797-spm-load: cyc %u/%u: %s r12 %08x timer_out %u (~%u ms) wfi %llu ms exits %u r0 %08x r7 %08x\n",
++		pr_info("mt6797-spm-load: cyc %u/%u: %s r12 %08x timer_out %u (~%u ms) wfi %llu ms exits %u r0 %08x r7 %08x r13 %08x dbg %08x\n",
+ 			n + 1, cycles, c.r.refused ? "REFUSED" : c.r.returned ? "ret" : "NO-RET",
+ 			c.r.ws[1], c.r.ws[6], c.r.ws[6] * 1000 / 32768,
+-			frq ? div64_u64(c.r.ticks * 1000, frq) : 0, c.r.exits, c.r.r0_ret, c.r.r7_ret);
++			frq ? div64_u64(c.r.ticks * 1000, frq) : 0, c.r.exits, c.r.r0_ret, c.r.r7_ret,
++			c.r.ws[7], c.r.ws[9]);
+ 		if (!c.r.ran || c.r.refused || !c.r.returned)
+ 			break;
+ 		ok++;
+@@ -1066,6 +1088,9 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
+ 	wr(SPM_MAS_PAUSE2_MASK_B, sv_mp2);
+ 	wr(SPM_SW_RSV_0, sv_rsv0);
+ 	wr(SPM_SW_FLAG, sv_flag);
++	wr(SPM_SW_DEBUG, sv_dbg);
++	wr(SPM_SRC_MASK, sv_src);
++	wr(SPM_SRC2_MASK, sv_src2);
+ 	for (i = 0; i < 10; i++)
+ 		wr(MP0_CPU0_WFI_EN + 4 * i, sv_wfi[i]);
+ 	wr(AP_STANDBY_CON, sv_apsb);
