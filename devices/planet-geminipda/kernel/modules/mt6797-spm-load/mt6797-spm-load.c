@@ -69,6 +69,15 @@
  *               WFI returns, i.e. never if the SPM IRQ never comes) -> PWR_IO_EN = 0
  *               first (outputs back to POWER_ON_VAL), then reset (abort path).
  *               No SYS_CIRQ, no PSCI/dormant, PCM WDT off, toprgu untouched.
+ *   pdn=1       3e3 (stage=6, no ACINACTM): stock suspend CPU power-down. SW_FLAG
+ *               without DIS_CPU_PDN, AP_STANDBY_CON low bits = pdn_apsb (vendor
+ *               suspend 0x11: WFI_OP_AND, only mp3top masked), WFI_EN cpu0;
+ *               after the kick cpu_pm_enter() + psci_cpu_suspend_enter(pdn_state)
+ *               (vendor mt_cpu_dormant_psci: 0x01010000 = cluster power-down) +
+ *               cpu_pm_exit(), arch timer CNTP_CTL/CVAL put back by hand (no
+ *               broadcast timer). If PCM_RETURN is not set after PSCI returns,
+ *               the stage-6 WFI loop follows. Needs the kernel's
+ *               psci_cpu_suspend_enter export (delta psci.c).
  *   axi_test=1  (stage=0 only) ATF SMC 0x82000201 no-op test: write MP0/MP1
  *               AXI_CONFIG back with the value just read, report a0 + readback.
  *   verify=1    (with stage>=1) read the IM back through PCM_IM_HOST_RW_PTR/DAT
@@ -97,6 +106,8 @@
 #include <linux/moduleparam.h>
 #include <linux/arm-smccc.h>
 #include <linux/cpumask.h>
+#include <linux/cpu_pm.h>
+#include <linux/psci.h>
 #include <linux/interrupt.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
@@ -187,6 +198,18 @@ MODULE_PARM_DESC(settle, "stage=6: vendor spm_set_sysclk_settle(): SYS_SETTLE_SE
 static bool srcclken_low;
 module_param(srcclken_low, bool, 0444);
 MODULE_PARM_DESC(srcclken_low, "stage=6: do not force SPM_FLAG_DIS_SRCCLKEN_LOW (default: forced on)");
+
+static bool pdn;
+module_param(pdn, bool, 0444);
+MODULE_PARM_DESC(pdn, "stage=6: CPU power-down through PSCI CPU_SUSPEND (stock suspend), DIS_CPU_PDN cleared (3e3)");
+
+static uint pdn_state = 0x01010000;
+module_param(pdn_state, uint, 0444);
+MODULE_PARM_DESC(pdn_state, "pdn=1: PSCI power_state (default 0x01010000 = cluster power-down, vendor mt_cpu_dormant_psci)");
+
+static uint pdn_apsb = 0x11;
+module_param(pdn_apsb, uint, 0444);
+MODULE_PARM_DESC(pdn_apsb, "pdn=1: AP_STANDBY_CON bits 6:0 (default 0x11 = vendor suspend: WFI_OP_AND, mp3top masked)");
 
 static bool axi_test;
 module_param(axi_test, bool, 0444);
@@ -396,6 +419,7 @@ static int do_verify(const u32 *prog, u32 words)
 #define ISRM_RET_IRQ_AUX	(0x3ffU << 8)
 #define ISRM_TWAM		BIT(2)
 #define SPM_FLAG_DIS_SRCCLKEN_LOW BIT(15)
+#define SPM_FLAG_DIS_CPU_PDN	BIT(0)
 #define PCM_TIMER_VAL		0x030
 #define PCM_TIMER_OUT		0x150
 #define PCM_TIMER_EN		BIT(5)
@@ -801,6 +825,9 @@ struct sleep_res {
 	u32 axi_pre[3], axi_set[3];
 	unsigned long smc_ret[3];
 	u32 pmr_old;
+	int pm_ret, psci_ret, pdn_ran, ret_after_psci;
+	u64 pdn_ticks;		/* CNTVCT across psci_cpu_suspend_enter() */
+	u32 dbg_after_psci, r13_after_psci;
 };
 
 struct sleep_ctx {
@@ -843,8 +870,8 @@ static long sleep_work(void *arg)
 	wr(PCM_PWR_IO_EN, 0);
 	for (i = 0; i < 16; i++)
 		wr(PCM_EVENT_VECTOR0 + 4 * i, c->t->vec[i]);
-	/* power control as stage 5: standby = cpu0 WFI only */
-	wr(AP_STANDBY_CON, (rd(AP_STANDBY_CON) & ~0x7fU) | 0x7f);
+	/* power control as stage 5: standby = cpu0 WFI only; pdn: vendor suspend masks */
+	wr(AP_STANDBY_CON, (rd(AP_STANDBY_CON) & ~0x7fU) | (pdn ? (pdn_apsb & 0x7f) : 0x7f));
 	for (i = 0; i < 10; i++)
 		wr(MP0_CPU0_WFI_EN + 4 * i, i == 0);
 	/* __spm_set_wakeup_event(): PCM timer; SPM ISR: only PCM_RETURN */
@@ -894,7 +921,36 @@ static long sleep_work(void *arg)
 	dsb(sy);
 	a = read_sysreg(cntvct_el0);
 	limit = (u64)(sleep_ms + 2000) * read_sysreg(cntfrq_el0) / 1000;
-	for (r->exits = 0; ; r->exits++) {
+	if (pdn) {
+		/*
+		 * Stock suspend: mt_cpu_dormant(CPU_SHUTDOWN_MODE) -> PSCI CPU_SUSPEND.
+		 * The SPM firmware powers cpu0 back up at the wake. No broadcast
+		 * timer here, so the per-CPU timer (phys, EL1) is put back by hand.
+		 */
+		u64 cval = read_sysreg(cntp_cval_el0);
+		u32 ctl = read_sysreg(cntp_ctl_el0);
+
+		r->pm_ret = cpu_pm_enter();
+		if (!r->pm_ret) {
+			u64 p = read_sysreg(cntvct_el0);
+
+			r->pdn_ran = 1;
+			r->psci_ret = psci_cpu_suspend_enter(pdn_state);
+			r->pdn_ticks = read_sysreg(cntvct_el0) - p;
+			r->dbg_after_psci = rd(SPM_SW_DEBUG);
+			r->r13_after_psci = rd(PCM_REG13_DATA);
+			cpu_pm_exit();
+			write_sysreg(cval, cntp_cval_el0);
+			write_sysreg(ctl, cntp_ctl_el0);
+			gic_write_pmr(SLEEP_PMR);	/* GIC cpu_pm exit reset it */
+			isb();
+		}
+		if (rd(SPM_IRQ_STA) & ISRS_PCM_RETURN) {
+			r->ret_after_psci = 1;
+			r->returned = 1;
+		}
+	}
+	for (r->exits = 0; !r->returned; r->exits++) {
 		dsb(sy);
 		wfi();
 		if (rd(SPM_IRQ_STA) & ISRS_PCM_RETURN) {
@@ -992,6 +1048,10 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
 		pr_err("mt6797-spm-load: stage 6: r0 (CPU clock off) needs acinactm (at least bit0 = MP0)\n");
 		return;
 	}
+	if (pdn && acinactm) {
+		pr_err("mt6797-spm-load: stage 6: pdn=1 runs without ACINACTM (stock suspend)\n");
+		return;
+	}
 	if (num_online_cpus() != 1 || !cpu_online(0)) {
 		pr_err("mt6797-spm-load: stage 6: offline cpu1-9 first (%u online)\n", num_online_cpus());
 		return;
@@ -1074,6 +1134,8 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
 
 	c.t = t;
 	c.swflag = flags | (srcclken_low ? 0 : SPM_FLAG_DIS_SRCCLKEN_LOW);
+	if (pdn)
+		c.swflag &= ~SPM_FLAG_DIS_CPU_PDN;
 	pr_info("mt6797-spm-load: stage 6: %u x %u ms sleep (gap %u ms), PWR_IO_EN %02x, SW_FLAG %08x, wake_unmask %08x, ACINACTM mask %x, SPM irq %u (GIC prio %02x -> %02x), PMR %02x -> %02x in WFI\n",
 		cycles, sleep_ms, gap_ms, io_en, c.swflag, wake_unmask, acinactm, irq, sv_prio,
 		readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI), gic_read_pmr(), SLEEP_PMR);
@@ -1096,6 +1158,12 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
 			c.r.ws[1], c.r.ws[6], c.r.ws[6] * 1000 / 32768,
 			frq ? div64_u64(c.r.ticks * 1000, frq) : 0, c.r.exits, c.r.r0_ret, c.r.r7_ret,
 			c.r.ws[7], c.r.ws[9]);
+		if (pdn)
+			pr_info("mt6797-spm-load: cyc %u/%u: pdn state %08x cpu_pm %d psci %d (%s) in psci %llu ms, ret_after_psci %d, after psci: dbg %08x r13 %08x\n",
+				n + 1, cycles, pdn_state, c.r.pm_ret, c.r.psci_ret,
+				c.r.pdn_ran ? "called" : "not called",
+				frq ? div64_u64(c.r.pdn_ticks * 1000, frq) : 0, c.r.ret_after_psci,
+				c.r.dbg_after_psci, c.r.r13_after_psci);
 		if (!c.r.ran || c.r.refused || !c.r.returned)
 			break;
 		ok++;
