@@ -9,6 +9,7 @@ WAKE=${4:-0x1}
 FLAGS=${5:-0xffc102ff}
 BLANK=${6:-no}		# "yes": wait 20 s, then require OVL0 L0 off (screen blanked) or abort
 SRC=${7:-0xffffffff}	# SPM_SRC_MASK during the sleeps (3e1 module); 0xffffffff = keep LK, vendor suspend 0x10aa007e
+EXTRA="${8:-}"	# extra insmod args (3e3), e.g. "clk_init=1 settle=1 pdn=1 acinactm=0"
 P=/sys/class/power_supply/mt6351-battery
 L=/home/andrew/spm-live.txt
 log() { echo "$*" >> $L; sync $L; echo "$*"; }
@@ -32,9 +33,9 @@ if [ "$BLANK" = yes ]; then
 fi
 [ "$WIFI" = off ] && nmcli radio wifi off
 sleep 5
-log "$(date +%T) $(cat $P/status) online=$(cat /sys/devices/system/cpu/online) cycles=$CYC awake=${AW}s wifi=$WIFI wake=$WAKE flags=$FLAGS blank=$BLANK src_mask=$SRC SRC_CON=$(busybox devmem 0x1400b02c 32)"
+log "$(date +%T) $(cat $P/status) online=$(cat /sys/devices/system/cpu/online) cycles=$CYC awake=${AW}s wifi=$WIFI wake=$WAKE flags=$FLAGS blank=$BLANK src_mask=$SRC extra=$EXTRA SRC_CON=$(busybox devmem 0x1400b02c 32)"
 [ "$AW" -gt 0 ] && m sleep $AW
-m insmod /home/andrew/mt6797-spm-load.ko stage=6 io_en=0x81 acinactm=3 sleep_ms=2000 cycles=$CYC wake_unmask=$WAKE flags=$FLAGS src_mask=$SRC
+m insmod /home/andrew/mt6797-spm-load.ko stage=6 io_en=0x81 acinactm=3 sleep_ms=2000 cycles=$CYC wake_unmask=$WAKE flags=$FLAGS src_mask=$SRC $EXTRA
 rmmod mt6797-spm-load
 [ "$AW" -gt 0 ] && m sleep $AW
 log "$(date +%T) done"
