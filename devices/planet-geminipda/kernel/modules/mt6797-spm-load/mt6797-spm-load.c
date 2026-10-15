@@ -76,7 +76,9 @@
  *               (vendor mt_cpu_dormant_psci: 0x01010000 = cluster power-down) +
  *               cpu_pm_exit(), arch timer CNTP_CTL/CVAL put back by hand (no
  *               broadcast timer). If PCM_RETURN is not set after PSCI returns,
- *               the stage-6 WFI loop follows. Needs the kernel's
+ *               the stage-6 WFI loop follows (with io_en r0: abort instead —
+ *               r0 is allowed without ACINACTM only here, as in stock
+ *               spm_suspend's CPU_PDN branch). Needs the kernel's
  *               psci_cpu_suspend_enter export (delta psci.c).
  *   axi_test=1  (stage=0 only) ATF SMC 0x82000201 no-op test: write MP0/MP1
  *               AXI_CONFIG back with the value just read, report a0 + readback.
@@ -950,7 +952,8 @@ static long sleep_work(void *arg)
 			r->returned = 1;
 		}
 	}
-	for (r->exits = 0; !r->returned; r->exits++) {
+	/* pdn with r0 and no ACINACTM: never WFI with the CPU clock under SPM control */
+	for (r->exits = 0; !r->returned && !(pdn && (io_en & PCM_PWRIO_EN_R0)); r->exits++) {
 		dsb(sy);
 		wfi();
 		if (rd(SPM_IRQ_STA) & ISRS_PCM_RETURN) {
@@ -1044,7 +1047,8 @@ static void sleep_test(const struct pcm_tail *t, u32 im_ptr, u32 words)
 		pr_err("mt6797-spm-load: stage 6: acinactm bit2 (MP2) not allowed until its register is confirmed\n");
 		return;
 	}
-	if ((io_en & PCM_PWRIO_EN_R0) && !(acinactm & 1)) {
+	/* pdn: stock spm_suspend: CPU_PDN -> mt_cpu_dormant, no ACINACTM, r0+r7 on */
+	if ((io_en & PCM_PWRIO_EN_R0) && !(acinactm & 1) && !pdn) {
 		pr_err("mt6797-spm-load: stage 6: r0 (CPU clock off) needs acinactm (at least bit0 = MP0)\n");
 		return;
 	}
