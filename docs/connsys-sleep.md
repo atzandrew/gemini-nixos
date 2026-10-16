@@ -1,9 +1,9 @@
 # Connsys sleep — status
 
-**Last updated: 2026-10-15 (evening).** Status: **a real CONN power-off now works** (glue
+**Last updated: 2026-10-15 (night).** Status: **a real CONN power-off now works** (glue
 `conn_pwr_off`, cef35fd). With connsys powered off, PCM_REG13 bits 13/14/27 clear and the SPM
 firmware runs the **26M-off step for the first time** (SW_DEBUG bits 0/1, SPM sleep ~347 mA vs
-~390–400 mA). DDREN still not run. The connsys re-power-on is fragile (see below). Connsys still
+~390–400 mA). DDREN still not run. The re-power-on timeout is fixed (13af906, see below). Connsys still
 never *sleeps* while a function is on. Running log: `~/Build/notes/connsys-sleep.md` on Dragon.
 
 Why it matters: connsys holds PCM_REG13 (0x10006134) bit 14 CONN_SRCCLKENA high, which blocks the
@@ -80,18 +80,22 @@ Runtime controls used (all stock WMT debug paths; `/proc/driver/wmt_dbg` takes h
 | B | on | 402 mA | 0x10fc | 0x00066000 |
 | C2 | on (power-off skipped, see below) | 387 mA | 0x10fc | 0x00066000 |
 
-- Fragile re-power-on: the domain power-on after an off hit `wait completion timeout opId(3)` right
-  after the ROM patch push in 2 of 3 tries (E5, end of C1; E7 was clean). It still came up, but in
-  the C1→B case the link later failed (`Ack Miss trigger firmware assert` during run B's sleep) →
-  whole-chip reset, which never recovers on this port (`wifi_reset_start` no-op) → Wi-Fi lost until
-  power cycle.
+- Re-power-on (fixed in 13af906): every domain power-on after an off hit `wait completion timeout opId(3)`
+  (3 of 3, E7 included). opId(3) = WMT_OPID_FUNC_ON; stock `wmt_exp.c` caps the **Wi-Fi** func-on wait at
+  4 s, and after `wmt:0` that call must do the whole power-on incl. the ROM patch push, which took ~10 s here
+  (~40 ms/fragment). Cause: the spike's live STP reader (`consys_wmtrxd`) used `btif_rx_drain()` with a 30 ms
+  idle wait after every reply. With the idle wait removed for that reader: patch push ~1 s (boot and
+  re-power-on), HCI round trips 4–11 ms (were 40–50), Wi-Fi func-on incl. power-on 2.8 s; E8 (3 off/on
+  cycles) clean, Wi-Fi back 4 s after radio on. Earlier, in the C1→B case the link later failed
+  (`Ack Miss trigger firmware assert` during run B's sleep) → whole-chip reset, which never recovers on this
+  port (`wifi_reset_start` no-op); not yet re-tested with the fix.
 - Procedure rule: take BT down through BlueZ (`bluetoothctl power off`) before a WMT BT func off; turning
   the BT core off under an UP hci0 leads to tx timeouts → whole-chip reset (happened once).
 
 ## Next steps
 
-1. Make the CONN re-power-on robust: find why `opId(3)` (func on) times out after the patch push,
-   then whole-chip reset recovery. Then the rails in the off state (stock also turns VCN18/28/33 off)
+1. Re-run the SPM A/B/A with the rx-idle fix (does the ack-miss assert recur?), then whole-chip reset
+   recovery. Then the rails in the off state (stock also turns VCN18/28/33 off)
    and DDREN (SW_DEBUG bits 8/9), which still does not run with CONN off.
 2. For sleep while Wi-Fi is on: wire BGF EINT (stock), drop the WAK heartbeat, enable the PSM, and
    retest A2DP (resyncs / `stp_do_tx_timeout` / throughput as in `docs/bluetooth-a2dp.md`).
@@ -103,5 +107,6 @@ Runtime controls used (all stock WMT debug paths; `/proc/driver/wmt_dbg` takes h
 - `463e816` — `wmt_psm_allow` module param (default 0 = A2DP force-off unchanged).
 - `d5967d5` — hci_stp close fix (not yet deployed).
 - `cef35fd` — glue `conn_pwr_off` (deployed, default 0).
+- `13af906` — spike: no RX idle wait in the live STP reader (built in; flashed as boot-rxidle-20261015.img).
 - The Gemini runs a cef35fd `mtk_wcn.ko` (previous: `mtk_wcn.ko.psm-463e816`); the original is kept as
   `/lib/modules/6.6.157/kernel/drivers/misc/mediatek-connectivity/mtk_wcn.ko.orig-20261015`.
