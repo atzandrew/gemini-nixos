@@ -5,6 +5,13 @@ kernel delta and VERIFIED ON GLASS** (`wmt_lib.c`: STP PSM forced off;
 toplevel `94bw47dh6bhr1rk4jafva9nimz3avwjb`, gen7, after a WDT reboot).
 Kernel rebuild/deploy receipts are in `docs/session-log.md` 2026-09-10r.
 
+> **Correction (2026-10-15, `docs/connsys-sleep.md`):** the PSM's missing
+> deep-idle backend did *not* stop the chip sleeping — the firmware sleep
+> handshake completes and the backend only gates host-side BTIF clocks. The
+> more likely cause of the stutter is the unwired chip→host wake interrupt
+> (BGF EINT), so a PSM-asleep chip can't wake the host for RX. The force-off
+> fix below still stands until that is wired and A2DP is retested.
+
 Related: `docs/bluetooth-bringup.md` (the HCI-STP/WMT bring-up) ·
 `services/audio.nix` (the one system PipeWire/WirePlumber session) ·
 kernel delta `devices/planet-geminipda/kernel/delta/drivers/misc/mediatek-connectivity/`.
