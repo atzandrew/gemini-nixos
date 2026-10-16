@@ -624,8 +624,6 @@ static int hci_stp_open(struct hci_dev *hdev)
 	}
 	BT_INFO("hci_stp_dev_init ok\n");
 
-	set_bit(HCI_RUNNING, &hdev->flags);
-
 	/* hand the BT channel to the H4 parser + BlueZ */
 	mtk_wcn_stp_register_if_rx(stp_rx_event_cb_directly);
 	mtk_wcn_stp_register_event_cb(BT_TASK_INDX, NULL);
@@ -655,9 +653,12 @@ static int hci_stp_close(struct hci_dev *hdev)
 {
 	struct hci_stp *hu = hci_get_drvdata(hdev);
 
-	if (!test_and_clear_bit(HCI_RUNNING, &hdev->flags))
-		return 0;
-
+	/* No HCI_RUNNING guard here: since the hci_sync rework the core
+	 * manages HCI_RUNNING itself and clears it before calling ->close()
+	 * (hci_dev_close_sync), so the old test_and_clear_bit() early return
+	 * made every close a no-op and the BT WMT function was never turned
+	 * off (connsys-sleep work, 2026-10-15). Mainline drivers do not guard
+	 * ->close on it either. */
 	BT_INFO("closing %s\n", hdev->name);
 
 	hci_stp_flush(hdev);
