@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPM step 3d-3: A/B/A gauge run with Wi-Fi off, per-cycle log synced to disk.
+# usage (as root, from the Gemini's own keyboard, lid open):
+#   systemd-inhibit --what=handle-lid-switch:sleep:idle sh /home/andrew/gauge-ab3.sh CYCLES [AWAKE_S] [WIFI on|off] [WAKE_UNMASK] [FLAGS] [BLANK yes|no] [SRC_MASK]
+CYC=${1:-25}
+AW=${2:-55}
+WIFI=${3:-off}
+WAKE=${4:-0x1}
+FLAGS=${5:-0xffc102ff}
+BLANK=${6:-no}		# "yes": wait 20 s, then require OVL0 L0 off (screen blanked) or abort
+SRC=${7:-0xffffffff}	# SPM_SRC_MASK during the sleeps (3e1 module); 0xffffffff = keep LK, vendor suspend 0x10aa007e
+EXTRA="${8:-}"	# extra insmod args (3e3), e.g. "clk_init=1 settle=1 pdn=1 acinactm=0"
+CONNOFF=${9:-no}	# "yes": after Wi-Fi off, WMT BT+Wi-Fi func off with conn_pwr_off=1 (CONN domain off); back on at the end
+P=/sys/class/power_supply/mt6351-battery
+L=/home/andrew/spm-live.txt
+log() { echo "$*" >> $L; sync $L; echo "$*"; }
+pkill -f "dmesg -W" 2>/dev/null
+: > $L
+( dmesg -W | grep --line-buffered -E "spm-load: (cyc |stage 6)" | while read -r l; do echo "$l" >> $L; sync $L; done ) &
+LOGPID=$!
+# (earlier runs: a leftover dmesg -W doubled every line; killed at the end now)
+m() {
+	c0=$(cat $P/charge_counter); t0=$(date +%s.%N)
+	"$@" >/dev/null 2>&1
+	c1=$(cat $P/charge_counter); t1=$(date +%s.%N)
+	log "$(echo "$1 $c0 $c1 $t0 $t1" | awk '{printf "%-7s %7.1f mA over %.1f s (%d uAh)", $1, ($2-$3)*3.6/($5-$4), $5-$4, $2-$3}')"
+}
+echo 1 > /sys/devices/virtual/workqueue/cpumask
+for c in 9 8 7 6 5 4 3 2 1; do echo 0 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done
+if [ "$BLANK" = yes ]; then
+	log "$(date +%T) waiting 20 s for the screen to blank (close the lid)"
+	sleep 20
+	[ "$(busybox devmem 0x1400b02c 32)" = "0x00000000" ] || { log "screen not blanked (L0 on) - abort"; pkill -f "dmesg -W"; exit 1; }
+fi
+[ "$WIFI" = off ] && nmcli radio wifi off
+if [ "$CONNOFF" = yes ]; then bluetoothctl power off >/dev/null 2>&1; sleep 2; echo 1 > /sys/module/mtk_wcn/parameters/conn_pwr_off; echo "7 0 0" > /proc/driver/wmt_dbg; echo "7 3 0" > /proc/driver/wmt_dbg; sleep 2; log "$(date +%T) connoff r13=$(busybox devmem 0x10006134 32) PWR_CON=$(busybox devmem 0x1000632c 32)"; fi
+sleep 5
+log "$(date +%T) $(cat $P/status) online=$(cat /sys/devices/system/cpu/online) cycles=$CYC awake=${AW}s wifi=$WIFI wake=$WAKE flags=$FLAGS blank=$BLANK src_mask=$SRC extra=$EXTRA connoff=$CONNOFF SRC_CON=$(busybox devmem 0x1400b02c 32)"
+[ "$AW" -gt 0 ] && m sleep $AW
+m insmod /home/andrew/mt6797-spm-load.ko stage=6 io_en=0x81 acinactm=3 sleep_ms=2000 cycles=$CYC wake_unmask=$WAKE flags=$FLAGS src_mask=$SRC $EXTRA
+rmmod mt6797-spm-load
+[ "$AW" -gt 0 ] && m sleep $AW
+log "$(date +%T) done"
+[ "$CONNOFF" = yes ] && { log "$(date +%T) pre-on r13=$(busybox devmem 0x10006134 32) PWR_CON=$(busybox devmem 0x1000632c 32)"; echo "7 3 1" > /proc/driver/wmt_dbg; echo 0 > /sys/module/mtk_wcn/parameters/conn_pwr_off; }
+[ "$WIFI" = off ] && nmcli radio wifi on
+sleep 1
+[ "$CONNOFF" = yes ] && { sleep 10; bluetoothctl power on >/dev/null 2>&1; }
+kill $LOGPID 2>/dev/null; pkill -f "dmesg -W"

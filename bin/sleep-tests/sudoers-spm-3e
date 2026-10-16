@@ -1,0 +1,1 @@
+andrew ALL=(root) NOPASSWD: /usr/bin/busybox, /usr/sbin/insmod, /usr/sbin/rmmod, /bin/sh /home/andrew/spm-run.sh *, /bin/sh /home/andrew/gauge-ab2.sh *
