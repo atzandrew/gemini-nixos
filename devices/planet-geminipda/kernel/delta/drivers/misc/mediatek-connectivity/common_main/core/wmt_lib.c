@@ -39,6 +39,7 @@
 *                    E X T E R N A L   R E F E R E N C E S
 ********************************************************************************
 */
+#include <linux/moduleparam.h>
 #include "osal_typedef.h"
 #include "wmt_dbg.h"
 
@@ -86,6 +87,12 @@ static UINT32 gPsIdleTime = STP_PSM_IDLE_TIME_SLEEP;
 /* Gemini PDA port: the STP PSM is OFF by default.  See wmt_lib_ps_enable(). */
 static UINT32 gPsEnable;
 static PF_WMT_SDIO_PSOP sdio_own_ctrl;
+/* Test hook (connsys-sleep work, 2026-10-15): 0 (default) keeps the A2DP
+ * force-off below; 1 restores the stock wmt_lib_ps_ctrl()/wmt_lib_ps_enable()
+ * behaviour so the STP PSM can be enabled at runtime via
+ * /proc/driver/wmt_dbg "0 <idle_ms>". */
+static bool wmt_psm_allow;
+module_param(wmt_psm_allow, bool, 0644);
 #endif
 
 #define WMT_STP_CPUPCR_BUF_SIZE 6144
@@ -633,7 +640,11 @@ INT32 wmt_lib_ps_ctrl(UINT32 state)
 	/* Gemini PDA port: never re-enable the STP PSM (see wmt_lib_ps_enable()).
 	 * Both mt6630_sw_init() and mtk_wcn_wmt_func_off(BT) ask for it, so the
 	 * force-off has to live here or the audio fix would last one session. */
-	(void)state;
+	if (wmt_psm_allow && state) {
+		gPsEnable = 1;
+		wmt_lib_ps_enable();
+		return 0;
+	}
 	wmt_lib_ps_disable();
 	gPsEnable = 0;
 	return 0;
@@ -658,8 +669,12 @@ INT32 wmt_lib_ps_enable(VOID)
 	 * from 1x577 B/80 ms (~57 kbps) to the full ~265 kbps, and wlan0 (5 GHz)
 	 * still associates/pings.  /proc/driver/wmt_dbg "0 0" is the runtime
 	 * equivalent.  Re-enable only with a real MT6630 deep-idle backend. */
-	if (gPsEnable)
-		mtk_wcn_stp_psm_disable();
+	if (gPsEnable) {
+		if (wmt_psm_allow)
+			mtk_wcn_stp_psm_enable(gPsIdleTime);
+		else
+			mtk_wcn_stp_psm_disable();
+	}
 
 	return 0;
 }
