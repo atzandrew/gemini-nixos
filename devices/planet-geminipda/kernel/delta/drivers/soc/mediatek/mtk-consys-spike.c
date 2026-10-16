@@ -719,7 +719,7 @@ static int btif_dma_rx_byte(unsigned long deadline)
 static int btif_tx(struct device *dev, void __iomem *btif, const u8 *buf,
 		   int len);
 static int btif_rx_drain(void __iomem *btif, u8 *buf, int max,
-			 unsigned int timeout_ms);
+			 unsigned int timeout_ms, unsigned int idle_ms);
 static int wmt_cmd_full(struct device *dev, void __iomem *btif,
 			 const u8 *cmd, int cmdlen, const u8 *evt, int evtlen,
 			 bool quiet);
@@ -762,7 +762,8 @@ static int wmt_reg_read(struct device *dev, void __iomem *btif, u32 addr,
 	if (ret)
 		return ret;
 
-	n = btif_rx_drain(btif, rx, sizeof(rx), G2B_RX_TIMEOUT_MS);
+	n = btif_rx_drain(btif, rx, sizeof(rx), G2B_RX_TIMEOUT_MS,
+			  G2B_RX_IDLE_MS);
 	dev_info(dev, "consys-spike: WMT reg-read RX %d bytes: %*ph\n",
 		 n, n, rx);
 	if (n < sizeof(wmt_reg_rd_evt_hdr) + 8)
@@ -814,12 +815,14 @@ static int btif_tx(struct device *dev, void __iomem *btif, const u8 *buf,
 }
 
 /* Drain RX for up to timeout_ms into buf; returns bytes read. Once at
- * least one byte has arrived, G2B_RX_IDLE_MS of silence ends the drain
- * early (a complete reply is ~16 bytes; waiting out the full timeout
- * per exchange would make the 259-fragment firmware push take
- * minutes). */
+ * least one byte has arrived, idle_ms of silence ends the drain early
+ * (a complete reply is ~16 bytes; waiting out the full timeout per
+ * exchange would make the 259-fragment firmware push take minutes).
+ * idle_ms = 0: return as soon as the FIFO is empty after the first
+ * byte (vendor btif_rx_thread hands each DMA batch on at once; used
+ * by the live STP reader, whose parser takes a byte stream). */
 static int btif_rx_drain(void __iomem *btif, u8 *buf, int max,
-			 unsigned int timeout_ms)
+			 unsigned int timeout_ms, unsigned int idle_ms)
 {
 	unsigned long t = jiffies + msecs_to_jiffies(timeout_ms);
 	unsigned long idle = 0;
@@ -832,13 +835,14 @@ static int btif_rx_drain(void __iomem *btif, u8 *buf, int max,
 		while (n < max) {
 			unsigned long d = n ? min(idle, t) : t;
 
-			if (time_after(d, jiffies) == 0 && n)
+			if (idle_ms && time_after(d, jiffies) == 0 && n)
 				break;
 			b = btif_dma_rx_byte(d);
 			if (b < 0)
 				break;
 			buf[n++] = b;
-			idle = jiffies + msecs_to_jiffies(G2B_RX_IDLE_MS);
+			idle = idle_ms ? jiffies + msecs_to_jiffies(idle_ms) :
+					 jiffies - 1;
 		}
 		return n;
 	}
@@ -846,7 +850,8 @@ static int btif_rx_drain(void __iomem *btif, u8 *buf, int max,
 	while (n < max && !time_after(jiffies, t)) {
 		if (readl(btif + BTIF_LSR) & BTIF_LSR_DR) {
 			buf[n++] = readl(btif + BTIF_RBR) & 0xff;
-			idle = jiffies + msecs_to_jiffies(G2B_RX_IDLE_MS);
+			idle = idle_ms ? jiffies + msecs_to_jiffies(idle_ms) :
+					 jiffies - 1;
 		} else {
 			if (n && time_after(jiffies, idle))
 				break;
@@ -901,7 +906,8 @@ static int wmt_cmd_evt(struct device *dev, void __iomem *btif, u8 seq,
 			      STP_HDR_SIZE + cmdlen + STP_CRC_SIZE);
 		if (ret)
 			break;
-		n = btif_rx_drain(btif, rx, sizeof(rx), G2B_RX_TIMEOUT_MS);
+		n = btif_rx_drain(btif, rx, sizeof(rx), G2B_RX_TIMEOUT_MS,
+				  G2B_RX_IDLE_MS);
 		if (n > 0)
 			break;	/* something came back; judge below */
 	}
@@ -1872,7 +1878,9 @@ EXPORT_SYMBOL(g_emi_base);
 /* RX consumer for the WMT core (vendor btif_rx_thread equivalent,
  * polling): while the core owns the link, drain the RX vFIFO and hand
  * the bytes to its STP parser. The 50 ms poll keeps the STP 180 ms
- * TX-timeout budget comfortable. */
+ * TX-timeout budget comfortable. No idle wait: a 30 ms idle per reply
+ * made the ROM patch push ~10 s (40 ms/fragment), past the stock 4 s
+ * Wi-Fi func-on wait on a re-power-on (opId(3) timeout). */
 #define WMT_RXD_POLL_MS		50
 #define WMT_RXD_BUF_SZ		(4 * 1024)
 
@@ -1894,7 +1902,7 @@ static int consys_wmtrxd(void *data)
 
 		if (cb && ready) {
 			n = btif_rx_drain(wmt_btif, buf, WMT_RXD_BUF_SZ,
-					  WMT_RXD_POLL_MS);
+					  WMT_RXD_POLL_MS, 0);
 			if (n > 0)
 				cb(buf, n);
 			usleep_range(2000, 5000);
@@ -2156,7 +2164,7 @@ static int consys_gate_g2b(struct device *dev)
 
 	/* Let the ROM boot; log anything it sends unsolicited. */
 	msleep(50);
-	n = btif_rx_drain(btif, rx, sizeof(rx), 200);
+	n = btif_rx_drain(btif, rx, sizeof(rx), 200, G2B_RX_IDLE_MS);
 	dev_info(dev, "consys-spike: post-release RX %d bytes: %*ph\n",
 		 n, n, rx);
 
