@@ -27,6 +27,7 @@
 #define MTK_SCPD_FWAIT_SRAM		BIT(1)
 #define MTK_SCPD_KEEP_DEFAULT_OFF	BIT(2)
 #define MTK_SCPD_ALWAYS_ON		BIT(3)
+#define MTK_SCPD_MT6797_MFG		BIT(4)
 #define MTK_SCPD_CAPS(_scpd, _x)	((_scpd)->data->caps & (_x))
 
 #define SPM_VDE_PWR_CON			0x0210
@@ -155,6 +156,7 @@ struct scp {
 	struct regmap *infracfg;
 	struct scp_ctrl_reg ctrl_reg;
 	bool bus_prot_reg_update;
+	void __iomem *mfgcfg;	/* mt6797: MFGCFG (0x13000000), optional */
 };
 
 struct scp_subdomain {
@@ -413,6 +415,154 @@ out:
 	return ret;
 }
 
+/*
+ * MT6797 GPU: the MFG domain plus its four shader-core domains, switched as
+ * one genpd (panfrost attaches a single domain). Sequences are the vendor
+ * 3.18 clk-mt6797-pg.c spm_mtcmos_ctrl_mfg / _mfg_core0-3, which differ
+ * from the generic flow: MFG's SRAM_PDN/ACK live in MFG_SRAM_CON, the core
+ * SRAM_PDN is bit 8 of each core's PWR_CON with its ACK in MFG_SRAM_CON
+ * bits 20+N. Off order cores 3..0 then MFG; on is the reverse. MFG_ASYNC is
+ * the parent genpd (generic flow, CLK_MFG). Powering MFG off clears the
+ * MFGCFG timing (0x1c) and PMU-enable (0x3e0-0x3f0) registers, so power-on
+ * rewrites them with the vendor mtk_pm_callback_power_on values (and opens
+ * the BG3D clock gate), as gemini-gpu-poweron.sh does at boot.
+ * Measured 2026-10-16 (notes E21/E22): ~15 mA awake, ~20 mA in SPM sleep.
+ */
+#define MT6797_POWERON_CONFIG_EN	0x000
+#define MT6797_MFG_PWR_CON		0x338
+#define MT6797_MFG_SRAM_CON		0x33c
+#define MT6797_MFG_CORE_PWR_CON(n)	(0x340 + 4 * (n))
+#define MT6797_MFG_STA			BIT(12)
+#define MT6797_MFG_CORE_STA(n)		BIT(11 - (n))
+#define MT6797_MFG_SRAM_PDN		GENMASK(1, 0)
+#define MT6797_MFG_SRAM_ACK		GENMASK(17, 16)
+#define MT6797_MFG_CORE_SRAM_PDN	BIT(8)
+#define MT6797_MFG_CORE_SRAM_ACK(n)	BIT(20 + (n))
+
+static void mt6797_rmw(struct scp *scp, int offs, u32 clr, u32 set)
+{
+	u32 val = readl(scp->base + offs);
+
+	writel((val & ~clr) | set, scp->base + offs);
+}
+
+static int mt6797_wait_sta(struct scp *scp, u32 mask, bool on)
+{
+	u32 a, b;
+
+	return readl_poll_timeout(scp->base + scp->ctrl_reg.pwr_sta_offs, a,
+			((a & mask) != 0) == on &&
+			((b = readl(scp->base + scp->ctrl_reg.pwr_sta2nd_offs)),
+			 ((b & mask) != 0) == on),
+			MTK_POLL_DELAY_US, MTK_POLL_TIMEOUT);
+}
+
+static int mt6797_wait_sram(struct scp *scp, u32 mask, bool set)
+{
+	u32 v;
+
+	return readl_poll_timeout(scp->base + MT6797_MFG_SRAM_CON, v,
+			set ? (v & mask) == mask : !(v & mask),
+			MTK_POLL_DELAY_US, MTK_POLL_TIMEOUT);
+}
+
+static int mt6797_mfg_power_off(struct generic_pm_domain *genpd)
+{
+	struct scp_domain *scpd = container_of(genpd, struct scp_domain, genpd);
+	struct scp *scp = scpd->scp;
+	int n, ret;
+
+	writel((0xb16 << 16) | 1, scp->base + MT6797_POWERON_CONFIG_EN);
+
+	for (n = 3; n >= 0; n--) {
+		int c = MT6797_MFG_CORE_PWR_CON(n);
+
+		mt6797_rmw(scp, c, 0, MT6797_MFG_CORE_SRAM_PDN);
+		ret = mt6797_wait_sram(scp, MT6797_MFG_CORE_SRAM_ACK(n), true);
+		if (ret)
+			goto err;
+		mt6797_rmw(scp, c, 0, PWR_CLK_DIS_BIT);
+		mt6797_rmw(scp, c, 0, PWR_ISO_BIT);
+		mt6797_rmw(scp, c, PWR_RST_B_BIT, 0);
+		mt6797_rmw(scp, c, PWR_ON_BIT, 0);
+		mt6797_rmw(scp, c, PWR_ON_2ND_BIT, 0);
+		ret = mt6797_wait_sta(scp, MT6797_MFG_CORE_STA(n), false);
+		if (ret)
+			goto err;
+	}
+
+	mt6797_rmw(scp, MT6797_MFG_SRAM_CON, 0, MT6797_MFG_SRAM_PDN);
+	ret = mt6797_wait_sram(scp, MT6797_MFG_SRAM_ACK, true);
+	if (ret)
+		goto err;
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, 0, PWR_ISO_BIT);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, 0, PWR_CLK_DIS_BIT);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, PWR_RST_B_BIT, 0);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, PWR_ON_BIT, 0);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, PWR_ON_2ND_BIT, 0);
+	ret = mt6797_wait_sta(scp, MT6797_MFG_STA, false);
+	if (ret)
+		goto err;
+
+	return 0;
+
+err:
+	dev_err(scp->dev, "Failed to power off domain %s\n", genpd->name);
+	return ret;
+}
+
+static int mt6797_mfg_power_on(struct generic_pm_domain *genpd)
+{
+	struct scp_domain *scpd = container_of(genpd, struct scp_domain, genpd);
+	struct scp *scp = scpd->scp;
+	int n, ret;
+
+	writel((0xb16 << 16) | 1, scp->base + MT6797_POWERON_CONFIG_EN);
+
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, 0, PWR_ON_BIT);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, 0, PWR_ON_2ND_BIT);
+	ret = mt6797_wait_sta(scp, MT6797_MFG_STA, true);
+	if (ret)
+		goto err;
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, PWR_CLK_DIS_BIT, 0);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, PWR_ISO_BIT, 0);
+	mt6797_rmw(scp, MT6797_MFG_PWR_CON, 0, PWR_RST_B_BIT);
+	mt6797_rmw(scp, MT6797_MFG_SRAM_CON, MT6797_MFG_SRAM_PDN, 0);
+	ret = mt6797_wait_sram(scp, MT6797_MFG_SRAM_ACK, false);
+	if (ret)
+		goto err;
+
+	for (n = 0; n < 4; n++) {
+		int c = MT6797_MFG_CORE_PWR_CON(n);
+
+		mt6797_rmw(scp, c, 0, PWR_ON_BIT);
+		mt6797_rmw(scp, c, 0, PWR_ON_2ND_BIT);
+		ret = mt6797_wait_sta(scp, MT6797_MFG_CORE_STA(n), true);
+		if (ret)
+			goto err;
+		mt6797_rmw(scp, c, 0, PWR_RST_B_BIT);
+		mt6797_rmw(scp, c, PWR_ISO_BIT, 0);
+		mt6797_rmw(scp, c, PWR_CLK_DIS_BIT, 0);
+		mt6797_rmw(scp, c, MT6797_MFG_CORE_SRAM_PDN, 0);
+		ret = mt6797_wait_sram(scp, MT6797_MFG_CORE_SRAM_ACK(n), false);
+		if (ret)
+			goto err;
+	}
+
+	if (scp->mfgcfg) {
+		writel(BIT(0), scp->mfgcfg + 0x08);	/* BG3D gate open (CG_CLR) */
+		writel(readl(scp->mfgcfg + 0x1c) | 0xa, scp->mfgcfg + 0x1c);
+		for (n = 0; n < 5; n++)
+			writel(0xffffffff, scp->mfgcfg + 0x3e0 + 4 * n);
+	}
+
+	return 0;
+
+err:
+	dev_err(scp->dev, "Failed to power on domain %s\n", genpd->name);
+	return ret;
+}
+
 static void init_clks(struct platform_device *pdev, struct clk **clk)
 {
 	int i;
@@ -447,6 +597,15 @@ static struct scp *init_scp(struct platform_device *pdev,
 	scp->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(scp->base))
 		return ERR_CAST(scp->base);
+
+	/* optional second window: mt6797 MFGCFG, see mt6797_mfg_power_on() */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (res) {
+		scp->mfgcfg = devm_ioremap(&pdev->dev, res->start,
+					   resource_size(res));
+		if (!scp->mfgcfg)
+			return ERR_PTR(-ENOMEM);
+	}
 
 	scp->domains = devm_kcalloc(&pdev->dev,
 				num, sizeof(*scp->domains), GFP_KERNEL);
@@ -525,6 +684,10 @@ static struct scp *init_scp(struct platform_device *pdev,
 		genpd->name = data->name;
 		genpd->power_off = scpsys_power_off;
 		genpd->power_on = scpsys_power_on;
+		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_MT6797_MFG)) {
+			genpd->power_off = mt6797_mfg_power_off;
+			genpd->power_on = mt6797_mfg_power_on;
+		}
 		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ACTIVE_WAKEUP))
 			genpd->flags |= GENPD_FLAG_ACTIVE_WAKEUP;
 		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ALWAYS_ON))
@@ -844,14 +1007,21 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
 		.sram_pdn_bits = 0,
 		.sram_pdn_ack_bits = 0,
 		.clk_id = {CLK_MFG},
-		/*
-		 * Kept on: the Mali node has no power-domains yet and the MFG
-		 * sub-domains behind this one are powered by gpu-poweron.sh, so
-		 * genpd's late "power off unused domains" pass (active since
-		 * pd_ignore_unused left the cmdline) would cut power under a
-		 * running GPU. Drop this once panfrost owns the MFG domains.
-		 */
-		.caps = MTK_SCPD_ALWAYS_ON,
+	},
+	/*
+	 * MFG + MFG_CORE0-3 as one domain (vendor sequences, see
+	 * mt6797_mfg_power_on()); the Mali node's power domain. Child of
+	 * MFG_ASYNC. Kept off at probe: the MTCMOS needs the VGPU rail
+	 * (fan53555, may probe later). gemini-gpu-poweron.sh still powers
+	 * everything raw at boot before panfrost loads; harmless, genpd
+	 * re-runs the (idempotent) on-sequence when panfrost attaches.
+	 */
+	[MT6797_POWER_DOMAIN_MFG] = {
+		.name = "mfg",
+		.sta_mask = MT6797_MFG_STA,
+		.ctl_offs = MT6797_MFG_PWR_CON,
+		.clk_id = {CLK_NONE},
+		.caps = MTK_SCPD_KEEP_DEFAULT_OFF | MTK_SCPD_MT6797_MFG,
 	},
 	[MT6797_POWER_DOMAIN_MJC] = {
 		.name = "mjc",
@@ -927,6 +1097,7 @@ static const struct scp_subdomain scp_subdomain_mt6797[] = {
 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_ISP},
 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_VENC},
 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_MJC},
+	{MT6797_POWER_DOMAIN_MFG_ASYNC, MT6797_POWER_DOMAIN_MFG},
 };
 
 /*

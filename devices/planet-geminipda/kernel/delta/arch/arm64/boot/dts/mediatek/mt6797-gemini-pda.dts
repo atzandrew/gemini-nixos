@@ -2151,10 +2151,11 @@
 	 * The VGPU rail (Richtek RT5735 on i2c7, &vgpu) is kernel-owned:
 	 * enabled at boot, voltage set by panfrost from &gpu_opp_table
 	 * (devfreq). The six MFG MTCMOS domains (MFG_ASYNC 0x334, MFG 0x338,
-	 * MFG_CORE0-3 0x340-0x34c) are NOT: gemini-gpu-poweron.sh brings them
-	 * up after boot using the vendor clk-mt6797-pg.c sequences — hence
-	 * NO power-domains property here, and panfrost is a module, loaded
-	 * after power-on.
+	 * MFG_CORE0-3 0x340-0x34c) are genpd-owned (2026-10-16): scpsys "mfg"
+	 * = MFG + CORE0-3 (vendor clk-mt6797-pg.c sequences), child of
+	 * mfg_async, so panfrost runtime-PM powers them off when idle.
+	 * gemini-gpu-poweron.sh still raw-powers them at boot (plus the GPU
+	 * SRAM LDO) before panfrost, a module, is loaded.
 	 * The mfg clock (CLK_TOP_MUX_MFG -> mfgpll_ck) is set by devfreq.
 	 */
 	gpu: mali@13040000 {
@@ -2168,6 +2169,7 @@
 		clock-names = "clk_mali";
 		mali-supply = <&vgpu>;
 		operating-points-v2 = <&gpu_opp_table>;
+		power-domains = <&scpsys MT6797_POWER_DOMAIN_MFG>;
 		#cooling-cells = <2>;
 	};
 };
