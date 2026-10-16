@@ -34,6 +34,9 @@
 
 #include <linux/consys_wmt.h>
 #include <linux/debugfs.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
 
 #include "osal_typedef.h"
@@ -205,8 +208,74 @@ ENUM_STP_TX_IF_TYPE wmt_plat_get_comm_if_type(VOID)
 	return STP_BTIF_IF_TX;
 }
 
+/* CONN domain power-off at WMT HW_PWR_OFF (connsys-sleep work, 2026-10-15).
+ *
+ * Stock mtk_wcn_consys_hw_reg_ctrl(0) turns the CONN MTCMOS off when the
+ * WMT core powers the chip down (all functions off); this port's
+ * HW_PWR_OFF was a no-op, so connsys kept CONN_SRCCLKENA (PCM_REG13 bit
+ * 14) asserted forever. The spike already owns the CONN scpsys domain
+ * through runtime PM on its device and drops it the same way for its
+ * B-27 power cycle (measured: PWR_CON 0x10d -> 0x112, r13 bits 13/14/27
+ * clear while off). Here: FUNC_OFF puts the spike's reference so the
+ * domain powers off; FUNC_ON takes it back before the core's STP init,
+ * whose BTIF hand-off runs B-27 (put/get) against a balanced count.
+ * Test-gated by conn_pwr_off (default 0 = previous no-op behaviour). */
+static bool conn_pwr_off;
+module_param(conn_pwr_off, bool, 0644);
+static bool wcn_conn_released;	/* we hold the spike's domain ref down */
+#define WCN_SPM_CONN_PWR_CON	0x1000632C
+
+static struct device *wcn_conn_dev(void)
+{
+	static struct device *dev;
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	if (dev)
+		return dev;
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6797-consys");
+	if (!np)
+		return NULL;
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (pdev)
+		dev = &pdev->dev;	/* keep the reference for the module's life */
+	return dev;
+}
+
+static u32 wcn_reg32(u32 pa);
+
 INT32 wmt_plat_pwr_ctrl(ENUM_FUNC_STATE state)
 {
+	struct device *dev;
+	int ret;
+
+	if (state == FUNC_OFF) {
+		if (!conn_pwr_off || wcn_conn_released)
+			return 0;
+		dev = wcn_conn_dev();
+		if (!dev) {
+			pr_warn("wcn-glue: HW_PWR_OFF: consys device not found\n");
+			return 0;
+		}
+		ret = pm_runtime_put_sync(dev);
+		wcn_conn_released = true;
+		pr_info("wcn-glue: HW_PWR_OFF: CONN domain put -> %d (suspended=%d PWR_CON=%#x)\n",
+			ret, pm_runtime_suspended(dev),
+			wcn_reg32(WCN_SPM_CONN_PWR_CON));
+	} else if (state == FUNC_ON) {
+		if (!wcn_conn_released)
+			return 0;
+		dev = wcn_conn_dev();
+		if (!dev)
+			return -1;
+		ret = pm_runtime_get_sync(dev);
+		wcn_conn_released = false;
+		pr_info("wcn-glue: HW_PWR_ON: CONN domain get -> %d (PWR_CON=%#x)\n",
+			ret, wcn_reg32(WCN_SPM_CONN_PWR_CON));
+		if (ret < 0)
+			return -1;
+	}
 	return 0;
 }
 
@@ -295,9 +364,12 @@ P_CONSYS_EMI_ADDR_INFO wmt_plat_get_emi_phy_add(VOID)
  * core observe the true patched-CPUPCR (0x9b5d6) vs bare (0x112c). */
 UINT32 wmt_plat_read_cpupcr(VOID)
 {
-	void __iomem *r = wcn_map_reg(WCN_CONSYS_CPUPCR_REG);
+	void __iomem *r;
 	UINT32 v;
 
+	if (wcn_conn_released)
+		return WCN_CONSYS_CPUPCR_BARE;
+	r = wcn_map_reg(WCN_CONSYS_CPUPCR_REG);
 	if (!r)
 		return WCN_CONSYS_CPUPCR_BARE;
 	v = readl(r);
@@ -843,6 +915,12 @@ static ssize_t wcn_status_read(struct file *filp, char __user *ubuf,
 	ENUM_DRV_STS s;
 	bool ready;
 
+	if (wcn_conn_released) {
+		n = scnprintf(buf, sizeof(buf),
+			      "conn_domain: OFF (PWR_CON=%#x)\n",
+			      wcn_reg32(WCN_SPM_CONN_PWR_CON));
+		return simple_read_from_buffer(ubuf, len, off, buf, n);
+	}
 	chip = wcn_reg32(WCN_CONSYS_CHIPID_REG);
 	pcr = wcn_reg32(WCN_CONSYS_CPUPCR_REG);
 	s = wmt_core_get_drv_status(WMTDRV_TYPE_WMT);
