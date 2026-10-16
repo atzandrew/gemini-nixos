@@ -1,8 +1,10 @@
 # Connsys sleep — status
 
-**Last updated: 2026-10-15.** Status: **connsys never sleeps and never powers off on this port**,
-in any WMT state. Root cause not found yet; the next step is a real (stock-shaped) consys
-power-off. Running log: `~/Build/notes/connsys-sleep.md` on Dragon.
+**Last updated: 2026-10-15 (evening).** Status: **a real CONN power-off now works** (glue
+`conn_pwr_off`, cef35fd). With connsys powered off, PCM_REG13 bits 13/14/27 clear and the SPM
+firmware runs the **26M-off step for the first time** (SW_DEBUG bits 0/1, SPM sleep ~347 mA vs
+~390–400 mA). DDREN still not run. The connsys re-power-on is fragile (see below). Connsys still
+never *sleeps* while a function is on. Running log: `~/Build/notes/connsys-sleep.md` on Dragon.
 
 Why it matters: connsys holds PCM_REG13 (0x10006134) bit 14 CONN_SRCCLKENA high, which blocks the
 SPM's 26 MHz-off and DDREN (DRAM self-refresh) steps (see `docs/spm-sleep.md`) and keeps the
@@ -58,11 +60,39 @@ Runtime controls used (all stock WMT debug paths; `/proc/driver/wmt_dbg` takes h
 7. Not levers: 0x10001f00 bit 9 (AP2CONN_WAKEUP, an active-low force-assert debug pin — high is
    normal) and `BTIF_SLEEP_EN` (stock never calls `btif_sleep_ctrl`).
 
+## Real CONN power-off (E6, E7, SPM A/B — 2026-10-15)
+
+- E6: during the spike's B-27 power cycle (CONN domain off ~120 ms, SPM PWR_CON 0x10d → 0x112)
+  r13 reads 0x00000000 / 0x00040000 → bits 13, 14 and 27 clear. The 26M request is inside connsys.
+- WMT order: power-off = STP deinit (BTIF released) → `HW_PWR_OFF` → `wmt_plat_pwr_ctrl(FUNC_OFF)`;
+  power-on = `HW_PWR_ON` → `wmt_plat_pwr_ctrl(FUNC_ON)` → STP init → BTIF hand-off (B-27).
+- cef35fd: `conn_pwr_off` (mtk_wcn param, default 0). 1 → FUNC_OFF does `pm_runtime_put_sync` on the
+  spike's consys device (CONN domain off, same mechanism as B-27); FUNC_ON gets it back before STP
+  init so B-27 stays balanced. CONN register reads in the glue are skipped while off.
+- E7: all functions off with `conn_pwr_off=1` → domain off for 30 s, r13 clear in 300/300 samples;
+  Wi-Fi back afterwards.
+- SPM stage 6, run-B config of 2026-10-14 (`pdn=1 acinactm=0 clk_init=1 settle=1`, flags 0x5fc102ff,
+  src_mask 0x10aa007e, Wi-Fi off, 25 × 2 s), USB unplugged:
+
+| run | CONN | SPM sleep | dbg | r13 at wake |
+|---|---|---|---|---|
+| C1 | off | **347 mA** | **0x10ff** (26M bits 0/1) ×25 | 0x00060000 |
+| B | on | 402 mA | 0x10fc | 0x00066000 |
+| C2 | on (power-off skipped, see below) | 387 mA | 0x10fc | 0x00066000 |
+
+- Fragile re-power-on: the domain power-on after an off hit `wait completion timeout opId(3)` right
+  after the ROM patch push in 2 of 3 tries (E5, end of C1; E7 was clean). It still came up, but in
+  the C1→B case the link later failed (`Ack Miss trigger firmware assert` during run B's sleep) →
+  whole-chip reset, which never recovers on this port (`wifi_reset_start` no-op) → Wi-Fi lost until
+  power cycle.
+- Procedure rule: take BT down through BlueZ (`bluetoothctl power off`) before a WMT BT func off; turning
+  the BT core off under an UP hci0 leads to tx timeouts → whole-chip reset (happened once).
+
 ## Next steps
 
-1. Implement the stock consys power-off (`mtk_wcn_consys_hw_reg_ctrl(0)`: AXI bus protect, ISO,
-   MTCMOS off, VCN rails off) behind `mtk_wcn_cmb_hw_pwr_off`, then check r13 with all functions off.
-   If bit 14 still stays high with connsys powered off, the holder is outside connsys.
+1. Make the CONN re-power-on robust: find why `opId(3)` (func on) times out after the patch push,
+   then whole-chip reset recovery. Then the rails in the off state (stock also turns VCN18/28/33 off)
+   and DDREN (SW_DEBUG bits 8/9), which still does not run with CONN off.
 2. For sleep while Wi-Fi is on: wire BGF EINT (stock), drop the WAK heartbeat, enable the PSM, and
    retest A2DP (resyncs / `stp_do_tx_timeout` / throughput as in `docs/bluetooth-a2dp.md`).
 3. Then VCN33 HW mode and SPM stage 6 (`pdn=1 io_en=0x81 acinactm=0 src_mask=0x10aa007e
@@ -72,5 +102,6 @@ Runtime controls used (all stock WMT debug paths; `/proc/driver/wmt_dbg` takes h
 
 - `463e816` — `wmt_psm_allow` module param (default 0 = A2DP force-off unchanged).
 - `d5967d5` — hci_stp close fix (not yet deployed).
-- The Gemini runs a 463e816 `mtk_wcn.ko`; the original is kept as
+- `cef35fd` — glue `conn_pwr_off` (deployed, default 0).
+- The Gemini runs a cef35fd `mtk_wcn.ko` (previous: `mtk_wcn.ko.psm-463e816`); the original is kept as
   `/lib/modules/6.6.157/kernel/drivers/misc/mediatek-connectivity/mtk_wcn.ko.orig-20261015`.
