@@ -89,13 +89,20 @@ Runtime controls used (all stock WMT debug paths; `/proc/driver/wmt_dbg` takes h
   cycles) clean, Wi-Fi back 4 s after radio on. Earlier, in the C1→B case the link later failed
   (`Ack Miss trigger firmware assert` during run B's sleep) → whole-chip reset, which never recovers on this
   port (`wifi_reset_start` no-op); not yet re-tested with the fix.
+- After the fix, a CONN re-power-on is clean, but an SPM run with CONN **on** after any runtime re-power-on breaks the
+  STP link within seconds (RESYNC2 → `Ack Miss trigger firmware assert` → whole-chip reset, Wi-Fi lost): 3 of 3, vs
+  0 of 7 SPM runs without a prior re-power-on. Awake is fine (11 min). Register diff boot vs re-powered (E9): only
+  CONN MCU_CFG_ACR bits 24/25, which turned out to be dynamic firmware state (E10). Parked; rule: reboot before an
+  SPM run with CONN on after a re-power-on. CONN-off SPM runs are not affected.
+- DDREN with CONN off: still never runs; clearing DIS_DDRPHY_PDN (0x5fc102fb) changes nothing (E11, SPM sleep
+  ~337 mA both). One self-reset in a CONN-off SPM cycle (after ~100 clean ones); RGU WDT armed, reason lost.
 - Procedure rule: take BT down through BlueZ (`bluetoothctl power off`) before a WMT BT func off; turning
   the BT core off under an UP hci0 leads to tx timeouts → whole-chip reset (happened once).
 
 ## Next steps
 
-1. Re-run the SPM A/B/A with the rx-idle fix (does the ack-miss assert recur?), then whole-chip reset
-   recovery. Then the rails in the off state (stock also turns VCN18/28/33 off)
+1. DDREN with CONN off: walk the remaining SPM flag bits toward stock 0x00030038 (keep bits 3 and 9), one per
+   CONN-off A/B/A run. Parked: CONN-on SPM after a re-power-on (ack-miss), whole-chip reset recovery. Then the rails in the off state (stock also turns VCN18/28/33 off)
    and DDREN (SW_DEBUG bits 8/9), which still does not run with CONN off.
 2. For sleep while Wi-Fi is on: wire BGF EINT (stock), drop the WAK heartbeat, enable the PSM, and
    retest A2DP (resyncs / `stp_do_tx_timeout` / throughput as in `docs/bluetooth-a2dp.md`).
