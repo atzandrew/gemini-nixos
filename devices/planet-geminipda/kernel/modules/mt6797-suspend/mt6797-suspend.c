@@ -61,6 +61,9 @@
 #include <linux/irq.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/i2c.h>
+#include <linux/regmap.h>
+#include <linux/pm_runtime.h>
 #include <asm/unaligned.h>
 #include <asm/barrier.h>
 #include <asm/sysreg.h>
@@ -102,6 +105,13 @@ MODULE_PARM_DESC(touch_rst, "mode 1: hold the SSD2092 touch controller in reset 
 static bool wdt_pause = true;
 module_param(wdt_pause, bool, 0644);
 MODULE_PARM_DESC(wdt_pause, "mode 1: disable the TOPRGU WDT for the SPM sleep loop (as stock wd_suspend_notify); 0 = feed it each cycle only");
+
+static bool vgpu_low;
+module_param(vgpu_low, bool, 0644);
+MODULE_PARM_DESC(vgpu_low, "mode 1: VGPU (RT5735 PROGVSEL0) to 843.75 mV for the suspend (power test); restored in .finish");
+static bool vproc2_off;
+module_param(vproc2_off, bool, 0644);
+MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (power test); NOT restored, the next boot re-powers it");
 
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
@@ -296,6 +306,90 @@ static void unpin_domains(void)
 			pinned[i]->flags &= ~GENPD_FLAG_ALWAYS_ON;
 		pinned[i] = NULL;
 	}
+}
+
+/* ------------------------------------------------------- external bucks */
+/*
+ * Power tests (2026-10-17). Both bucks sit on I2C, which is only usable
+ * until suspend_noirq, so this runs in .prepare through the drivers' own
+ * regmaps (keeps their caches right, handles the DA9214 page register).
+ *
+ * VGPU: lowered, not switched off: genpd powers the MFG domains back on
+ * in resume_noirq, before .finish could restore the rail. 843.75 mV is
+ * the lowest GPU OPP voltage, safe for that power-on.
+ *
+ * VPROC2: once both A72s are offline ATF tears the cluster down
+ * (EXT_BUCK_ISO 0x10006290 bit1 set, 0x10006218 bit0 clear) and the rail
+ * can be dropped (vendor cpu_power_off_buck, cl2-down.sh: reg 0x5e = 0).
+ * Turning it back on needs the cl2-power latch sequence, so it stays off;
+ * cpu8/9 never come back after an SPM sleep anyway.
+ */
+#define RT5735_VSEL0		0x11
+#define RT5735_EN		BIT(7)
+#define VGPU_LOW_SEL		0x27		/* 600 mV + 39 * 6.25 mV = 843.75 mV */
+#define DA9211_BUCKB_CONT	0x5e
+#define SPM_CL2_218		0x218
+#define SPM_EXT_BUCK_ISO	0x290
+
+static struct regmap *vgpu_map;
+static unsigned int vgpu_saved;
+
+static struct regmap *i2c_regmap(const char *name)
+{
+	struct device *dev = bus_find_device_by_name(&i2c_bus_type, NULL, name);
+	struct regmap *map;
+
+	if (!dev)
+		return NULL;
+	map = dev_get_regmap(dev, NULL);
+	put_device(dev);
+	return map;
+}
+
+static void bucks_down(void)
+{
+	if (vgpu_low) {
+		struct device *gdev = bus_find_device_by_name(&platform_bus_type, NULL, "13040000.mali");
+		bool gpu_off = gdev && pm_runtime_status_suspended(gdev);
+
+		if (gdev)
+			put_device(gdev);
+		vgpu_map = i2c_regmap("3-001c");
+		if (!gpu_off || !vgpu_map || regmap_read(vgpu_map, RT5735_VSEL0, &vgpu_saved) ||
+		    !(vgpu_saved & RT5735_EN)) {
+			pr_warn(TAG "vgpu_low skipped (gpu %s, map %d, VSEL0 %02x)\n",
+				gpu_off ? "suspended" : "ACTIVE", !!vgpu_map, vgpu_saved);
+			vgpu_map = NULL;
+		} else if (regmap_write(vgpu_map, RT5735_VSEL0, RT5735_EN | VGPU_LOW_SEL)) {
+			pr_warn(TAG "vgpu_low: write failed\n");
+			vgpu_map = NULL;
+		} else {
+			pr_info(TAG "VGPU VSEL0 %02x -> %02x\n", vgpu_saved, RT5735_EN | VGPU_LOW_SEL);
+		}
+	}
+	if (vproc2_off) {
+		u32 iso = rd(SPM_EXT_BUCK_ISO), con = rd(SPM_CL2_218);
+		struct regmap *map = i2c_regmap("2-0068");
+		int ret;
+
+		if (cpu_online(8) || cpu_online(9) || !(iso & BIT(1)) || (con & BIT(0)) || !map) {
+			pr_warn(TAG "vproc2_off skipped (cpu8/9 %d%d, ISO %08x, 218 %08x, map %d)\n",
+				cpu_online(8), cpu_online(9), iso, con, !!map);
+		} else {
+			/* write only: reads on this bus are unreliable (shared with the SCP) */
+			ret = regmap_write(map, DA9211_BUCKB_CONT, 0);
+			pr_info(TAG "VPROC2 (BUCKB) off: %d\n", ret);
+		}
+	}
+}
+
+static void bucks_up(void)
+{
+	if (!vgpu_map)
+		return;
+	regmap_write(vgpu_map, RT5735_VSEL0, vgpu_saved);
+	udelay(400);	/* ramp + vendor 350 us settle */
+	vgpu_map = NULL;
 }
 
 /* ------------------------------------------------------------- wake checks */
@@ -642,6 +736,7 @@ static int gem_suspend_prepare(void)
 		pr_err(TAG "bad poll_ms/io_en\n");
 		return -EINVAL;
 	}
+	bucks_down();
 	ret = spm_prepare();
 	if (ret) {
 		pr_err(TAG "SPM prepare failed: %d\n", ret);
@@ -753,6 +848,7 @@ static int gem_suspend_enter(suspend_state_t state)
 
 static void gem_suspend_finish(void)
 {
+	bucks_up();
 	key_ints_restore();
 	spm_finish();
 }
