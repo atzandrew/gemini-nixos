@@ -21,8 +21,13 @@
  *   then reset at ~62 s) and the watchdog core feeds it; its suspend
  *   callback only stops it when userspace has /dev/watchdog open, so in
  *   suspend nothing feeds it and the chip resets ~1 min in (S2 2026-10-17).
- *   .enter feeds it (WDT_RESTART) every loop, which keeps it as a backstop
- *   for a hang inside .enter. Proper fix later: mtk_wdt suspend/resume.
+ *   Feeding it every loop was not enough: with it running, SPM sleeps
+ *   randomly ended in a WDT reset (= PMIC cold reset, WDTRSTB mode 0):
+ *   2 of ~90 5 s cycles, 1 of ~570 2 s cycles; with it disabled, 0 of
+ *   120 5 s cycles (2026-10-17). Stock disables it around SPM suspend
+ *   (wd_suspend_notify), so mode 1 does too (wdt_pause, default on) and
+ *   restores WDT_MODE after the loop. Proper fix later: mtk_wdt
+ *   suspend/resume + the SPM's PCM WDT as the hang backstop.
  *
  * Keys: a short press falls between two polls, so the PMIC key interrupts
  *   are enabled for the suspend (INT_CON0 bits 0-3, as stock) and the
@@ -94,6 +99,9 @@ MODULE_PARM_DESC(wake_lid, "mode 1: wake when the lid opens (only if it was clos
 static bool touch_rst;
 module_param(touch_rst, bool, 0644);
 MODULE_PARM_DESC(touch_rst, "mode 1: hold the SSD2092 touch controller in reset (CTP_RST GPIO68 low) while asleep (power test)");
+static bool wdt_pause = true;
+module_param(wdt_pause, bool, 0644);
+MODULE_PARM_DESC(wdt_pause, "mode 1: disable the TOPRGU WDT for the SPM sleep loop (as stock wd_suspend_notify); 0 = feed it each cycle only");
 
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
@@ -130,6 +138,9 @@ module_param(fw, charp, 0444);
 #define WDT_PHYS		0x10007000
 #define WDT_RESTART		0x08
 #define WDT_RESTART_KEY		0x1971
+#define WDT_MODE		0x00
+#define WDT_MODE_KEY		0x22000000
+#define WDT_MODE_EN		BIT(0)
 #define MT6351_TOPSTATUS	0x220		/* bit1 PWRKEY_DEB, bit2 HOMEKEY_DEB, active low */
 #define KEYS_MASK		(BIT(1) | BIT(2))
 #define GPIO_PHYS		0x10005000
@@ -646,7 +657,7 @@ static int gem_suspend_enter(suspend_state_t state)
 {
 	struct cyc r, first = {}, last = {};
 	u64 frq = read_sysreg(cntfrq_el0), t0 = read_sysreg(cntvct_el0);
-	u32 n = 0, top = 0, kint = 0, asleep_ms = 0;
+	u32 n = 0, top = 0, kint = 0, asleep_ms = 0, wdt_mode;
 	bool lid0;
 	int why = 0, ret;
 
@@ -667,6 +678,11 @@ static int gem_suspend_enter(suspend_state_t state)
 		return -EBUSY;
 
 	lid0 = lid_closed();
+	wdt_mode = readl(wdt + WDT_MODE) & 0xff;
+	if (wdt_pause && (wdt_mode & WDT_MODE_EN)) {
+		wdt_feed();
+		writel(WDT_MODE_KEY | (wdt_mode & ~WDT_MODE_EN), wdt + WDT_MODE);
+	}
 	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
@@ -720,10 +736,13 @@ static int gem_suspend_enter(suspend_state_t state)
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) | BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
 	wdt_feed();
-	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s\n",
+	if (wdt_pause && (wdt_mode & WDT_MODE_EN))
+		writel(WDT_MODE_KEY | wdt_mode, wdt + WDT_MODE);
+	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
 		why_txt[why], n, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
-		lid0 ? "closed" : "open", top, kint, touch_rst ? "; touch held in reset" : "");
+		lid0 ? "closed" : "open", top, kint, touch_rst ? "; touch held in reset" : "",
+		readl(wdt + WDT_MODE) & 0xff, wdt_pause ? " (paused in loop)" : "");
 	pr_info(TAG "  first: %s psci %d r12 %08x r13 %08x dbg %08x | last: %s psci %d r12 %08x r13 %08x dbg %08x timer_out %u\n",
 		first.refused ? "REFUSED" : first.returned ? "ret" : "NO-RET", first.psci_ret,
 		first.r12, first.r13, first.dbg,
