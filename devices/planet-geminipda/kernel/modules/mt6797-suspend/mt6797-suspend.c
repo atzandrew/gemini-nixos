@@ -91,6 +91,10 @@ static bool wake_lid = true;
 module_param(wake_lid, bool, 0644);
 MODULE_PARM_DESC(wake_lid, "mode 1: wake when the lid opens (only if it was closed at entry)");
 
+static bool touch_rst;
+module_param(touch_rst, bool, 0644);
+MODULE_PARM_DESC(touch_rst, "mode 1: hold the SSD2092 touch controller in reset (CTP_RST GPIO68 low) while asleep (power test)");
+
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
 module_param(flags, uint, 0644);
@@ -131,6 +135,8 @@ module_param(fw, charp, 0444);
 #define GPIO_PHYS		0x10005000
 #define GPIO_DIN(pin)		(0x200 + 0x10 * ((pin) / 32))
 #define LID_GPIO		66		/* hall, low = lid closed */
+#define GPIO_DOUT(pin)		(0x100 + 0x10 * ((pin) / 32))
+#define CTP_RST_GPIO		68		/* touch reset, low = reset; output, high while running */
 
 #define POWERON_CONFIG_EN	0x000
 #define SPM_POWER_ON_VAL0	0x004
@@ -661,6 +667,9 @@ static int gem_suspend_enter(suspend_state_t state)
 		return -EBUSY;
 
 	lid0 = lid_closed();
+	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
+		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
+		       gpio + GPIO_DOUT(CTP_RST_GPIO));
 	for (;;) {
 		wdt_feed();
 		if (im_load()) {
@@ -707,11 +716,14 @@ static int gem_suspend_enter(suspend_state_t state)
 		mdelay(gap_ms);
 	}
 
+	if (touch_rst)	/* back to run; resume re-inits the chip (driver rebind) */
+		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) | BIT(CTP_RST_GPIO % 32),
+		       gpio + GPIO_DOUT(CTP_RST_GPIO));
 	wdt_feed();
-	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x\n",
+	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s\n",
 		why_txt[why], n, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
-		lid0 ? "closed" : "open", top, kint);
+		lid0 ? "closed" : "open", top, kint, touch_rst ? "; touch held in reset" : "");
 	pr_info(TAG "  first: %s psci %d r12 %08x r13 %08x dbg %08x | last: %s psci %d r12 %08x r13 %08x dbg %08x timer_out %u\n",
 		first.refused ? "REFUSED" : first.returned ? "ret" : "NO-RET", first.psci_ret,
 		first.r12, first.r13, first.dbg,
