@@ -2065,6 +2065,14 @@
 		compatible = "mediatek,mt6797-mt6351-sound";
 		mediatek,platform = <&afe>;
 		mediatek,audio-codec = <&mt6351_codec>;
+		/*
+		 * [2026-10-16] Speaker amp enables (left/right), driven by the
+		 * machine driver's DAPM "Speaker" widget: on only while a
+		 * playback stream runs (they drew ~60 mA on-and-idle under the
+		 * old userspace gpioset scheme). "Speaker Switch" off = jack only.
+		 */
+		speaker-amp-gpios = <&pio 243 GPIO_ACTIVE_HIGH>,
+				    <&pio 244 GPIO_ACTIVE_HIGH>;
 	};
 };
 
