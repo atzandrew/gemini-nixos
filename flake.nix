@@ -280,6 +280,11 @@
         mt6351-probe = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-probe {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # DEBUG: MT6351 audio-register poke (headphone idle-buzz experiment,
+        # 2026-10-16). Writes limited to the audio blocks. Light build.
+        mt6351-audpoke = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6351-audpoke {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # READ-ONLY MT6797 CPU clock/voltage probe (docs/cpu-dvfs.md step 1):
         # ARM PLLs under the vendor 0x1001A semaphore (mcu=1), CPULDO VSRAM,
         # CSPM state, A72 PLL via SMC (smc_b=1). Light build like mt6351-probe.

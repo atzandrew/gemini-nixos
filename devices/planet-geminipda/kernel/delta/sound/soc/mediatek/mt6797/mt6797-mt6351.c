@@ -7,6 +7,7 @@
 
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/irqflags.h>
 #include <linux/module.h>
 #include <sound/soc.h>
 
@@ -194,27 +195,111 @@ static struct snd_soc_dai_link mt6797_mt6351_dai_links[] = {
  * The "Speaker" widget drives those GPIOs, so the amps are on only while
  * a playback stream is routed to the headphone drivers. SPK widgets get
  * POST_PMU / PRE_PMD events: amps on after the codec path is up, off
- * before it goes down (no pop). The "Speaker Switch" pin switch lets
- * userspace pick jack-only output. The jack itself has no detection, so
+ * before it goes down (no pop). The jack itself has no detection, so
  * "Headphones" is always connected. Without the DT property the amps
  * are simply not driven.
+ *
+ * Enable sequence as the vendor 3.18 kernel (mt_soc_audio_6797
+ * AudDrv_GPIO_EXTAMP_Select, mode 3, + Ext_Speaker_Amp_Change): low,
+ * 1 ms, then 3 low/high pulses of ~2 us (AW87xx one-wire mode select:
+ * the number of rising edges picks the mode), 25 ms warm-up. Off: low,
+ * 0.5 ms. The pulses must stay short, hence the brief irq-off section
+ * (the MT6797 pio GPIOs are MMIO and never sleep).
  */
+#define SPK_AMP_MODE		3
+#define SPK_AMP_WARM_UP_MS	25
+
+static void mt6797_mt6351_spk_amp_set(struct gpio_descs *amp, int val)
+{
+	unsigned int i;
+
+	for (i = 0; i < amp->ndescs; i++)
+		gpiod_set_value(amp->desc[i], val);
+}
+
 static int mt6797_mt6351_spk_amp_event(struct snd_soc_dapm_widget *w,
 				       struct snd_kcontrol *kcontrol,
 				       int event)
 {
 	struct gpio_descs *amp = snd_soc_card_get_drvdata(w->dapm->card);
-	int on = SND_SOC_DAPM_EVENT_ON(event);
-	unsigned int i;
+	unsigned long flags;
+	int n;
 
 	if (!amp)
 		return 0;
 
-	for (i = 0; i < amp->ndescs; i++)
-		gpiod_set_value_cansleep(amp->desc[i], on);
+	mt6797_mt6351_spk_amp_set(amp, 0);
+	if (!SND_SOC_DAPM_EVENT_ON(event)) {
+		udelay(500);
+		return 0;
+	}
 
-	/* let the amp outputs settle before the codec drivers change */
-	usleep_range(5000, 6000);
+	usleep_range(1000, 1500);
+	local_irq_save(flags);
+	for (n = 0; n < SPK_AMP_MODE; n++) {
+		mt6797_mt6351_spk_amp_set(amp, 0);
+		udelay(2);
+		mt6797_mt6351_spk_amp_set(amp, 1);
+		udelay(2);
+	}
+	local_irq_restore(flags);
+	msleep(SPK_AMP_WARM_UP_MS);
+	return 0;
+}
+
+/*
+ * "Speaker Switch" (the control PipeWire's Speakers/Headphones ports
+ * flip): on = speaker path enabled; off = headphone-only, which also
+ * enables the codec's "HP Idle" input so the jack is driven quiet while
+ * nothing plays (see mt6351.c). Both pins change in one DAPM sync, so
+ * the shared headphone drivers stay up across the switch, and the amps
+ * can never be powered by the idle path.
+ */
+static void mt6797_mt6351_set_speaker(struct snd_soc_dapm_context *dapm,
+				      bool on)
+{
+	if (on) {
+		snd_soc_dapm_disable_pin_unlocked(dapm, "HP Idle");
+		snd_soc_dapm_enable_pin_unlocked(dapm, "Speaker");
+	} else {
+		snd_soc_dapm_disable_pin_unlocked(dapm, "Speaker");
+		snd_soc_dapm_enable_pin_unlocked(dapm, "HP Idle");
+	}
+	snd_soc_dapm_sync_unlocked(dapm);
+}
+
+static int mt6797_mt6351_speaker_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+
+	ucontrol->value.integer.value[0] =
+		snd_soc_dapm_get_pin_status(&card->dapm, "Speaker");
+	return 0;
+}
+
+static int mt6797_mt6351_speaker_put(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct snd_soc_dapm_context *dapm = &card->dapm;
+	bool on = !!ucontrol->value.integer.value[0];
+	int changed;
+
+	snd_soc_dapm_mutex_lock(dapm);
+	changed = snd_soc_dapm_get_pin_status(dapm, "Speaker") != on;
+	if (changed)
+		mt6797_mt6351_set_speaker(dapm, on);
+	snd_soc_dapm_mutex_unlock(dapm);
+	return changed;
+}
+
+static int mt6797_mt6351_late_probe(struct snd_soc_card *card)
+{
+	/* boot state: speakers enabled, no idle hold */
+	snd_soc_dapm_mutex_lock(&card->dapm);
+	mt6797_mt6351_set_speaker(&card->dapm, true);
+	snd_soc_dapm_mutex_unlock(&card->dapm);
 	return 0;
 }
 
@@ -232,7 +317,8 @@ static const struct snd_soc_dapm_route mt6797_mt6351_routes[] = {
 
 static const struct snd_kcontrol_new mt6797_mt6351_controls[] = {
 	SOC_DAPM_PIN_SWITCH("Headphones"),
-	SOC_DAPM_PIN_SWITCH("Speaker"),
+	SOC_SINGLE_BOOL_EXT("Speaker Switch", 0, mt6797_mt6351_speaker_get,
+			    mt6797_mt6351_speaker_put),
 };
 
 static struct snd_soc_card mt6797_mt6351_card = {
@@ -246,6 +332,7 @@ static struct snd_soc_card mt6797_mt6351_card = {
 	.num_dapm_widgets = ARRAY_SIZE(mt6797_mt6351_widgets),
 	.dapm_routes = mt6797_mt6351_routes,
 	.num_dapm_routes = ARRAY_SIZE(mt6797_mt6351_routes),
+	.late_probe = mt6797_mt6351_late_probe,
 };
 
 static int mt6797_mt6351_dev_probe(struct platform_device *pdev)

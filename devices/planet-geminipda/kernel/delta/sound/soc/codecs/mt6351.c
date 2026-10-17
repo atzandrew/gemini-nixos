@@ -1253,6 +1253,18 @@ static const struct snd_soc_dapm_widget mt6351_dapm_widgets[] = {
 
 	SND_SOC_DAPM_INPUT("SGEN DL"),
 
+	/*
+	 * [gemini 2026-10-16] "HP Idle": keeps the DAC + headphone drivers
+	 * and the codec's digital DL clocks (AUDIO_TOP_CON0 gates) running
+	 * with no stream, so the jack outputs are driven quiet instead of
+	 * floating and picking up board noise (audible buzz). Proven by
+	 * register A/B on the Gemini PDA: analog chain alone still buzzes,
+	 * the digital clock gates are what silence it; the SoC AFE / DMA
+	 * stays off. Disabled by default; the machine driver enables it in
+	 * headphone-only mode.
+	 */
+	SND_SOC_DAPM_INPUT("HP Idle"),
+
 	/* Uplinks */
 	SND_SOC_DAPM_AIF_OUT_E("AIF1TX", "AIF1 Capture", 0,
 			       MT6351_AFE_UL_SRC_CON0_L,
@@ -1426,6 +1438,10 @@ static const struct snd_soc_dapm_route mt6351_dapm_routes[] = {
 	{"DACR", NULL, "DAC In Mux"},
 	{"DACR", NULL, "DL Power Supply"},
 	{"DACR", NULL, "DACR_BIASGEN"},
+
+	{"DACL", NULL, "HP Idle"},
+	{"DACR", NULL, "HP Idle"},
+	{"HP Idle", NULL, "DL Digital Clock"},
 
 	{"LOL Mux", "Playback", "DACL"},
 
