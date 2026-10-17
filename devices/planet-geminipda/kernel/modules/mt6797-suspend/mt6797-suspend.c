@@ -3,9 +3,31 @@
  * mt6797-suspend — system suspend ("deep", /sys/power/mem_sleep) for the
  * MT6797 Gemini PDA, as a loadable module (suspend_set_ops is exported).
  *
- * mode=0 (probe): .enter just busy-waits probe_ms and returns. Tests that
- *   every driver's suspend/resume callbacks and the secondary-CPU
- *   offline/online path survive a real suspend, with no SPM involved.
+ * mode=0 (probe): .enter only busy-waits probe_ms. Tests the driver
+ *   suspend/resume callbacks and secondary-CPU offline/online, no SPM.
+ *
+ * mode=1 (SPM sleep): the vendor suspend firmware (pcm_suspend.bin) on the
+ *   SPM, the sequence proven by mt6797-spm-load stage 6 pdn=1
+ *   (docs/spm-sleep.md): cpu0 alone, PSCI CPU_SUSPEND cluster power-down,
+ *   PCM timer wake. There is no wake interrupt yet (pinctrl-mt6797 has no
+ *   EINT), so .enter loops: sleep poll_ms, wake, check the PMIC keys
+ *   (TOPSTATUS over the pwrap WACS2 port) and the lid (GPIO66), go back to
+ *   sleep if nothing changed. Leaves .enter on a key press, the lid
+ *   opening, a non-timer SPM wake reason, a failed cycle, or after max_s.
+ *   Caller's job (userspace hook for now): panel DCS 0x28/0x29, connsys
+ *   off, cpu8/9 offline (CPU_ON(8) hangs after SPM sleep).
+ *
+ * Watchdog: mtk-wdt starts the TOPRGU WDT at boot (31 s, dual mode: IRQ,
+ *   then reset at ~62 s) and the watchdog core feeds it; its suspend
+ *   callback only stops it when userspace has /dev/watchdog open, so in
+ *   suspend nothing feeds it and the chip resets ~1 min in (S2 2026-10-17).
+ *   .enter feeds it (WDT_RESTART) every loop, which keeps it as a backstop
+ *   for a hang inside .enter. Proper fix later: mtk_wdt suspend/resume.
+ *
+ * Keys: a short press falls between two polls, so the PMIC key interrupts
+ *   are enabled for the suspend (INT_CON0 bits 0-3, as stock) and the
+ *   latched INT_STATUS0 bits are read each cycle; nothing services the
+ *   PMIC interrupt line itself (no EINT yet). INT_CON0 is restored after.
  *
  * Power domains: genpd powers a domain off in suspend_noirq once all of
  * its devices have suspended. "mm" must never go off here (LK programmed
@@ -14,7 +36,7 @@
  * devices in keep_pd[] and .end clears what it set. (Kernel fix later:
  * MTK_SCPD_ALWAYS_ON for mm in mtk-scpsys.)
  *
- * Unload restores "no platform suspend" (s2idle only).
+ * Unload restores "no platform suspend" (s2idle only) and the PCM state.
  */
 #include <linux/module.h>
 #include <linux/suspend.h>
@@ -24,20 +46,199 @@
 #include <linux/io.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/dma-mapping.h>
+#include <linux/firmware.h>
+#include <linux/gfp.h>
+#include <linux/math64.h>
+#include <linux/cpu_pm.h>
+#include <linux/psci.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <asm/unaligned.h>
+#include <asm/barrier.h>
+#include <asm/sysreg.h>
+#include <asm/arch_gicv3.h>
 
-static uint mode;
+#define TAG "mt6797-suspend: "
+
+static uint mode = 1;
 module_param(mode, uint, 0644);
-MODULE_PARM_DESC(mode, "0 = probe (enter busy-waits probe_ms, no SPM)");
+MODULE_PARM_DESC(mode, "0 = probe (busy-wait, no SPM), 1 = SPM sleep (default)");
 
 static uint probe_ms = 5000;
 module_param(probe_ms, uint, 0644);
 MODULE_PARM_DESC(probe_ms, "mode 0: time spent in .enter (ms)");
 
+static uint poll_ms = 2000;
+module_param(poll_ms, uint, 0644);
+MODULE_PARM_DESC(poll_ms, "mode 1: SPM sleep per cycle (PCM timer, ms, 100..5000)");
+
+static uint gap_ms = 200;
+module_param(gap_ms, uint, 0644);
+MODULE_PARM_DESC(gap_ms, "mode 1: awake busy-wait between cycles (ms)");
+
+static uint max_s;
+module_param(max_s, uint, 0644);
+MODULE_PARM_DESC(max_s, "mode 1: leave .enter after this many seconds asleep (0 = never)");
+
+static bool wake_keys = true;
+module_param(wake_keys, bool, 0644);
+MODULE_PARM_DESC(wake_keys, "mode 1: wake on Esc/On or the silver key");
+
+static bool wake_lid = true;
+module_param(wake_lid, bool, 0644);
+MODULE_PARM_DESC(wake_lid, "mode 1: wake when the lid opens (only if it was closed at entry)");
+
+/* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
+static uint flags = 0x5fc102ff;
+module_param(flags, uint, 0644);
+static uint src_mask = 0x10aa007e;
+module_param(src_mask, uint, 0644);
+static uint io_en = 0x81;
+module_param(io_en, uint, 0644);
+static uint wake_unmask = 0x1;
+module_param(wake_unmask, uint, 0644);
+static uint pdn_state = 0x01010000;
+module_param(pdn_state, uint, 0644);
+static uint pdn_apsb = 0x11;
+module_param(pdn_apsb, uint, 0644);
+
+static char *fw = "mt6797-spm/pcm_suspend.bin";
+module_param(fw, charp, 0444);
+
+/* ---------------------------------------------------------------- registers */
 #define SPM_PHYS		0x10006000
+#define INFRA_AO_PHYS		0x10001000
+#define INFRA_MISC		0xf00		/* bit13 = DRAM 4 GB mode */
+#define PWRAP_PHYS		0x1000d000
+#define PWRAP_WACS2_CMD		0x0a0
+#define PWRAP_WACS2_RDATA	0x0a4
+#define PWRAP_WACS2_VLDCLR	0x0a8
+#define WACS_FSM(x)		(((x) >> 16) & 7)
+#define WACS_FSM_IDLE		0
+#define WACS_FSM_WFVLDCLR	6
+#define PWRAP_DVFS_ADR0		0x10c		/* ADRn = 0x10c + 8n, WDATAn = +4, n = 0..15 */
+#define MT6351_INT_CON0		0x2c2
+#define MT6351_INT_STATUS0	0x2e0		/* bit0 PWRKEY, bit1 HOMEKEY, bit2/3 their releases; W1C */
+#define KEY_INTS		0xf
+#define WDT_PHYS		0x10007000
+#define WDT_RESTART		0x08
+#define WDT_RESTART_KEY		0x1971
+#define MT6351_TOPSTATUS	0x220		/* bit1 PWRKEY_DEB, bit2 HOMEKEY_DEB, active low */
+#define KEYS_MASK		(BIT(1) | BIT(2))
+#define GPIO_PHYS		0x10005000
+#define GPIO_DIN(pin)		(0x200 + 0x10 * ((pin) / 32))
+#define LID_GPIO		66		/* hall, low = lid closed */
+
+#define POWERON_CONFIG_EN	0x000
+#define SPM_POWER_ON_VAL0	0x004
+#define SPM_POWER_ON_VAL1	0x008
+#define SPM_CLK_CON		0x00C
+#define SPM_CLK_SETTLE		0x010
+#define AP_STANDBY_CON		0x014
+#define PCM_CON0		0x018
+#define PCM_CON1		0x01C
+#define PCM_IM_PTR		0x020
+#define PCM_IM_LEN		0x024
+#define PCM_REG_DATA_INI	0x028
+#define PCM_PWR_IO_EN		0x02C
+#define PCM_TIMER_VAL		0x030
+#define PCM_WDT_VAL_OFF		0x034
+#define PCM_EVENT_VECTOR0	0x040
+#define SPM_SW_INT_CLEAR	0x094
+#define SPM_CPU_WAKEUP_EVENT	0x0B0
+#define SPM_IRQ_MASK		0x0B4
+#define SPM_SRC_REQ		0x0B8
+#define SPM_SRC_MASK		0x0BC
+#define SPM_SRC2_MASK		0x0C0
+#define SPM_WAKEUP_EVENT_MASK	0x0C4
+#define PCM_REG0_DATA		0x100
+#define PCM_REG7_DATA		0x11C
+#define PCM_REG13_DATA		0x134
+#define PCM_REG15_DATA		0x13C
+#define PCM_TIMER_OUT		0x150
+#define SPM_IRQ_STA		0x158
+#define SPM_WAKEUP_STA		0x15C
+#define PCM_FSM_STA		0x17C
 #define SPM_PWR_STATUS		0x180
 #define SPM_PWR_STATUS_2ND	0x184
-static void __iomem *spm;
+#define SPM_MAS_PAUSE_MASK_B	0x408
+#define SPM_MAS_PAUSE2_MASK_B	0x40C
+#define SPM_BSI_D0_SR		0x41C
+#define SPM_BSI_D1_SR		0x420
+#define SPM_BSI_D2_SR		0x424
+#define MP0_CPU0_WFI_EN		0x540
+#define SPM_SW_FLAG		0x600
+#define SPM_SW_DEBUG		0x604
+#define SPM_SW_RSV_0		0x608
 
+#define KEY			(0xb16U << 16)	/* SPM_REGWR_CFG_KEY */
+#define PCM_KICK_L		BIT(0)
+#define IM_KICK_L		BIT(1)
+#define PCM_CK_EN		BIT(2)
+#define EN_IM_SLEEP_DVS		BIT(3)
+#define PCM_SW_RESET		BIT(15)
+#define MIF_APBEN		BIT(3)
+#define PCM_TIMER_EN		BIT(5)
+#define IM_NONRP_EN		BIT(6)
+#define PCM_WDT_EN		BIT(8)
+#define PCM_WDT_WAKE_MODE	BIT(9)
+#define SPM_SRAM_SLEEP_B	BIT(10)
+#define SPM_SRAM_ISOINT_B	BIT(11)
+#define EVENT_LOCK_EN		BIT(12)
+#define SRCCLKEN_FAST_RESP	BIT(13)
+#define SCP_APB_INTERNAL_EN	BIT(14)
+#define FSM_DEF			0x48490
+#define FSM_IM_REDY		BIT(9)
+#define ISRM_TWAM		BIT(2)
+#define ISRM_RET_IRQ_AUX	(0x3ffU << 8)
+#define ISRS_PCM_RETURN		BIT(3)
+#define PCM_RF_SYNC_R0		BIT(16)
+#define PCM_RF_SYNC_R7		BIT(23)
+#define PCM_PWRIO_EN_R0		BIT(0)
+#define SPM_FLAG_DIS_CPU_PDN	BIT(0)
+#define SPM_FLAG_DIS_SRCCLKEN_LOW BIT(15)
+#define SYS_SETTLE_SEL		BIT(4)
+#define SPM_LOCK_INFRA_DCM	BIT(5)
+#define CLK_CON_VENDOR_INIT	0x0801104C
+#define SPM_SYSCLK_SETTLE	99		/* 32 kHz ticks = 3 ms */
+#define R12_PCM_TIMER		BIT(0)
+
+#define GICD_PHYS		0x19000000
+#define GICD_IPRIORITYR		0x400
+#define SPM_IRQ_SPI		180		/* vendor DT sleep@10006000, level-low */
+#define SPM_IRQ_PRIO		0x80
+#define SLEEP_PMR		0x90		/* passes 0x80, blocks 0xa0 */
+
+#define IM_MAX_WORDS		2048
+
+struct pcm_tail {			/* struct pcm_desc from .size on */
+	u16 size;
+	u8 sess;
+	u8 replace;
+	u16 addr_2nd;
+	u16 reserved;
+	u32 vec[16];
+} __packed;
+
+static void __iomem *spm, *pwrap, *gpio, *gicd, *wdt;
+static struct platform_device *pdev;
+static struct page *page;
+static unsigned int page_order;
+static dma_addr_t dma;
+static size_t dma_len;
+static bool loaded;
+static u32 saved_con0, saved_con1, saved_ptr, saved_len;
+static struct pcm_tail tail;
+static u32 im_ptr, im_words;
+static unsigned int spm_irq;
+
+static inline u32 rd(u32 off) { return readl(spm + off); }
+static inline void wr(u32 off, u32 v) { writel(v, spm + off); }
+
+/* ------------------------------------------------------------ power domains */
 static const char * const keep_pd[] = {
 	"geminipda-drm",		/* mm */
 	"11220000.audio-controller",	/* audio */
@@ -55,7 +256,7 @@ static void pin_domains(void)
 
 		pinned[i] = NULL;
 		if (!dev) {
-			pr_warn("mt6797-suspend: %s not found\n", keep_pd[i]);
+			pr_warn(TAG "%s not found\n", keep_pd[i]);
 			continue;
 		}
 		if (dev->pm_domain) {
@@ -64,7 +265,6 @@ static void pin_domains(void)
 				pd->flags |= GENPD_FLAG_ALWAYS_ON;
 				pinned[i] = pd;
 			}
-			pr_info("mt6797-suspend: domain %s (%s) pinned on\n", pd->name, keep_pd[i]);
 		}
 		put_device(dev);
 	}
@@ -81,6 +281,329 @@ static void unpin_domains(void)
 	}
 }
 
+/* ------------------------------------------------------------- wake checks */
+/* One PMIC register read on the AP's WACS2 port (mtk-pmic-wrap pwrap_read16, no ARB cap). */
+static int pmic_read(u32 adr, u32 *val)
+{
+	int i;
+
+	for (i = 0; i < 10000 && WACS_FSM(readl(pwrap + PWRAP_WACS2_RDATA)) != WACS_FSM_IDLE; i++)
+		udelay(1);
+	if (i == 10000)
+		return -ETIMEDOUT;
+	writel((adr >> 1) << 16, pwrap + PWRAP_WACS2_CMD);
+	for (i = 0; i < 10000; i++) {
+		u32 v = readl(pwrap + PWRAP_WACS2_RDATA);
+
+		if (WACS_FSM(v) == WACS_FSM_WFVLDCLR) {
+			*val = v & 0xffff;
+			writel(1, pwrap + PWRAP_WACS2_VLDCLR);
+			return 0;
+		}
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static int pmic_write(u32 adr, u32 val)
+{
+	int i;
+
+	for (i = 0; i < 10000 && WACS_FSM(readl(pwrap + PWRAP_WACS2_RDATA)) != WACS_FSM_IDLE; i++)
+		udelay(1);
+	if (i == 10000)
+		return -ETIMEDOUT;
+	writel(BIT(31) | ((adr >> 1) << 16) | (val & 0xffff), pwrap + PWRAP_WACS2_CMD);
+	return 0;
+}
+
+static void wdt_feed(void)
+{
+	writel(WDT_RESTART_KEY, wdt + WDT_RESTART);
+}
+
+static bool lid_closed(void)
+{
+	return !(readl(gpio + GPIO_DIN(LID_GPIO)) & BIT(LID_GPIO % 32));
+}
+
+/* ------------------------------------------------------------------- PCM */
+static int pcm_reset(void)
+{
+	int i;
+
+	wr(PCM_CON0, KEY | PCM_CK_EN | PCM_SW_RESET);
+	for (i = 0; i < 5000; i++) {
+		if ((rd(PCM_FSM_STA) & 0x7fffff) == FSM_DEF)
+			break;
+		udelay(1);
+	}
+	wr(PCM_CON0, KEY | PCM_CK_EN);
+	return i == 5000 ? -EIO : 0;
+}
+
+static int im_load(void)
+{
+	u32 con0, con1, i;
+	int ret = pcm_reset();
+
+	if (ret)
+		return ret;
+	wr(PCM_CON0, KEY | PCM_CK_EN | EN_IM_SLEEP_DVS);
+	con1 = saved_con1 & (PCM_WDT_EN | PCM_WDT_WAKE_MODE | SRCCLKEN_FAST_RESP);
+	wr(PCM_CON1, con1 | KEY | EVENT_LOCK_EN | SPM_SRAM_ISOINT_B | SPM_SRAM_SLEEP_B |
+		     (tail.replace ? 0 : IM_NONRP_EN) | MIF_APBEN | SCP_APB_INTERNAL_EN);
+	wr(PCM_IM_PTR, im_ptr);
+	wr(PCM_IM_LEN, im_words - 1);
+	con0 = rd(PCM_CON0) & 0xffff & ~(IM_KICK_L | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN | IM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN);
+	for (i = 0; i < 10000; i++) {
+		if (rd(PCM_FSM_STA) & FSM_IM_REDY)
+			return 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static irqreturn_t spm_isr(int irq, void *dev)
+{
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	wr(SPM_SW_INT_CLEAR, 0x3ff);
+	return IRQ_HANDLED;
+}
+
+struct cyc {
+	int refused, returned, pm_ret, psci_ret;
+	u32 r12, timer_out, r13, dbg;
+};
+
+/*
+ * One SPM sleep (mt6797-spm-load sleep_work, pdn=1, no ACINACTM). Called
+ * from .enter: cpu0 alone, IRQs off.
+ */
+static void spm_sleep_once(struct cyc *r)
+{
+	u32 con0, i, swflag, pmr_old;
+	u64 cval;
+	u32 ctl;
+
+	memset(r, 0, sizeof(*r));
+	swflag = (flags | SPM_FLAG_DIS_SRCCLKEN_LOW) & ~SPM_FLAG_DIS_CPU_PDN;
+
+	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL0));
+	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R0);
+	wr(PCM_PWR_IO_EN, 0);
+	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL1));
+	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R7);
+	wr(PCM_PWR_IO_EN, 0);
+	for (i = 0; i < 16; i++)
+		wr(PCM_EVENT_VECTOR0 + 4 * i, tail.vec[i]);
+	wr(AP_STANDBY_CON, (rd(AP_STANDBY_CON) & ~0x7fU) | (pdn_apsb & 0x7f));
+	for (i = 0; i < 10; i++)
+		wr(MP0_CPU0_WFI_EN + 4 * i, i == 0);
+	wr(PCM_TIMER_VAL, poll_ms * 32768 / 1000);
+	wr(PCM_CON1, (rd(PCM_CON1) & 0xffff) | KEY | PCM_TIMER_EN);
+	wr(SPM_WAKEUP_EVENT_MASK, ~wake_unmask);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	wr(SPM_SW_INT_CLEAR, 0x3ff);
+	wr(SPM_IRQ_MASK, ISRM_TWAM | ISRM_RET_IRQ_AUX);
+	wr(SPM_MAS_PAUSE_MASK_B, 0xffffffff);
+	wr(SPM_MAS_PAUSE2_MASK_B, 0xffffffff);
+	wr(PCM_REG_DATA_INI, 0);
+	wr(SPM_SW_FLAG, swflag);
+	wr(SPM_SW_RSV_0, 0);
+	wr(SPM_SW_DEBUG, 0);
+
+	if (rd(PCM_REG0_DATA) != rd(SPM_POWER_ON_VAL0) || rd(PCM_REG7_DATA) != rd(SPM_POWER_ON_VAL1)) {
+		r->refused = 1;
+		goto out;
+	}
+
+	wr(PCM_PWR_IO_EN, io_en);
+	con0 = rd(PCM_CON0) & 0xffff & ~(IM_KICK_L | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN | PCM_KICK_L);
+	wr(PCM_CON0, con0 | KEY | PCM_CK_EN);
+
+	pmr_old = gic_read_pmr();
+	gic_write_pmr(SLEEP_PMR);
+	isb();
+	dsb(sy);
+	cval = read_sysreg(cntp_cval_el0);
+	ctl = read_sysreg(cntp_ctl_el0);
+	r->pm_ret = cpu_pm_enter();
+	if (!r->pm_ret) {
+		r->psci_ret = psci_cpu_suspend_enter(pdn_state);
+		cpu_pm_exit();
+		write_sysreg(cval, cntp_cval_el0);
+		write_sysreg(ctl, cntp_ctl_el0);
+		isb();
+	}
+	if (rd(SPM_IRQ_STA) & ISRS_PCM_RETURN)
+		r->returned = 1;
+	gic_write_pmr(pmr_old);
+	isb();
+
+	if (!r->returned)
+		wr(PCM_PWR_IO_EN, 0);	/* abort: outputs back to POWER_ON_VAL0/1 */
+	if (r->returned && (io_en & PCM_PWRIO_EN_R0) && rd(PCM_REG0_DATA) != rd(SPM_POWER_ON_VAL0))
+		wr(SPM_POWER_ON_VAL0, rd(PCM_REG0_DATA));	/* vendor r0 -> POWER_ON_VAL0 backup */
+	r->r12 = rd(SPM_SW_RSV_0);
+	r->timer_out = rd(SPM_BSI_D1_SR);
+	r->r13 = rd(PCM_REG13_DATA);
+	r->dbg = rd(SPM_SW_DEBUG);
+out:
+	wr(SPM_CPU_WAKEUP_EVENT, 0);
+	wr(SPM_WAKEUP_EVENT_MASK, ~0U);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	wr(SPM_SW_INT_CLEAR, 0x3ff);
+	wr(PCM_CON1, KEY | (rd(PCM_CON1) & 0xffff & ~PCM_TIMER_EN));
+	wr(PCM_PWR_IO_EN, 0);
+	pcm_reset();
+}
+
+/* saved around one suspend (prepare -> finish) */
+static struct {
+	bool active;
+	u8 prio;
+	u32 apsb, irqm, tval, wdtv, bsi[3], wmask, cwe, wfi[10], flag, rsv0, dbg;
+	u32 src, src2, clkcon, settle, mp1, mp2, ini, vec[16], pw[32];
+} sv;
+
+static int spm_prepare(void)
+{
+	struct device_node *np;
+	struct of_phandle_args oa = { .args_count = 3, .args = { 0, SPM_IRQ_SPI, IRQ_TYPE_LEVEL_LOW } };
+	u32 i, md_settle;
+	int ret;
+
+	if (gic_read_pmr() <= SPM_IRQ_PRIO + 0x20) {
+		pr_err(TAG "ICC_PMR_EL1 = %02x — refusing\n", gic_read_pmr());
+		return -EIO;
+	}
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6797-sysirq");
+	if (!np)
+		return -ENODEV;
+	oa.np = np;
+	spm_irq = irq_create_of_mapping(&oa);
+	of_node_put(np);
+	if (!spm_irq)
+		return -ENXIO;
+	/* NO_SUSPEND: stays enabled through suspend_device_irqs() */
+	ret = request_irq(spm_irq, spm_isr, IRQF_NO_AUTOEN | IRQF_NO_SUSPEND, "mt6797-spm", NULL);
+	if (ret) {
+		irq_dispose_mapping(spm_irq);
+		spm_irq = 0;
+		return ret;
+	}
+
+	sv.apsb = rd(AP_STANDBY_CON);
+	sv.irqm = rd(SPM_IRQ_MASK);
+	sv.tval = rd(PCM_TIMER_VAL);
+	sv.wdtv = rd(PCM_WDT_VAL_OFF);
+	for (i = 0; i < 3; i++)
+		sv.bsi[i] = rd(SPM_BSI_D0_SR + 4 * i);
+	sv.wmask = rd(SPM_WAKEUP_EVENT_MASK);
+	sv.cwe = rd(SPM_CPU_WAKEUP_EVENT);
+	for (i = 0; i < 10; i++)
+		sv.wfi[i] = rd(MP0_CPU0_WFI_EN + 4 * i);
+	sv.flag = rd(SPM_SW_FLAG);
+	sv.rsv0 = rd(SPM_SW_RSV_0);
+	sv.dbg = rd(SPM_SW_DEBUG);
+	sv.src = rd(SPM_SRC_MASK);
+	sv.src2 = rd(SPM_SRC2_MASK);
+	sv.clkcon = rd(SPM_CLK_CON);
+	sv.settle = rd(SPM_CLK_SETTLE);
+	sv.mp1 = rd(SPM_MAS_PAUSE_MASK_B);
+	sv.mp2 = rd(SPM_MAS_PAUSE2_MASK_B);
+	sv.ini = rd(PCM_REG_DATA_INI);
+	for (i = 0; i < 16; i++)
+		sv.vec[i] = rd(PCM_EVENT_VECTOR0 + 4 * i);
+	for (i = 0; i < 32; i++)
+		sv.pw[i] = readl(pwrap + PWRAP_DVFS_ADR0 + 4 * i);
+	for (i = 0; i < 16; i++) {	/* SPM PMIC commands -> read-only HWCID */
+		writel(0x0200, pwrap + PWRAP_DVFS_ADR0 + 8 * i);
+		writel(0, pwrap + PWRAP_DVFS_ADR0 + 8 * i + 4);
+	}
+	sv.prio = readb(gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	writeb(SPM_IRQ_PRIO, gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
+	if (src_mask != ~0U)
+		wr(SPM_SRC_MASK, src_mask);
+	wr(SPM_CLK_CON, rd(SPM_CLK_CON) | CLK_CON_VENDOR_INIT | SPM_LOCK_INFRA_DCM);
+	wr(SPM_CLK_CON, rd(SPM_CLK_CON) | SYS_SETTLE_SEL);
+	wr(SPM_CLK_SETTLE, 0);
+	md_settle = rd(SPM_CLK_SETTLE);
+	if (md_settle < SPM_SYSCLK_SETTLE)
+		wr(SPM_CLK_SETTLE, SPM_SYSCLK_SETTLE - md_settle);
+	enable_irq(spm_irq);
+	sv.active = true;
+	return 0;
+}
+
+static void spm_finish(void)
+{
+	u32 i;
+
+	if (!sv.active)
+		return;
+	disable_irq(spm_irq);
+	free_irq(spm_irq, NULL);
+	irq_dispose_mapping(spm_irq);
+	spm_irq = 0;
+	writeb(sv.prio, gicd + GICD_IPRIORITYR + 32 + SPM_IRQ_SPI);
+	wr(PCM_PWR_IO_EN, 0);
+	for (i = 0; i < 16; i++)
+		wr(PCM_EVENT_VECTOR0 + 4 * i, sv.vec[i]);
+	wr(PCM_REG_DATA_INI, sv.ini);
+	wr(SPM_MAS_PAUSE_MASK_B, sv.mp1);
+	wr(SPM_MAS_PAUSE2_MASK_B, sv.mp2);
+	wr(SPM_SW_RSV_0, sv.rsv0);
+	wr(SPM_SW_FLAG, sv.flag);
+	wr(SPM_SW_DEBUG, sv.dbg);
+	wr(SPM_SRC_MASK, sv.src);
+	wr(SPM_SRC2_MASK, sv.src2);
+	wr(SPM_CLK_SETTLE, sv.settle);
+	wr(SPM_CLK_CON, sv.clkcon);
+	for (i = 0; i < 10; i++)
+		wr(MP0_CPU0_WFI_EN + 4 * i, sv.wfi[i]);
+	wr(AP_STANDBY_CON, sv.apsb);
+	wr(SPM_CPU_WAKEUP_EVENT, sv.cwe);
+	wr(SPM_WAKEUP_EVENT_MASK, sv.wmask);
+	wr(SPM_IRQ_MASK, sv.irqm);
+	wr(PCM_TIMER_VAL, sv.tval);
+	wr(PCM_WDT_VAL_OFF, sv.wdtv);
+	for (i = 0; i < 3; i++)
+		wr(SPM_BSI_D0_SR + 4 * i, sv.bsi[i]);
+	for (i = 0; i < 32; i++)
+		writel(sv.pw[i], pwrap + PWRAP_DVFS_ADR0 + 4 * i);
+	sv.active = false;
+}
+
+static bool key_ints_on;
+static u32 int_con0_saved;
+
+static void key_ints_enable(void)
+{
+	key_ints_on = false;
+	if (!wake_keys || pmic_read(MT6351_INT_CON0, &int_con0_saved))
+		return;
+	if (pmic_write(MT6351_INT_CON0, int_con0_saved | KEY_INTS) ||
+	    pmic_write(MT6351_INT_STATUS0, KEY_INTS))	/* clear stale latches */
+		return;
+	key_ints_on = true;
+}
+
+static void key_ints_restore(void)
+{
+	if (!key_ints_on)
+		return;
+	pmic_write(MT6351_INT_STATUS0, KEY_INTS);
+	pmic_write(MT6351_INT_CON0, int_con0_saved);
+	key_ints_on = false;
+}
+
+/* --------------------------------------------------------- suspend ops */
 static int gem_suspend_valid(suspend_state_t state)
 {
 	return state == PM_SUSPEND_MEM;
@@ -88,62 +611,294 @@ static int gem_suspend_valid(suspend_state_t state)
 
 static int gem_suspend_begin(suspend_state_t state)
 {
-	pr_info("mt6797-suspend: begin (mode %u)\n", mode);
 	pin_domains();
 	return 0;
 }
 
-static int gem_suspend_enter(suspend_state_t state)
+static int gem_suspend_prepare(void)
 {
-	pr_info("mt6797-suspend: enter on cpu%d, %u cpus online, irqs %s\n",
-		raw_smp_processor_id(), num_online_cpus(),
-		irqs_disabled() ? "off" : "ON");
-	pr_info("mt6797-suspend: PWR_STATUS %08x / %08x\n",
-		readl(spm + SPM_PWR_STATUS), readl(spm + SPM_PWR_STATUS_2ND));
+	int ret;
 
-	switch (mode) {
-	case 0:
-		mdelay(probe_ms);
-		break;
-	default:
+	if (mode != 1)
+		return 0;
+	if (poll_ms < 100 || poll_ms > 5000 || (io_en != 0x80 && io_en != 0x81)) {
+		pr_err(TAG "bad poll_ms/io_en\n");
 		return -EINVAL;
 	}
-	pr_info("mt6797-suspend: leaving enter\n");
+	ret = spm_prepare();
+	if (ret) {
+		pr_err(TAG "SPM prepare failed: %d\n", ret);
+		return ret;
+	}
+	key_ints_enable();
 	return 0;
+}
+
+static const char *const why_txt[] = { "max_s", "key", "lid opened", "SPM wake reason", "cycle failed", "pmic read failed" };
+
+static int gem_suspend_enter(suspend_state_t state)
+{
+	struct cyc r, first = {}, last = {};
+	u64 frq = read_sysreg(cntfrq_el0), t0 = read_sysreg(cntvct_el0);
+	u32 n = 0, top = 0, kint = 0, asleep_ms = 0;
+	bool lid0;
+	int why = 0, ret;
+
+	pr_info(TAG "enter: cpu%d, %u cpus online, PWR_STATUS %08x\n",
+		raw_smp_processor_id(), num_online_cpus(), rd(SPM_PWR_STATUS));
+
+	if (mode == 0) {
+		u32 ms;
+
+		for (ms = 0; ms < probe_ms; ms += 1000) {
+			wdt_feed();
+			mdelay(min(1000U, probe_ms - ms));
+		}
+		wdt_feed();
+		return 0;
+	}
+	if (num_online_cpus() != 1 || raw_smp_processor_id() != 0)
+		return -EBUSY;
+
+	lid0 = lid_closed();
+	for (;;) {
+		wdt_feed();
+		if (im_load()) {
+			why = 4;
+			break;
+		}
+		spm_sleep_once(&r);
+		if (!n)
+			first = r;
+		last = r;
+		n++;
+		if (r.refused || !r.returned || r.pm_ret) {
+			why = 4;
+			break;
+		}
+		asleep_ms += r.timer_out * 1000 / 32768;
+		if (r.r12 & ~R12_PCM_TIMER) {
+			why = 3;
+			break;
+		}
+		if (wake_keys) {
+			ret = pmic_read(MT6351_TOPSTATUS, &top);
+			if (ret) {
+				why = 5;
+				break;
+			}
+			if ((top & KEYS_MASK) != KEYS_MASK) {
+				why = 1;
+				break;
+			}
+			if (key_ints_on && !pmic_read(MT6351_INT_STATUS0, &kint) && (kint & KEY_INTS)) {
+				why = 1;
+				break;
+			}
+		}
+		if (wake_lid && lid0 && !lid_closed()) {
+			why = 2;
+			break;
+		}
+		if (max_s && asleep_ms >= max_s * 1000) {
+			why = 0;
+			break;
+		}
+		mdelay(gap_ms);
+	}
+
+	wdt_feed();
+	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x\n",
+		why_txt[why], n, asleep_ms / 1000,
+		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
+		lid0 ? "closed" : "open", top, kint);
+	pr_info(TAG "  first: %s psci %d r12 %08x r13 %08x dbg %08x | last: %s psci %d r12 %08x r13 %08x dbg %08x timer_out %u\n",
+		first.refused ? "REFUSED" : first.returned ? "ret" : "NO-RET", first.psci_ret,
+		first.r12, first.r13, first.dbg,
+		last.refused ? "REFUSED" : last.returned ? "ret" : "NO-RET", last.psci_ret,
+		last.r12, last.r13, last.dbg, last.timer_out);
+	return 0;
+}
+
+static void gem_suspend_finish(void)
+{
+	key_ints_restore();
+	spm_finish();
 }
 
 static void gem_suspend_end(void)
 {
 	unpin_domains();
-	pr_info("mt6797-suspend: end\n");
 }
 
 static const struct platform_suspend_ops gem_suspend_ops = {
-	.valid = gem_suspend_valid,
-	.begin = gem_suspend_begin,
-	.enter = gem_suspend_enter,
-	.end   = gem_suspend_end,
+	.valid   = gem_suspend_valid,
+	.begin   = gem_suspend_begin,
+	.prepare = gem_suspend_prepare,
+	.enter   = gem_suspend_enter,
+	.finish  = gem_suspend_finish,
+	.end     = gem_suspend_end,
 };
+
+/* ------------------------------------------------------------- init/exit */
+static int alloc_buf(struct device *dev, const void *prog, size_t bytes)
+{
+	struct page *bad[32];
+	int nbad = 0, i, ret = -ENOMEM;
+
+	page_order = get_order(bytes);
+	while (nbad < ARRAY_SIZE(bad)) {
+		struct page *p = alloc_pages(GFP_KERNEL | GFP_DMA | __GFP_NOWARN, page_order);
+		phys_addr_t pa;
+
+		if (!p)
+			break;
+		pa = page_to_phys(p);
+		if (pa >= 0x40000000 && pa + (PAGE_SIZE << page_order) <= 0xC0000000) {
+			page = p;
+			ret = 0;
+			break;
+		}
+		bad[nbad++] = p;
+	}
+	for (i = 0; i < nbad; i++)
+		__free_pages(bad[i], page_order);
+	if (ret)
+		return ret;
+
+	memcpy(page_address(page), prog, bytes);
+	dma_len = bytes;
+	dma = dma_map_page(dev, page, 0, bytes, DMA_TO_DEVICE);	/* cleans D-cache */
+	if (dma_mapping_error(dev, dma) || dma != page_to_phys(page)) {
+		if (!dma_mapping_error(dev, dma))
+			dma_unmap_page(dev, dma, bytes, DMA_TO_DEVICE);
+		__free_pages(page, page_order);
+		page = NULL;
+		return -EIO;
+	}
+	return 0;
+}
+
+static void unmap_all(void)
+{
+	if (spm)
+		iounmap(spm);
+	if (pwrap)
+		iounmap(pwrap);
+	if (gpio)
+		iounmap(gpio);
+	if (gicd)
+		iounmap(gicd);
+	if (wdt)
+		iounmap(wdt);
+	spm = pwrap = gpio = gicd = wdt = NULL;
+}
 
 static int __init gem_suspend_init(void)
 {
+	const struct firmware *f = NULL;
+	void __iomem *infra;
+	bool mode4g;
+	u32 top = 0;
+	int ret;
+
 	spm = ioremap(SPM_PHYS, 0x1000);
-	if (!spm)
-		return -ENOMEM;
+	pwrap = ioremap(PWRAP_PHYS, 0x1000);
+	gpio = ioremap(GPIO_PHYS, 0x1000);
+	gicd = ioremap(GICD_PHYS, 0x1000);
+	wdt = ioremap(WDT_PHYS, 0x100);
+	infra = ioremap(INFRA_AO_PHYS, 0x1000);
+	if (!spm || !pwrap || !gpio || !gicd || !wdt || !infra) {
+		ret = -ENOMEM;
+		goto out_map;
+	}
+	mode4g = readl(infra + INFRA_MISC) & BIT(13);
+	iounmap(infra);
+	infra = NULL;
+
+	pdev = platform_device_register_simple("mt6797-suspend", -1, NULL, 0);
+	if (IS_ERR(pdev)) {
+		ret = PTR_ERR(pdev);
+		goto out_map;
+	}
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret)
+		goto out_pdev;
+
+	ret = request_firmware_direct(&f, fw, &pdev->dev);
+	if (ret) {
+		pr_err(TAG "request_firmware_direct(%s) = %d\n", fw, ret);
+		goto out_pdev;
+	}
+	ret = -EINVAL;
+	if (f->size < 2)
+		goto out_fw;
+	im_words = get_unaligned_le16(f->data);
+	if (im_words < 16 || im_words > IM_MAX_WORDS || f->size < 2 + im_words * 4 + sizeof(tail) + 1)
+		goto out_fw;
+	memcpy(&tail, f->data + 2 + im_words * 4, sizeof(tail));
+	if (tail.size != im_words || tail.sess > 2 || tail.replace > 1)
+		goto out_fw;
+
+	if ((rd(PCM_FSM_STA) & 0x7fffff) != FSM_DEF || rd(PCM_PWR_IO_EN) ||
+	    !(rd(POWERON_CONFIG_EN) & 1)) {
+		pr_err(TAG "PCM not in reset-default / PWR_IO_EN set / bus CG off — refusing\n");
+		ret = -EBUSY;
+		goto out_fw;
+	}
+	ret = alloc_buf(&pdev->dev, f->data + 2, im_words * 4);
+	if (ret)
+		goto out_fw;
+	im_ptr = (u32)page_to_phys(page) + (mode4g ? 0x40000000 : 0);
+	release_firmware(f);
+	f = NULL;
+
+	saved_con0 = rd(PCM_CON0);
+	saved_con1 = rd(PCM_CON1);
+	saved_ptr = rd(PCM_IM_PTR);
+	saved_len = rd(PCM_IM_LEN);
+	loaded = true;
+
+	pmic_read(MT6351_TOPSTATUS, &top);
 	suspend_set_ops(&gem_suspend_ops);
-	pr_info("mt6797-suspend: deep suspend registered (mode %u)\n", mode);
+	pr_info(TAG "deep suspend registered (mode %u, poll %u ms, gap %u ms, max_s %u); fw %u words, IM_PTR %08x; TOPSTATUS %04x, lid %s\n",
+		mode, poll_ms, gap_ms, max_s, im_words, im_ptr, top, lid_closed() ? "closed" : "open");
 	return 0;
+
+out_fw:
+	if (ret == -EINVAL)
+		pr_err(TAG "%s: bad format\n", fw);
+	release_firmware(f);
+out_pdev:
+	platform_device_unregister(pdev);
+out_map:
+	if (infra)
+		iounmap(infra);
+	unmap_all();
+	return ret;
 }
 
 static void __exit gem_suspend_exit(void)
 {
 	suspend_set_ops(NULL);
 	unpin_domains();
-	iounmap(spm);
-	pr_info("mt6797-suspend: unregistered\n");
+	if (loaded) {
+		pcm_reset();
+		wr(PCM_IM_PTR, saved_ptr);
+		wr(PCM_IM_LEN, saved_len);
+		wr(PCM_CON1, KEY | (saved_con1 & 0xffff));
+		wr(PCM_CON0, KEY | (saved_con0 & 0xffff));
+	}
+	if (page) {
+		dma_unmap_page(&pdev->dev, dma, dma_len, DMA_TO_DEVICE);
+		__free_pages(page, page_order);
+	}
+	platform_device_unregister(pdev);
+	unmap_all();
+	pr_info(TAG "unregistered\n");
 }
 
 module_init(gem_suspend_init);
 module_exit(gem_suspend_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("MT6797 system suspend (Gemini PDA)");
+MODULE_DESCRIPTION("MT6797 system suspend via the SPM (Gemini PDA)");
