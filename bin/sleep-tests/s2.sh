@@ -17,7 +17,7 @@ dcs() {	# DCS short no-param via DSI VM_CMD (see ~/panel/dcs.sh); never 0x10
 	i=0; while [ $(( $(rd 0x0c) & 0x20 )) -eq 0 ]; do i=$((i+1)); [ $i -gt 200 ] && { log "dcs $1 NO DONE"; return 1; }; done
 	st=$(rd 0x0c); wr 0x0c $(( st & ~0x20 )); log "dcs $1 done ($i polls)"
 }
-dpms() { runuser -u andrew -- env XDG_RUNTIME_DIR=/run/user/1001 WAYLAND_DISPLAY=wayland-0 kscreen-doctor --dpms $1 >/dev/null 2>&1; }
+dpms() { timeout 10 runuser -u andrew -- env XDG_RUNTIME_DIR=/run/user/1001 WAYLAND_DISPLAY=wayland-0 kscreen-doctor --dpms $1 >/dev/null 2>&1; }
 l0() { busybox devmem 0x1400b02c 32; }
 restore() {
 	dcs 0x29
@@ -25,7 +25,7 @@ restore() {
 	dpms on
 	if [ "$CONNOFF" = 1 ]; then echo "7 3 1" > /proc/driver/wmt_dbg
 		echo 0 > /sys/module/mtk_wcn/parameters/conn_pwr_off; fi
-	nmcli radio wifi on; sleep 10; bluetoothctl power on >/dev/null 2>&1
+	nmcli radio wifi on; sleep 10; timeout 10 bluetoothctl power on >/dev/null 2>&1
 	log "restored; online=$(cat /sys/devices/system/cpu/online)"
 }
 [ "$(rd 0x14)" = 0x00000001 ] && [ $(( $(rd 0x130) & 0xff )) -eq $((0x21)) ] || { log "DSI not in expected state - abort"; exit 1; }
@@ -36,8 +36,8 @@ log "module ok; mem_sleep=$(cat /sys/power/mem_sleep); waiting for unplug"
 for i in $(seq 300); do [ "$(cat /sys/class/power_supply/bq25890-charger-0/online)" = 0 ] && break; sleep 1; done
 [ "$(cat /sys/class/power_supply/bq25890-charger-0/online)" = 0 ] || { log "still plugged - abort"; rmmod mt6797-suspend; exit 1; }
 log "unplugged; max=$MAX poll=$POLL gap=$GAP extra='$EXTRA'"; sleep 5
-dpms off; sleep 3
-nmcli radio wifi off; bluetoothctl power off >/dev/null 2>&1; sleep 2
+dpms off; log "dpms off"; sleep 3
+timeout 20 nmcli radio wifi off; timeout 10 bluetoothctl power off >/dev/null 2>&1; sleep 2
 echo 1 > /sys/module/mtk_wcn/parameters/conn_pwr_off; echo "7 0 0" > /proc/driver/wmt_dbg; echo "7 3 0" > /proc/driver/wmt_dbg; CONNOFF=1
 sleep 2; log "connoff r13=$(busybox devmem 0x10006134 32)"
 for c in 9 8; do echo 0 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done
