@@ -109,9 +109,9 @@ MODULE_PARM_DESC(wdt_pause, "mode 1: disable the TOPRGU WDT for the SPM sleep lo
 static bool vgpu_low;
 module_param(vgpu_low, bool, 0644);
 MODULE_PARM_DESC(vgpu_low, "mode 1: VGPU (RT5735 PROGVSEL0) to 843.75 mV for the suspend (power test); restored in .finish");
-static bool vproc2_off;
+static bool vproc2_off = true;
 module_param(vproc2_off, bool, 0644);
-MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (power test); NOT restored, the next boot re-powers it");
+MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (default on, ~43 mA in suspend); NOT restored, the next boot re-powers it");
 
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
@@ -318,7 +318,8 @@ static void unpin_domains(void)
  * in resume_noirq, before .finish could restore the rail. 843.75 mV is
  * the lowest GPU OPP voltage, safe for that power-on.
  *
- * VPROC2: once both A72s are offline ATF tears the cluster down
+ * VPROC2 (default on; 249 -> 206 mA in suspend, A/B 2026-10-17): once
+ * both A72s are offline ATF tears the cluster down
  * (EXT_BUCK_ISO 0x10006290 bit1 set, 0x10006218 bit0 clear) and the rail
  * can be dropped (vendor cpu_power_off_buck, cl2-down.sh: reg 0x5e = 0).
  * Turning it back on needs the cl2-power latch sequence, so it stays off;
