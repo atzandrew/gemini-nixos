@@ -302,6 +302,11 @@
         mt6797-spm-load = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-spm-load {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # System suspend ("deep") as a module: platform_suspend_ops whose
+        # .enter runs the MT6797 SPM sleep (docs/suspend.md). Light build.
+        mt6797-suspend = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-suspend {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # A72 cluster power-on in the vendor order (test module for moving
         # cl2-up.sh into the kernel; docs/cpu-dvfs.md).
         mt6797-cl2-on = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cl2-on {
