@@ -11,18 +11,21 @@
 # volatile DA9214 STATUS_A: "busybox i2cget -f -y 2 0x68 0x50" (I2C with no module).
 # KEEP=1 (optional): load da9214-test once before run 2 and keep it loaded until the end
 # (presence vs unload as the trigger).
-# Run: sudo -n -b busybox sh /home/andrew/connsys/hunt.sh NAME RUNS MAX ["EXTRA"] ["BARGS"] ["BPOST"] [KEEP]
+# MOD (optional): module to load instead of ~/da9214-test.ko, e.g. a stock module with no
+# hardware access (/lib/modules/$(uname -r)/kernel/lib/crc-ccitt.ko); BARGS may then be "".
+# Run: sudo -n -b busybox sh /home/andrew/connsys/hunt.sh NAME RUNS MAX ["EXTRA"] ["BARGS"] ["BPOST"] [KEEP] [MOD]
 N=$1; RUNS=$2; MAX=$3; EX="wdt_pause=0 wdt_int_rst=1 $4"; BA=$5; BP=$6; KEEP=${7:-0}
+MOD=${8:-/home/andrew/da9214-test.ko}; MN=$(basename $MOD .ko); B=0; { [ -n "$BA" ] || [ -n "$8" ]; } && B=1
 D=/home/andrew/connsys; O=$D/hunt-$N.log
 : > $O
-echo "$(date +%T) start: runs=$RUNS max=$MAX extra='$EX' bargs='$BA' bpost='$BP' keep=$KEEP crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
+echo "$(date +%T) start: runs=$RUNS max=$MAX extra='$EX' bargs='$BA' bpost='$BP' keep=$KEEP mod=$MOD crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
 i=1
 while [ $i -le $RUNS ]; do
-	b=""; if [ -n "$BA" ] && { [ "$KEEP" = 1 ] && [ $i -eq 2 ] || [ "$KEEP" != 1 ] && [ $((i % 2)) -eq 0 ]; }; then b="B($BA) "
-		insmod /home/andrew/da9214-test.ko $BA || { echo "da9214-test insmod failed" >> $O; break; }; fi
+	b=""; if [ $B = 1 ] && { [ "$KEEP" = 1 ] && [ $i -eq 2 ] || [ "$KEEP" != 1 ] && [ $((i % 2)) -eq 0 ]; }; then b="B($MN $BA) "
+		insmod $MOD $BA || { echo "$MN insmod failed" >> $O; break; }; fi
 	[ "$KEEP" = 1 ] && [ $i -gt 2 ] && b="K "
 	sh $D/s2.sh $MAX 2000 200 "$EX" $D/hunt-$N-$i.log
-	[ -n "$b" ] && [ "$KEEP" != 1 ] && rmmod da9214-test
+	[ -n "$b" ] && [ "$KEEP" != 1 ] && rmmod $MN
 	if [ -n "$BP" ] && [ $((i % 2)) -eq 0 ]; then
 		b="${b}P($(sh -c "$BP" 2>&1 | tr '\n' ' ')) "; fi
 	echo "$(date +%T) run $i: $b$(grep -o 'back rc=.*' $D/hunt-$N-$i.log) crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
@@ -30,5 +33,5 @@ while [ $i -le $RUNS ]; do
 	i=$((i+1))
 	sleep 20
 done
-[ "$KEEP" = 1 ] && rmmod da9214-test 2>/dev/null
+[ "$KEEP" = 1 ] && rmmod $MN 2>/dev/null
 echo "=== done" >> $O; sync
