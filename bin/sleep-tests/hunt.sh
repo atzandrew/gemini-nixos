@@ -13,18 +13,21 @@
 # (presence vs unload as the trigger).
 # MOD (optional): module to load instead of ~/da9214-test.ko, e.g. a stock module with no
 # hardware access (/lib/modules/$(uname -r)/kernel/lib/crc-ccitt.ko); BARGS may then be "".
+# The panel stays display-off (DCS 0x28) + DPMS off for the whole series; the last run (or
+# an early stop) turns it back on (s2.sh PANEL_KEEP_OFF / panel-on).
 # Run: sudo -n -b busybox sh /home/andrew/connsys/hunt.sh NAME RUNS MAX ["EXTRA"] ["BARGS"] ["BPOST"] [KEEP] [MOD]
 N=$1; RUNS=$2; MAX=$3; EX="wdt_pause=0 wdt_int_rst=1 $4"; BA=$5; BP=$6; KEEP=${7:-0}
 MOD=${8:-/home/andrew/da9214-test.ko}; MN=$(basename $MOD .ko); B=0; { [ -n "$BA" ] || [ -n "$8" ]; } && B=1
 D=/home/andrew/connsys; O=$D/hunt-$N.log
-: > $O
+: > $O; PO=0
 echo "$(date +%T) start: runs=$RUNS max=$MAX extra='$EX' bargs='$BA' bpost='$BP' keep=$KEEP mod=$MOD crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
 i=1
 while [ $i -le $RUNS ]; do
 	b=""; if [ $B = 1 ] && { [ "$KEEP" = 1 ] && [ $i -eq 2 ] || [ "$KEEP" != 1 ] && [ $((i % 2)) -eq 0 ]; }; then b="B($MN $BA) "
 		insmod $MOD $BA || { echo "$MN insmod failed" >> $O; break; }; fi
 	[ "$KEEP" = 1 ] && [ $i -gt 2 ] && b="K "
-	sh $D/s2.sh $MAX 2000 200 "$EX" $D/hunt-$N-$i.log
+	PO=1; [ $i -eq $RUNS ] && PO=0	# panel stays off between runs; only the last run turns it on
+	PANEL_KEEP_OFF=$PO sh $D/s2.sh $MAX 2000 200 "$EX" $D/hunt-$N-$i.log
 	[ -n "$b" ] && [ "$KEEP" != 1 ] && rmmod $MN
 	if [ -n "$BP" ] && [ $((i % 2)) -eq 0 ]; then
 		b="${b}P($(sh -c "$BP" 2>&1 | tr '\n' ' ')) "; fi
@@ -34,4 +37,5 @@ while [ $i -le $RUNS ]; do
 	sleep 20
 done
 [ "$KEEP" = 1 ] && rmmod $MN 2>/dev/null
+[ "$PO" = 1 ] && { sh $D/s2.sh panel-on "" "" "" $D/hunt-$N-panel.log; echo "$(date +%T) panel on (early stop)" >> $O; }
 echo "=== done" >> $O; sync

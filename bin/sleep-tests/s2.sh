@@ -19,10 +19,14 @@ dcs() {	# DCS short no-param via DSI VM_CMD (see ~/panel/dcs.sh); never 0x10
 }
 dpms() { timeout 10 runuser -u andrew -- env XDG_RUNTIME_DIR=/run/user/1001 WAYLAND_DISPLAY=wayland-0 kscreen-doctor --dpms $1 >/dev/null 2>&1; }
 l0() { busybox devmem 0x1400b02c 32; }
+# "s2.sh panel-on [..] [LOG]": DCS 0x29 + DPMS on only (ends a PANEL_KEEP_OFF series).
+if [ "$1" = panel-on ]; then [ "$(rd 0x14)" = 0x00000001 ] || { log "DSI not in video mode - abort"; exit 1; }; dcs 0x29; dpms on; log "panel on"; exit 0; fi
 restore() {
-	dcs 0x29
+	# PANEL_KEEP_OFF=1 (env): leave the panel display-off + DPMS off after the run, so a series
+	# does not flash the static lock screen between suspends (screen burns 2026-10-17/18).
+	if [ "$PANEL_KEEP_OFF" = 1 ]; then log "panel kept off"; else dcs 0x29; fi
 	echo 4-0053 > /sys/bus/i2c/drivers/ssd2092/unbind; echo 4-0053 > /sys/bus/i2c/drivers/ssd2092/bind	# touch re-init (as gemini-suspend-prep)
-	dpms on
+	[ "$PANEL_KEEP_OFF" = 1 ] || dpms on
 	if [ "$CONNOFF" = 1 ]; then echo "7 3 1" > /proc/driver/wmt_dbg
 		echo 0 > /sys/module/mtk_wcn/parameters/conn_pwr_off; fi
 	nmcli radio wifi on; sleep 10; timeout 10 bluetoothctl power on >/dev/null 2>&1
