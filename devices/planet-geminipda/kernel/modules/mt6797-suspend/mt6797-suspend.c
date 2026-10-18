@@ -113,6 +113,13 @@ static bool vproc2_off = true;
 module_param(vproc2_off, bool, 0644);
 MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (default on, ~43 mA in suspend); NOT restored, the next boot re-powers it");
 
+static uint ldo_lp;
+module_param(ldo_lp, uint, 0644);
+MODULE_PARM_DESC(ldo_lp, "mode 1: MT6351 LDOs in low-power mode while asleep, bitmask: 1 VA18, 2 VA10, 4 VUSB33, 8 VLDO28, 0x10 VIO28, 0x20 VIO18 (power test)");
+static uint ldo_lp_mode = 1;
+module_param(ldo_lp_mode, uint, 0644);
+MODULE_PARM_DESC(ldo_lp_mode, "1 = SW LP forced around each SPM sleep, 2 = HW LP on SRCLKEN0 for the whole loop (stock SUSPEND setting)");
+
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
 module_param(flags, uint, 0644);
@@ -437,6 +444,77 @@ static void wdt_feed(void)
 static bool lid_closed(void)
 {
 	return !(readl(gpio + GPIO_DIN(LID_GPIO)) & BIT(LID_GPIO % 32));
+}
+
+/* ------------------------------------------------------------ PMIC LDOs */
+/*
+ * Power test (2026-10-17). Stock (mt_spm.c spm_pmic_power_mode SUSPEND)
+ * puts these LDOs in hardware low-power mode, entered when SRCLKEN0 drops
+ * in sleep; mainline leaves them in normal mode. LDO CON0 (upmu_hw.h):
+ * b0 MODE_SET (SW LP), b2 MODE_CTRL (1 = HW LP), b7:5 SRCLK_MODE_SEL
+ * (0 = SRCLKEN0), b8 QI_MODE (status: 1 = in LP). ldo_lp_mode 1 forces
+ * SW LP around each SPM sleep only (the awake gaps run in normal mode);
+ * mode 2 sets the stock HW mode for the loop. Saved values are restored
+ * on the way out. Plain WACS2 accesses: one CPU, IRQs off in .enter.
+ */
+#define LDO_MODE_SET		BIT(0)
+#define LDO_MODE_CTRL		BIT(2)
+#define LDO_SRCLK_MODE_SEL	(7 << 5)
+#define LDO_QI_MODE		BIT(8)
+
+static const struct { const char *name; u16 adr; } lp_ldo[] = {
+	{ "VA18", 0x0a00 }, { "VA10", 0x0a6e }, { "VUSB33", 0x0a16 },
+	{ "VLDO28", 0x0a9c }, { "VIO28", 0x0a34 }, { "VIO18", 0x0a4c },
+};
+static u32 ldo_saved[ARRAY_SIZE(lp_ldo)];
+static bool ldo_lp_on;
+
+static bool ldo_lp_save(void)
+{
+	int i;
+
+	ldo_lp_on = false;
+	if (!ldo_lp || (ldo_lp_mode != 1 && ldo_lp_mode != 2))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(lp_ldo); i++)
+		if ((ldo_lp & BIT(i)) && pmic_read(lp_ldo[i].adr, &ldo_saved[i]))
+			return false;
+	ldo_lp_on = true;
+	return true;
+}
+
+static void ldo_lp_set(bool lp)
+{
+	int i;
+
+	if (!ldo_lp_on)
+		return;
+	for (i = 0; i < ARRAY_SIZE(lp_ldo); i++) {
+		u32 v = ldo_saved[i];
+
+		if (!(ldo_lp & BIT(i)))
+			continue;
+		if (lp && ldo_lp_mode == 1)
+			v = (v & ~LDO_MODE_CTRL) | LDO_MODE_SET;
+		else if (lp)
+			v = (v & ~LDO_SRCLK_MODE_SEL) | LDO_MODE_CTRL;
+		pmic_write(lp_ldo[i].adr, v);
+	}
+}
+
+static void ldo_lp_log(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lp_ldo); i++) {
+		u32 v = 0;
+
+		if (!(ldo_lp & BIT(i)))
+			continue;
+		pmic_read(lp_ldo[i].adr, &v);
+		pr_info(TAG "LDO %s %04x: %04x -> %04x (%s)\n", lp_ldo[i].name, lp_ldo[i].adr,
+			ldo_saved[i], v, (v & LDO_QI_MODE) ? "in LP" : "normal");
+	}
 }
 
 /* ------------------------------------------------------------------- PCM */
@@ -782,13 +860,24 @@ static int gem_suspend_enter(suspend_state_t state)
 	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
+	if (ldo_lp_save() && ldo_lp_mode == 2) {
+		ldo_lp_set(true);
+		ldo_lp_log();
+	}
 	for (;;) {
 		wdt_feed();
 		if (im_load()) {
 			why = 4;
 			break;
 		}
+		if (ldo_lp_mode == 1) {
+			ldo_lp_set(true);
+			if (!n)
+				ldo_lp_log();
+		}
 		spm_sleep_once(&r);
+		if (ldo_lp_mode == 1)
+			ldo_lp_set(false);
 		if (!n)
 			first = r;
 		last = r;
@@ -828,6 +917,10 @@ static int gem_suspend_enter(suspend_state_t state)
 		mdelay(gap_ms);
 	}
 
+	ldo_lp_set(false);
+	if (ldo_lp_on)
+		ldo_lp_log();
+	ldo_lp_on = false;
 	if (touch_rst)	/* back to run; resume re-inits the chip (driver rebind) */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) | BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
