@@ -4,15 +4,20 @@
 # becomes a WDT reset (~1 min) instead of a power-hold. mt6797-suspend writes a breadcrumb
 # to NONRST_REG2 (0x10007024) at every step; after a reset read it with
 #   sudo busybox devmem 0x10007024 32      (or insmod ~/mt6797-suspend.ko prints it).
-# Run: sudo -n -b busybox sh /home/andrew/connsys/hunt.sh NAME RUNS MAX ["EXTRA"]
-N=$1; RUNS=$2; MAX=$3; EX="wdt_pause=0 wdt_int_rst=1 $4"
+# BARGS (optional): every even run loads ~/da9214-test.ko with BARGS (e.g. "vproc2_mv=600
+# phases=1") and unloads it after (= the A/B pattern of the 21:12 hang).
+# Run: sudo -n -b busybox sh /home/andrew/connsys/hunt.sh NAME RUNS MAX ["EXTRA"] ["BARGS"]
+N=$1; RUNS=$2; MAX=$3; EX="wdt_pause=0 wdt_int_rst=1 $4"; BA=$5
 D=/home/andrew/connsys; O=$D/hunt-$N.log
 : > $O
-echo "$(date +%T) start: runs=$RUNS max=$MAX extra='$EX' crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
+echo "$(date +%T) start: runs=$RUNS max=$MAX extra='$EX' bargs='$BA' crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
 i=1
 while [ $i -le $RUNS ]; do
+	b=""; if [ -n "$BA" ] && [ $((i % 2)) -eq 0 ]; then b="B($BA) "
+		insmod /home/andrew/da9214-test.ko $BA || { echo "da9214-test insmod failed" >> $O; break; }; fi
 	sh $D/s2.sh $MAX 2000 200 "$EX" $D/hunt-$N-$i.log
-	echo "$(date +%T) run $i: $(grep -o 'back rc=.*' $D/hunt-$N-$i.log) crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
+	[ -n "$b" ] && rmmod da9214-test
+	echo "$(date +%T) run $i: $b$(grep -o 'back rc=.*' $D/hunt-$N-$i.log) crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
 	grep -q "back rc=0" $D/hunt-$N-$i.log || { echo "stopped after run $i" >> $O; break; }
 	i=$((i+1))
 	sleep 20
