@@ -18,6 +18,7 @@
  *   insmod da9214-test.ko phases=1          # BUCKB 1 phase instead of 2
  *   insmod da9214-test.ko mode=1            # BUCKB_MODE: 1 auto 1-phase, 3 auto
  *   insmod da9214-test.ko noi2c=1           # load/unload only, no I2C at all
+ *   insmod da9214-test.ko nospm=1           # empty: no SPM read, no I2C (implies noi2c)
  *   rmmod da9214-test                       # restore
  */
 #include <linux/module.h>
@@ -49,6 +50,9 @@ MODULE_PARM_DESC(mode, "BUCKB_MODE (1 = auto 1-phase, 2 = PWM, 3 = auto, 0 = lea
 static bool noi2c;
 module_param(noi2c, bool, 0444);
 MODULE_PARM_DESC(noi2c, "load/unload only, never touch the DA9214 (hang hunt)");
+static bool nospm;
+module_param(nospm, bool, 0444);
+MODULE_PARM_DESC(nospm, "empty load: no SPM ioremap/read and no I2C (hang hunt)");
 
 static struct regmap *map;
 static unsigned int saved_d2, saved_d3, saved_d9;
@@ -62,6 +66,11 @@ static int __init da9214_test_init(void)
 
 	if ((vproc2_mv && (vproc2_mv < 300 || vproc2_mv > 1000)) || phases > 2 || mode > 3 || mode == 2)
 		return -EINVAL;	/* mode 2 (forced PWM) is never what we want */
+	if (nospm) {
+		noi2c = true;
+		pr_info(TAG "nospm: loaded, nothing touched\n");
+		return 0;
+	}
 
 	spm = ioremap(SPM_BASE, 0x1000);
 	if (!spm)
