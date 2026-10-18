@@ -28,6 +28,10 @@
  *   (wd_suspend_notify), so mode 1 does too (wdt_pause, default on) and
  *   restores WDT_MODE after the loop. Proper fix later: mtk_wdt
  *   suspend/resume + the SPM's PCM WDT as the hang backstop.
+ *   2026-10-17 re-read: those "WDT resets" may be the intermittent
+ *   suspend hang (seen with VPROC2 on too) caught by the WDT. Hang
+ *   hunting: wdt_pause=0 wdt_int_rst=1 + breadcrumbs in NONRST_REG2
+ *   (crumbs, default on; bin/sleep-tests/hunt.sh).
  *
  * Keys: a short press falls between two polls, so the PMIC key interrupts
  *   are enabled for the suspend (INT_CON0 bits 0-3, as stock) and the
@@ -105,6 +109,12 @@ MODULE_PARM_DESC(touch_rst, "mode 1: hold the SSD2092 touch controller in reset 
 static bool wdt_pause = true;
 module_param(wdt_pause, bool, 0644);
 MODULE_PARM_DESC(wdt_pause, "mode 1: disable the TOPRGU WDT for the SPM sleep loop (as stock wd_suspend_notify); 0 = feed it each cycle only");
+static bool crumbs = true;
+module_param(crumbs, bool, 0644);
+MODULE_PARM_DESC(crumbs, "write a progress breadcrumb to TOPRGU NONRST_REG2 (0x10007024) at each suspend step; printed and cleared at load (hang hunting)");
+static bool wdt_int_rst;
+module_param(wdt_int_rst, bool, 0644);
+MODULE_PARM_DESC(wdt_int_rst, "mode 1, wdt_pause=0: clear WDT_MODE EXTEN for the loop, so a WDT reset resets the SoC only (no PMIC cold reset; keeps NONRST_REG2, maybe DRAM)");
 
 static bool vgpu_low;
 module_param(vgpu_low, bool, 0644);
@@ -162,6 +172,8 @@ module_param(fw, charp, 0444);
 #define WDT_MODE		0x00
 #define WDT_MODE_KEY		0x22000000
 #define WDT_MODE_EN		BIT(0)
+#define WDT_MODE_EXTEN		BIT(2)	/* reset also via WDTRSTB -> PMIC cold reset */
+#define WDT_NONRST2		0x24	/* survives WDT resets; unused by LK/preloader (bit15 of NONRST = DL flag) */
 #define MT6351_TOPSTATUS	0x220		/* bit1 PWRKEY_DEB, bit2 HOMEKEY_DEB, active low */
 #define KEYS_MASK		(BIT(1) | BIT(2))
 #define GPIO_PHYS		0x10005000
@@ -446,6 +458,27 @@ static void wdt_feed(void)
 	writel(WDT_RESTART_KEY, wdt + WDT_RESTART);
 }
 
+/*
+ * Breadcrumbs (hang hunting, 2026-10-17): 0xB s ss nnnn in NONRST_REG2 =
+ * step s, suspend number ss since load, cycle nnnn. Read back so the
+ * write has landed before the next step can hang.
+ */
+enum { CR_PREPARE = 1, CR_LOOP, CR_SETUP, CR_KICKED, CR_PSCI, CR_PSCI_RET, CR_CYC_DONE,
+       CR_CHECKED, CR_LOOP_EXIT, CR_FINISH, CR_FINISH_DONE, CR_END };
+static const char *const cr_txt[16] = { "?", "prepare", "loop top", "SPM setup", "PCM kicked",
+	"PSCI suspend", "PSCI returned", "cycle done", "wake checks done", "loop exit",
+	"finish", "finish done", "end" };
+static u32 cr_susp, cr_n;
+
+static void crumb(u32 step)
+{
+	if (!crumbs || !wdt)
+		return;
+	writel(0xB0000000 | (step & 0xf) << 24 | (cr_susp & 0xff) << 16 | (cr_n & 0xffff),
+	       wdt + WDT_NONRST2);
+	readl(wdt + WDT_NONRST2);
+}
+
 static bool lid_closed(void)
 {
 	return !(readl(gpio + GPIO_DIN(LID_GPIO)) & BIT(LID_GPIO % 32));
@@ -624,6 +657,7 @@ static void spm_sleep_once(struct cyc *r)
 	u32 ctl;
 
 	memset(r, 0, sizeof(*r));
+	crumb(CR_SETUP);
 	swflag = (flags | SPM_FLAG_DIS_SRCCLKEN_LOW) & ~SPM_FLAG_DIS_CPU_PDN;
 
 	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL0));
@@ -659,6 +693,7 @@ static void spm_sleep_once(struct cyc *r)
 	con0 = rd(PCM_CON0) & 0xffff & ~(IM_KICK_L | PCM_KICK_L);
 	wr(PCM_CON0, con0 | KEY | PCM_CK_EN | PCM_KICK_L);
 	wr(PCM_CON0, con0 | KEY | PCM_CK_EN);
+	crumb(CR_KICKED);
 
 	pmr_old = gic_read_pmr();
 	gic_write_pmr(SLEEP_PMR);
@@ -668,7 +703,9 @@ static void spm_sleep_once(struct cyc *r)
 	ctl = read_sysreg(cntp_ctl_el0);
 	r->pm_ret = cpu_pm_enter();
 	if (!r->pm_ret) {
+		crumb(CR_PSCI);
 		r->psci_ret = psci_cpu_suspend_enter(pdn_state);
+		crumb(CR_PSCI_RET);
 		cpu_pm_exit();
 		write_sysreg(cval, cntp_cval_el0);
 		write_sysreg(ctl, cntp_ctl_el0);
@@ -695,6 +732,7 @@ out:
 	wr(PCM_CON1, KEY | (rd(PCM_CON1) & 0xffff & ~PCM_TIMER_EN));
 	wr(PCM_PWR_IO_EN, 0);
 	pcm_reset();
+	crumb(CR_CYC_DONE);
 }
 
 /* saved around one suspend (prepare -> finish) */
@@ -856,6 +894,9 @@ static int gem_suspend_prepare(void)
 
 	if (mode != 1)
 		return 0;
+	cr_susp++;
+	cr_n = 0;
+	crumb(CR_PREPARE);
 	if (poll_ms < 100 || poll_ms > 5000 || (io_en != 0x80 && io_en != 0x81)) {
 		pr_err(TAG "bad poll_ms/io_en\n");
 		return -EINVAL;
@@ -901,6 +942,9 @@ static int gem_suspend_enter(suspend_state_t state)
 	if (wdt_pause && (wdt_mode & WDT_MODE_EN)) {
 		wdt_feed();
 		writel(WDT_MODE_KEY | (wdt_mode & ~WDT_MODE_EN), wdt + WDT_MODE);
+	} else if (wdt_int_rst && (wdt_mode & WDT_MODE_EN)) {
+		wdt_feed();
+		writel(WDT_MODE_KEY | (wdt_mode & ~WDT_MODE_EXTEN), wdt + WDT_MODE);
 	}
 	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
@@ -912,6 +956,8 @@ static int gem_suspend_enter(suspend_state_t state)
 	}
 	for (;;) {
 		wdt_feed();
+		cr_n = n;
+		crumb(CR_LOOP);
 		if (im_load()) {
 			why = 4;
 			break;
@@ -960,6 +1006,7 @@ static int gem_suspend_enter(suspend_state_t state)
 			why = 0;
 			break;
 		}
+		crumb(CR_CHECKED);
 		mdelay(gap_ms);
 	}
 
@@ -972,8 +1019,9 @@ static int gem_suspend_enter(suspend_state_t state)
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) | BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
 	wdt_feed();
-	if (wdt_pause && (wdt_mode & WDT_MODE_EN))
+	if ((wdt_pause || wdt_int_rst) && (wdt_mode & WDT_MODE_EN))
 		writel(WDT_MODE_KEY | wdt_mode, wdt + WDT_MODE);
+	crumb(CR_LOOP_EXIT);
 	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
 		why_txt[why], n, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
@@ -989,14 +1037,18 @@ static int gem_suspend_enter(suspend_state_t state)
 
 static void gem_suspend_finish(void)
 {
+	crumb(CR_FINISH);
 	bucks_up();
 	key_ints_restore();
 	spm_finish();
+	crumb(CR_FINISH_DONE);
 }
 
 static void gem_suspend_end(void)
 {
 	unpin_domains();
+	if (mode == 1)
+		crumb(CR_END);
 }
 
 static const struct platform_suspend_ops gem_suspend_ops = {
@@ -1079,6 +1131,16 @@ static int __init gem_suspend_init(void)
 	if (!spm || !pwrap || !gpio || !gicd || !wdt || !infra) {
 		ret = -ENOMEM;
 		goto out_map;
+	}
+	{	/* breadcrumb left by the previous boot / load */
+		u32 c = readl(wdt + WDT_NONRST2);
+
+		if ((c >> 28) == 0xb)
+			pr_warn(TAG "last breadcrumb %08x: step %s, suspend #%u, cycle %u\n",
+				c, cr_txt[(c >> 24) & 0xf], (c >> 16) & 0xff, c & 0xffff);
+		else
+			pr_info(TAG "NONRST_REG2 %08x (no breadcrumb)\n", c);
+		writel(0, wdt + WDT_NONRST2);
 	}
 	mode4g = readl(infra + INFRA_MISC) & BIT(13);
 	iounmap(infra);
