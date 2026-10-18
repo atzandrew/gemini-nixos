@@ -31,6 +31,7 @@ restore() {
 [ "$(rd 0x14)" = 0x00000001 ] && [ $(( $(rd 0x130) & 0xff )) -eq $((0x21)) ] || { log "DSI not in expected state - abort"; exit 1; }
 lsmod | grep -q mt6797_suspend && rmmod mt6797-suspend
 insmod /home/andrew/mt6797-suspend.ko mode=1 max_s=$MAX poll_ms=$POLL gap_ms=$GAP $EXTRA || { log "insmod failed"; exit 1; }
+log "mod text=$(cat /sys/module/mt6797_suspend/sections/.text) nmods=$(wc -l < /proc/modules)"	# hang hunt: layout per run
 echo deep > /sys/power/mem_sleep
 log "module ok; mem_sleep=$(cat /sys/power/mem_sleep); waiting for unplug"
 for i in $(seq 300); do [ "$(cat /sys/class/power_supply/bq25890-charger-0/online)" = 0 ] && break; sleep 1; done

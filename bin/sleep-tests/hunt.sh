@@ -28,7 +28,7 @@ while [ $i -le $RUNS ]; do
 	[ -n "$b" ] && [ "$KEEP" != 1 ] && rmmod $MN
 	if [ -n "$BP" ] && [ $((i % 2)) -eq 0 ]; then
 		b="${b}P($(sh -c "$BP" 2>&1 | tr '\n' ' ')) "; fi
-	echo "$(date +%T) run $i: $b$(grep -o 'back rc=.*' $D/hunt-$N-$i.log) crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
+	echo "$(date +%T) run $i: $b$(grep -o "back rc=.*" $D/hunt-$N-$i.log) $(grep -o "text=[0-9a-fx]*" $D/hunt-$N-$i.log) crumb=$(busybox devmem 0x10007024 32)" >> $O; sync
 	grep -q "back rc=0" $D/hunt-$N-$i.log || { echo "stopped after run $i" >> $O; break; }
 	i=$((i+1))
 	sleep 20
