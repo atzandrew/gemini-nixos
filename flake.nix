@@ -307,6 +307,11 @@
         mt6797-suspend = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-suspend {
           kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
         };
+        # VPROC2 (DA9214 BUCKB) awake power test: voltage / phases / mode
+        # while the A72 cluster is torn down (notes/vproc-research.md).
+        da9214-test = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/da9214-test {
+          kernel = eval.pkgs.callPackage ./devices/planet-geminipda/kernel { };
+        };
         # A72 cluster power-on in the vendor order (test module for moving
         # cl2-up.sh into the kernel; docs/cpu-dvfs.md).
         mt6797-cl2-on = eval.pkgs.callPackage ./devices/planet-geminipda/kernel/modules/mt6797-cl2-on {
