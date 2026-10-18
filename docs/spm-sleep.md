@@ -65,3 +65,35 @@ is static load (panel, GPU rail, connsys rails, Vcore, PLLs).
 - Blank the screen with the lid open: `XDG_RUNTIME_DIR=/run/user/1001
   WAYLAND_DISPLAY=wayland-0 kscreen-doctor --dpms off`; check OVL0 L0
   (0x1400b02c) reads 0.
+
+## Intermittent hang in SPM sleep (2026-10-17/18)
+System suspend (`mt6797-suspend`, 2 s PCM-timer cycles) occasionally never
+returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
+("Hang hunt", "h9") on Dragon.
+- Rate: about one per 30-40 runs of 30 s, i.e. roughly 1 in 500 SPM cycles,
+  at a random cycle (seen at cycles 0, 4, 5, 13). Everyday suspend wakes
+  1800 times an hour, so a suspend of an hour or more is likely to hit it.
+- Where: breadcrumbs (`mt6797-suspend crumbs`, TOPRGU NONRST_REG2 0x10007024)
+  always stop at "PSCI suspend". The only SPM wake source is the PCM timer
+  (`wake_unmask=0x1`; keys and lid are polled by the CPU), so a missed timer
+  wake and a CPU that dies on resume look the same, and a key press cannot
+  wake a stuck sleep.
+- Ruled out as the cause: VPROC2 voltage/rail (the original suspect), DA9214
+  I2C reads, the battery gauge scale (checked against bq25896 ICHGR, within
+  2 %), the mt6797-suspend load address, connsys state. An extra kernel module
+  loaded between suspends may raise the rate (5/27 runs vs 1/28 plain,
+  p ~ 0.09): unresolved.
+- PSCI: the DT always pinned SMC32 `cpu_suspend = <0x84000001>` like stock,
+  but the 0.2 path ignored it (CPU_SUSPEND went out as SMC64). Fixed to honour
+  the DT id (`drivers/firmware/psci/psci.c`); no clear change in the hang rate
+  (h9: ~1 in 42 runs), kept because it matches stock.
+- The old "random WDT resets with the WDT fed each cycle" (9affe74) need 31 s
+  without the CPU running, so they were most likely this hang too.
+- Testing: `bin/sleep-tests/hunt.sh` with `wdt_pause=0 wdt_int_rst=1` turns a
+  hang into a SoC-only WDT reset in ~1 min with the breadcrumb kept. The
+  battery is worn (2600 of 4220 mAh): a reset's boot current (~2.4 A) can sag
+  it to 3.0 V and brown out below ~50 %; charge first.
+- After a WDT reset the bootloader once stalled polling SPM registers (ATF
+  WDT dump at 0x7FF6A000, PC in LK) and needed a second reset.
+- Way forward: fewer wake cycles (EINT wake for keys/lid, longer or no PCM
+  timer) and observability at the hang (SPM/ATF state), not more A/B runs.
