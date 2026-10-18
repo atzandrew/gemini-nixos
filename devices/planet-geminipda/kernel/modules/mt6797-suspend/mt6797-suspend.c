@@ -120,6 +120,10 @@ static uint ldo_lp_mode = 1;
 module_param(ldo_lp_mode, uint, 0644);
 MODULE_PARM_DESC(ldo_lp_mode, "1 = SW LP forced around each SPM sleep, 2 = HW LP on SRCLKEN0 for the whole loop (stock SUSPEND setting)");
 
+static uint pmic_misc;
+module_param(pmic_misc, uint, 0644);
+MODULE_PARM_DESC(pmic_misc, "mode 1: stock suspend-entry PMIC bits for the loop, bitmask: 1 OSC_SEL_HW_MODE, 2 VGPU buck low-IQ (power test)");
+
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
 module_param(flags, uint, 0644);
@@ -518,6 +522,46 @@ static void ldo_lp_log(void)
 	}
 }
 
+/*
+ * Stock suspend entry (mt_spm_sleep.c spm_suspend_pre_process, set while
+ * still awake): __spm_pmic_low_iq_mode(1) = VGPU_ANA_CON7 bit1, and
+ * spm_pmic_power_mode(SUSPEND) -> spm_pmic_set_osc_mode(HW) = TOP_CON
+ * bit6. Set before the loop, saved values restored after it.
+ */
+static const struct { const char *name; u16 adr; u16 bit; } misc_bit[] = {
+	{ "OSC_SEL_HW_MODE", 0x0204, BIT(6) }, { "VGPU_LOWIQ", 0x0470, BIT(1) },
+};
+static u32 misc_saved[ARRAY_SIZE(misc_bit)];
+static u32 misc_done;
+
+static void pmic_misc_set(void)
+{
+	int i;
+
+	misc_done = 0;
+	for (i = 0; i < ARRAY_SIZE(misc_bit); i++) {
+		u32 v;
+
+		if (!(pmic_misc & BIT(i)) || pmic_read(misc_bit[i].adr, &misc_saved[i]))
+			continue;
+		pmic_write(misc_bit[i].adr, misc_saved[i] | misc_bit[i].bit);
+		misc_done |= BIT(i);
+		v = 0;
+		pmic_read(misc_bit[i].adr, &v);
+		pr_info(TAG "%s %04x: %04x -> %04x\n", misc_bit[i].name, misc_bit[i].adr, misc_saved[i], v);
+	}
+}
+
+static void pmic_misc_restore(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(misc_bit); i++)
+		if (misc_done & BIT(i))
+			pmic_write(misc_bit[i].adr, misc_saved[i]);
+	misc_done = 0;
+}
+
 /* ------------------------------------------------------------------- PCM */
 static int pcm_reset(void)
 {
@@ -861,6 +905,7 @@ static int gem_suspend_enter(suspend_state_t state)
 	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
+	pmic_misc_set();
 	if (ldo_lp_save() && ldo_lp_mode == 2) {
 		ldo_lp_set(true);
 		ldo_lp_log();
@@ -918,6 +963,7 @@ static int gem_suspend_enter(suspend_state_t state)
 		mdelay(gap_ms);
 	}
 
+	pmic_misc_restore();
 	ldo_lp_set(false);
 	if (ldo_lp_on)
 		ldo_lp_log();
