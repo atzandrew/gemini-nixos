@@ -69,8 +69,15 @@ static struct psci_0_1_function_ids psci_0_1_function_ids;
  * SMC64 CPU_ON (0xC4000003) boots the A53 clusters yet HANGS the secure
  * world on the A72 cluster (cpu8/9) — the 3.18 BSP + stock DTB pin the
  * SMC32 ids (cpu_on 0x84000003) and boot all 10 cores. Read the optional
- * DT properties like the PSCI 0.1 path does (2026-09-04, cl2dbg capture). */
+ * DT properties like the PSCI 0.1 path does (2026-09-04, cl2dbg capture).
+ *
+ * cpu_suspend too (2026-10-18): the DT has always pinned SMC32 0x84000001
+ * like stock, but only cpu_on/affinity_info were read, so CPU_SUSPEND went
+ * out as SMC64 0xC4000001 — the one suspend-path call that differed from
+ * stock, and the call our intermittent SPM-sleep hang sits in
+ * (notes/vproc-research.md "Review of upstream (cjdell) workarounds"). */
 static u32 psci_0_2_cpu_on_fn = PSCI_0_2_FN64_CPU_ON;
+static u32 psci_0_2_cpu_suspend_fn = PSCI_0_2_FN64_CPU_SUSPEND;
 static u32 psci_0_2_affinity_info_fn = PSCI_0_2_FN64_AFFINITY_INFO;
 
 struct psci_0_1_function_ids get_psci_0_1_function_ids(void)
@@ -202,7 +209,7 @@ psci_0_1_cpu_suspend(u32 state, unsigned long entry_point)
 static __always_inline int
 psci_0_2_cpu_suspend(u32 state, unsigned long entry_point)
 {
-	return __psci_cpu_suspend(PSCI_FN_NATIVE(0_2, CPU_SUSPEND),
+	return __psci_cpu_suspend(psci_0_2_cpu_suspend_fn,
 				  state, entry_point);
 }
 
@@ -693,6 +700,10 @@ static int __init psci_0_2_init(const struct device_node *np)
 		psci_0_2_cpu_on_fn = id;
 	if (!of_property_read_u32(np, "affinity_info", &id))
 		psci_0_2_affinity_info_fn = id;
+	if (!of_property_read_u32(np, "cpu_suspend", &id))
+		psci_0_2_cpu_suspend_fn = id;
+	pr_info("PSCI 0.2 ids from DT: cpu_on 0x%08x cpu_suspend 0x%08x affinity_info 0x%08x\n",
+		psci_0_2_cpu_on_fn, psci_0_2_cpu_suspend_fn, psci_0_2_affinity_info_fn);
 
 	/*
 	 * Starting with v0.2, the PSCI specification introduced a call
