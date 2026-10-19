@@ -123,9 +123,9 @@ static bool vproc2_off;
 module_param(vproc2_off, bool, 0644);
 MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (power test, ~43 mA; default OFF: suspends entered with it already off hung, 3 of 5); NOT restored, the next boot re-powers it");
 
-static uint vproc2_sleep_mv;
+static uint vproc2_sleep_mv = 300;
 module_param(vproc2_sleep_mv, uint, 0644);
-MODULE_PARM_DESC(vproc2_sleep_mv, "mode 1: VPROC2 (DA9214 BUCKB, rail kept on) to this many mV (300..1000) for the suspend if the A72 cluster is torn down (~35-40 mA, A/B 2026-10-18); restored in .finish; 0 = leave");
+MODULE_PARM_DESC(vproc2_sleep_mv, "mode 1: VPROC2 (DA9214 BUCKB, rail kept on) to this many mV (300..1000) for the suspend if the A72 cluster is torn down (~35-40 mA, A/B 2026-10-18); restored in .finish; 0 = leave (default 300 since 2026-10-18)");
 
 static uint ldo_lp;
 module_param(ldo_lp, uint, 0644);

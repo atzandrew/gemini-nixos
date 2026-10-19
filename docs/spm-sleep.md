@@ -97,3 +97,20 @@ returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
   WDT dump at 0x7FF6A000, PC in LK) and needed a second reset.
 - Way forward: fewer wake cycles (EINT wake for keys/lid, longer or no PCM
   timer) and observability at the hang (SPM/ATF state), not more A/B runs.
+
+## VPROC2 low voltage in sleep (2026-10-18)
+- The DA9214 BUCKB rail (VPROC2, A72 cluster) stays on at 1.00 V after the
+  cluster is torn down. In SPM sleep that costs ~40 mA; awake it costs nothing
+  measurable.
+- A/B (30 s suspends, 250 mA baseline): 1 phase alone 0 mA, auto 1-phase mode
+  0 mA, 0.6 V + 1 phase −33 mA, 0.3 V + 1 phase −40 mA. So it is the voltage.
+- `mt6797-suspend vproc2_sleep_mv=300` (default since 393fedb + this commit):
+  .prepare sets VBUCKB_A to 0.30 V (chip minimum) through the da9211 regmap,
+  only with cpu8/9 offline and the cluster isolated; .finish restores it.
+  Measured 250 → 208 mA (7 runs, no hangs). Same saving as switching the rail
+  off (`vproc2_off`, −43 mA) without the rail-off path.
+- Stock never touches the DA9214 in suspend (no VSEL pin, GPI off); the unused
+  0.60 V "B" setting of VPROC1 is not a lever.
+- Panel: two screen burns (2026-10-17/18) during test series that woke the
+  panel to the static lock screen between every suspend. `hunt.sh` now keeps
+  it display-off for the whole series (cf32b26).
