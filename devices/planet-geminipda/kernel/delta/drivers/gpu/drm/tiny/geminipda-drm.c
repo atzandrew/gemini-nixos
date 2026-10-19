@@ -1369,6 +1369,30 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 	return sdev;
 }
 
+/*
+ * Console handback (2026-10-19, "lastclose1").  The text console is fbcon
+ * on geminipda-fb, which draws into the same LK buffer but cannot switch
+ * the display back on, and DRM fbdev emulation is off in this kernel, so
+ * nothing restores the screen when the last DRM client (KWin at logout)
+ * exits: its CRTC disable left OVL0 L0 off (blank-l0) and the backlight
+ * blanked (backlight_disable() sets BL_CORE_FBBLANK, which userspace's
+ * bl_power can't clear) -> greetd/tuigreet ran on a dark panel.  With no
+ * DRM client left, show the LK buffer again.  The CRTC state stays "off";
+ * the next compositor's modeset enables it as usual (both calls are then
+ * no-ops).
+ */
+static void geminipda_drm_lastclose(struct drm_device *dev)
+{
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(dev);
+	int idx;
+
+	if (!drm_dev_enter(dev, &idx))
+		return;
+	geminipda_drm_ovl_l0(sdev, true);
+	geminipda_drm_set_backlight(true);
+	drm_dev_exit(idx);
+}
+
 DEFINE_DRM_GEM_FOPS(geminipda_drm_fops);
 
 static struct drm_driver geminipda_drm_driver = {
@@ -1380,6 +1404,7 @@ static struct drm_driver geminipda_drm_driver = {
 	.minor			= DRIVER_MINOR,
 	.driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
 	.fops			= &geminipda_drm_fops,
+	.lastclose		= geminipda_drm_lastclose,
 };
 
 static int geminipda_drm_probe(struct platform_device *pdev)
