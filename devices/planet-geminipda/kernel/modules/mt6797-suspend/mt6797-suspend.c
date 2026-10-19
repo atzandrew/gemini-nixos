@@ -14,9 +14,8 @@
  *   (TOPSTATUS over the pwrap WACS2 port) and the lid (GPIO66), go back to
  *   sleep if nothing changed. Leaves .enter on a key press, the lid
  *   opening, a non-timer SPM wake reason, a failed cycle, or after max_s.
- *   The reason is left in the last_wake parameter (Debian powers off on
- *   "max_s", the unattended-suspend cap). .prepare refuses while the
- *   display is still on (disp_check).
+ *   The reason is left in the last_wake parameter. .prepare refuses while
+ *   the display is still on (disp_check).
  *   Caller's job (userspace hook for now): panel DCS 0x28/0x29, connsys
  *   off, cpu8/9 offline (CPU_ON(8) hangs after SPM sleep).
  *
@@ -169,7 +168,7 @@ static bool disp_check = true;
 module_param(disp_check, bool, 0644);
 MODULE_PARM_DESC(disp_check, "mode 1: refuse the suspend while OVL0 layer 0 (the display) is on");
 
-/* Read by the prep hook after resume: "max_s" = the cap ended it -> power off. */
+/* Why the last suspend ended, for logs and userspace hooks. */
 static char last_wake[24] = "none";
 module_param_string(last_wake, last_wake, sizeof(last_wake), 0444);
 MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened, SPM wake reason, cycle failed, pmic read failed, display on");
