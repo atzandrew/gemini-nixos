@@ -123,6 +123,10 @@ static bool vproc2_off;
 module_param(vproc2_off, bool, 0644);
 MODULE_PARM_DESC(vproc2_off, "mode 1: VPROC2 (DA9214 BUCKB) off if the A72 cluster is torn down (power test, ~43 mA; default OFF: suspends entered with it already off hung, 3 of 5); NOT restored, the next boot re-powers it");
 
+static uint vproc2_sleep_mv;
+module_param(vproc2_sleep_mv, uint, 0644);
+MODULE_PARM_DESC(vproc2_sleep_mv, "mode 1: VPROC2 (DA9214 BUCKB, rail kept on) to this many mV (300..1000) for the suspend if the A72 cluster is torn down (~35-40 mA, A/B 2026-10-18); restored in .finish; 0 = leave");
+
 static uint ldo_lp;
 module_param(ldo_lp, uint, 0644);
 MODULE_PARM_DESC(ldo_lp, "mode 1: MT6351 LDOs in low-power mode while asleep, bitmask: 1 VA18, 2 VA10, 4 VUSB33, 8 VLDO28, 0x10 VIO28, 0x20 VIO18 (power test)");
@@ -353,11 +357,14 @@ static void unpin_domains(void)
 #define RT5735_EN		BIT(7)
 #define VGPU_LOW_SEL		0x27		/* 600 mV + 39 * 6.25 mV = 843.75 mV */
 #define DA9211_BUCKB_CONT	0x5e
+#define DA9214_VBUCKB_A		0xd9	/* [7] SL_A, [6:0] 300 mV + 10 mV * n */
 #define SPM_CL2_218		0x218
 #define SPM_EXT_BUCK_ISO	0x290
 
 static struct regmap *vgpu_map;
 static unsigned int vgpu_saved;
+static struct regmap *vproc2_map;
+static unsigned int vproc2_saved;
 
 static struct regmap *i2c_regmap(const char *name)
 {
@@ -392,6 +399,31 @@ static void bucks_down(void)
 			pr_info(TAG "VGPU VSEL0 %02x -> %02x\n", vgpu_saved, RT5735_EN | VGPU_LOW_SEL);
 		}
 	}
+	/*
+	 * VPROC2 low voltage, rail kept on (no rail-off/re-power path): the sleep saving is the
+	 * voltage, not phases or mode (e-series 2026-10-18: 1 phase, auto 1-phase: 0 mA;
+	 * 0.6 V + 1 phase -33 mA; 0.3 V + 1 phase -40 mA). Same writes as da9214-test.
+	 */
+	if (vproc2_sleep_mv && !vproc2_off) {
+		u32 iso = rd(SPM_EXT_BUCK_ISO), con = rd(SPM_CL2_218);
+		unsigned int sel = (vproc2_sleep_mv - 300) / 10;
+
+		vproc2_map = i2c_regmap("2-0068");
+		if (vproc2_sleep_mv < 300 || vproc2_sleep_mv > 1000 || cpu_online(8) || cpu_online(9) ||
+		    !(iso & BIT(1)) || (con & BIT(0)) || !vproc2_map ||
+		    regmap_read(vproc2_map, DA9214_VBUCKB_A, &vproc2_saved)) {
+			pr_warn(TAG "vproc2_sleep_mv skipped (%u mV, cpu8/9 %d%d, ISO %08x, 218 %08x, map %d)\n",
+				vproc2_sleep_mv, cpu_online(8), cpu_online(9), iso, con, !!vproc2_map);
+			vproc2_map = NULL;
+		} else if (regmap_update_bits(vproc2_map, DA9214_VBUCKB_A, 0x7f, sel)) {
+			pr_warn(TAG "vproc2_sleep_mv: write failed\n");
+			regmap_write(vproc2_map, DA9214_VBUCKB_A, vproc2_saved);
+			vproc2_map = NULL;
+		} else {
+			pr_info(TAG "VPROC2 VBUCKB_A %02x -> %02x (%u mV)\n", vproc2_saved,
+				(vproc2_saved & 0x80) | sel, 300 + sel * 10);
+		}
+	}
 	if (vproc2_off) {
 		u32 iso = rd(SPM_EXT_BUCK_ISO), con = rd(SPM_CL2_218);
 		struct regmap *map = i2c_regmap("2-0068");
@@ -410,6 +442,13 @@ static void bucks_down(void)
 
 static void bucks_up(void)
 {
+	if (vproc2_map) {
+		/* cluster stays off (cpu8/9 never come back after SPM): no settle needed */
+		int ret = regmap_write(vproc2_map, DA9214_VBUCKB_A, vproc2_saved);
+
+		pr_info(TAG "VPROC2 VBUCKB_A restored %02x: %d\n", vproc2_saved, ret);
+		vproc2_map = NULL;
+	}
 	if (!vgpu_map)
 		return;
 	regmap_write(vgpu_map, RT5735_VSEL0, vgpu_saved);
