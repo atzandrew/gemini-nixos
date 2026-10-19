@@ -14,6 +14,9 @@
  *   (TOPSTATUS over the pwrap WACS2 port) and the lid (GPIO66), go back to
  *   sleep if nothing changed. Leaves .enter on a key press, the lid
  *   opening, a non-timer SPM wake reason, a failed cycle, or after max_s.
+ *   The reason is left in the last_wake parameter (Debian powers off on
+ *   "max_s", the unattended-suspend cap). .prepare refuses while the
+ *   display is still on (disp_check).
  *   Caller's job (userspace hook for now): panel DCS 0x28/0x29, connsys
  *   off, cpu8/9 offline (CPU_ON(8) hangs after SPM sleep).
  *
@@ -155,6 +158,22 @@ module_param(pdn_apsb, uint, 0644);
 static char *fw = "mt6797-spm/pcm_suspend.bin";
 module_param(fw, charp, 0444);
 
+/*
+ * The prep hook turns the display off before the suspend, but a compositor
+ * that starts or wakes in the meantime (2026-10-18: the SDDM greeter, 0.3 s
+ * after the hook's check) re-enables OVL0 layer 0 and the backlight, and the
+ * panel stays lit all night. .prepare runs with all tasks frozen, so nothing
+ * can turn it back on after this check.
+ */
+static bool disp_check = true;
+module_param(disp_check, bool, 0644);
+MODULE_PARM_DESC(disp_check, "mode 1: refuse the suspend while OVL0 layer 0 (the display) is on");
+
+/* Read by the prep hook after resume: "max_s" = the cap ended it -> power off. */
+static char last_wake[24] = "none";
+module_param_string(last_wake, last_wake, sizeof(last_wake), 0444);
+MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened, SPM wake reason, cycle failed, pmic read failed, display on");
+
 /* ---------------------------------------------------------------- registers */
 #define SPM_PHYS		0x10006000
 #define INFRA_AO_PHYS		0x10001000
@@ -181,6 +200,8 @@ module_param(fw, charp, 0444);
 #define MT6351_TOPSTATUS	0x220		/* bit1 PWRKEY_DEB, bit2 HOMEKEY_DEB, active low */
 #define KEYS_MASK		(BIT(1) | BIT(2))
 #define GPIO_PHYS		0x10005000
+#define OVL0_PHYS		0x1400b000
+#define OVL_SRC_CON		0x02c		/* bit0 = layer 0 enable (geminipda-drm CRTC on) */
 #define GPIO_DIN(pin)		(0x200 + 0x10 * ((pin) / 32))
 #define LID_GPIO		66		/* hall, low = lid closed */
 #define GPIO_DOUT(pin)		(0x100 + 0x10 * ((pin) / 32))
@@ -277,7 +298,7 @@ struct pcm_tail {			/* struct pcm_desc from .size on */
 	u32 vec[16];
 } __packed;
 
-static void __iomem *spm, *pwrap, *gpio, *gicd, *wdt;
+static void __iomem *spm, *pwrap, *gpio, *gicd, *wdt, *ovl;
 static struct platform_device *pdev;
 static struct page *page;
 static unsigned int page_order;
@@ -933,6 +954,13 @@ static int gem_suspend_prepare(void)
 
 	if (mode != 1)
 		return 0;
+	strscpy(last_wake, "none", sizeof(last_wake));
+	if (disp_check && (readl(ovl + OVL_SRC_CON) & BIT(0))) {
+		pr_warn(TAG "display still on (OVL0 SRC_CON %08x) - refusing\n",
+			readl(ovl + OVL_SRC_CON));
+		strscpy(last_wake, "display on", sizeof(last_wake));
+		return -EBUSY;
+	}
 	cr_susp++;
 	cr_n = 0;
 	crumb(CR_PREPARE);
@@ -1061,6 +1089,7 @@ static int gem_suspend_enter(suspend_state_t state)
 	if ((wdt_pause || wdt_int_rst) && (wdt_mode & WDT_MODE_EN))
 		writel(WDT_MODE_KEY | wdt_mode, wdt + WDT_MODE);
 	crumb(CR_LOOP_EXIT);
+	strscpy(last_wake, why_txt[why], sizeof(last_wake));
 	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
 		why_txt[why], n, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
@@ -1150,7 +1179,9 @@ static void unmap_all(void)
 		iounmap(gicd);
 	if (wdt)
 		iounmap(wdt);
-	spm = pwrap = gpio = gicd = wdt = NULL;
+	if (ovl)
+		iounmap(ovl);
+	spm = pwrap = gpio = gicd = wdt = ovl = NULL;
 }
 
 static int __init gem_suspend_init(void)
@@ -1166,8 +1197,9 @@ static int __init gem_suspend_init(void)
 	gpio = ioremap(GPIO_PHYS, 0x1000);
 	gicd = ioremap(GICD_PHYS, 0x1000);
 	wdt = ioremap(WDT_PHYS, 0x100);
+	ovl = ioremap(OVL0_PHYS, 0x100);
 	infra = ioremap(INFRA_AO_PHYS, 0x1000);
-	if (!spm || !pwrap || !gpio || !gicd || !wdt || !infra) {
+	if (!spm || !pwrap || !gpio || !gicd || !wdt || !ovl || !infra) {
 		ret = -ENOMEM;
 		goto out_map;
 	}
