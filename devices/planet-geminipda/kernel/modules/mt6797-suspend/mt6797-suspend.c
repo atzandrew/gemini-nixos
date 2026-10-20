@@ -47,6 +47,8 @@
  *   (REQ_MODE SPM_SCPSYS, reset mode). WDT_MODE EXTEN is cleared for the
  *   loop so that reset is SoC-only and the breadcrumb survives.
  *   pcm_wdt_test makes it fire 2 s into each sleep (checks the reset path).
+ *   The SoC reset wipes the SPM (checked 2026-10-20), so pcm_wdt_wake uses
+ *   the WDT's wake mode instead, to catch the stuck state in the log.
  *
  * Keys: a short press falls between two polls, so the PMIC key interrupts
  *   are enabled for the suspend (INT_CON0 bits 0-3, as stock) and the
@@ -143,6 +145,9 @@ module_param(pcm_wdt, uint, 0644);
 MODULE_PARM_DESC(pcm_wdt, "mode 1: arm the SPM PCM watchdog each sleep, firing this many s after the PCM timer (stock: 30; 0 = off, max 600); a stuck sleep then resets the SoC");
 static bool pcm_wdt_test;
 module_param(pcm_wdt_test, bool, 0644);
+static bool pcm_wdt_wake;
+module_param(pcm_wdt_wake, bool, 0644);
+MODULE_PARM_DESC(pcm_wdt_wake, "with pcm_wdt: the PCM watchdog wakes (R12 bit 13) instead of resetting, so a stuck sleep is logged (state dump); combine with wdt_pause=0 wdt_int_rst=1 as reset backstop");
 MODULE_PARM_DESC(pcm_wdt_test, "with pcm_wdt: fire the PCM watchdog 2 s into each sleep (forced reset, tests the path; use cycles > 2 s)");
 
 static bool vgpu_low;
@@ -313,6 +318,8 @@ MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened,
 #define SPM_SYSCLK_SETTLE	99		/* 32 kHz ticks = 3 ms */
 #define R12_PCM_TIMER		BIT(0)
 #define R12_EINT_EVENT_B	BIT(6)		/* pcm_def_mt6797.h */
+#define R12_PCM_WDT_WAKEUP_B	BIT(13)
+#define PCM_WDT_OUT		0x154
 
 /* EINT controller (vendor "mediatek,mt-eic"; same layout as mainline mtk-eint) */
 #define EINT_PHYS		0x1000b000
@@ -797,6 +804,7 @@ static irqreturn_t spm_isr(int irq, void *dev)
 struct cyc {
 	int refused, returned, pm_ret, psci_ret;
 	u32 r12, timer_out, r13, dbg;
+	u32 r15, fsm, pwr, pwr2, wsta, tout, wout, irqsta;	/* raw state before the PCM reset */
 };
 
 /*
@@ -832,7 +840,7 @@ static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 		wr(PCM_CON1, KEY | c1);
 		wr(PCM_WDT_VAL_OFF, pcm_wdt_test ? 2 * 32768 :
 		   rd(PCM_TIMER_VAL) + min(pcm_wdt, 600U) * 32768);
-		wr(PCM_CON1, KEY | c1 | PCM_WDT_EN);
+		wr(PCM_CON1, KEY | c1 | PCM_WDT_EN | (pcm_wdt_wake ? PCM_WDT_WAKE_MODE : 0));
 	}
 	wr(SPM_WAKEUP_EVENT_MASK, ~wmask);
 	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
@@ -885,6 +893,14 @@ static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 	r->timer_out = rd(SPM_BSI_D1_SR);
 	r->r13 = rd(PCM_REG13_DATA);
 	r->dbg = rd(SPM_SW_DEBUG);
+	r->r15 = rd(PCM_REG15_DATA);
+	r->fsm = rd(PCM_FSM_STA);
+	r->pwr = rd(SPM_PWR_STATUS);
+	r->pwr2 = rd(SPM_PWR_STATUS_2ND);
+	r->wsta = rd(SPM_WAKEUP_STA);
+	r->tout = rd(PCM_TIMER_OUT);
+	r->wout = rd(PCM_WDT_OUT);
+	r->irqsta = rd(SPM_IRQ_STA);
 out:
 	wr(SPM_CPU_WAKEUP_EVENT, 0);
 	wr(SPM_WAKEUP_EVENT_MASK, ~0U);
@@ -1137,6 +1153,8 @@ static int gem_suspend_enter(suspend_state_t state)
 	 * Long cycles only with the WDT stopped: it fires after 31 s
 	 * (wdt_pause=0 hang hunting keeps the poll_ms cycles).
 	 */
+	if (pcm_wdt && pcm_wdt_wake)
+		wmask |= R12_PCM_WDT_WAKEUP_B;
 	if (lid_eint && wake_lid && lid0 && (wdt_pause || !(wdt_mode & WDT_MODE_EN))) {
 		lid_eint_arm();
 		armed = true;
@@ -1168,7 +1186,8 @@ static int gem_suspend_enter(suspend_state_t state)
 			break;
 		}
 		asleep_ms += (u32)div_u64((u64)r.timer_out * 1000, 32768);
-		if (r.r12 & ~(R12_PCM_TIMER | (armed ? R12_EINT_EVENT_B : 0))) {
+		if ((r.r12 & ~(R12_PCM_TIMER | (armed ? R12_EINT_EVENT_B : 0))) ||
+		    (r.wsta & R12_PCM_WDT_WAKEUP_B)) {
 			why = 3;
 			break;
 		}
@@ -1238,6 +1257,8 @@ static int gem_suspend_enter(suspend_state_t state)
 		first.r12, first.r13, first.dbg,
 		last.refused ? "REFUSED" : last.returned ? "ret" : "NO-RET", last.psci_ret,
 		last.r12, last.r13, last.dbg, last.timer_out);
+	pr_info(TAG "  last raw: R15(PC) %08x FSM %08x PWR %08x/%08x WAKEUP_STA %08x TIMER_OUT %08x WDT_OUT %08x IRQ_STA %08x\n",
+		last.r15, last.fsm, last.pwr, last.pwr2, last.wsta, last.tout, last.wout, last.irqsta);
 	return 0;
 }
 
