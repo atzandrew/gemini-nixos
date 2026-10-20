@@ -114,3 +114,27 @@ returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
 - Panel: two screen burns (2026-10-17/18) during test series that woke the
   panel to the static lock screen between every suspend. `hunt.sh` now keeps
   it display-off for the whole series (cf32b26).
+
+## Lid EINT wake (2026-10-20)
+- The hall sensor (GPIO66) has an EINT function: mode 1 = EINT5 (vendor
+  DWS: HALL = EINT5, level, active low; pinctrl-mtk-mt6797.h: GPIO61-68 =
+  EINT0-7, GPIO85-93 = EINT8-16, so the keyboard INT GPIO87 = EINT10).
+  Mainline leaves GPIO66 in mode 0, and nothing programs the EINT block at
+  0x1000b000 (GIC SPI 170; same register layout as mainline mtk-eint): at
+  boot every EINT is masked and none is routed to the AP (D0EN = 0).
+- GPIO DIN still reads the lid with the pin in mode 1.
+- The SPM EINT wake is R12 bit 6 (`R12_EINT_EVENT_B`, pcm_def_mt6797.h);
+  stock suspend unmasks it.
+- `mt6797-suspend lid_eint=1` (default): when the lid is shut at entry,
+  GPIO66 goes to mode 1, EINT5 is set level / active high (= lid open),
+  routed and unmasked, and R12 bit 6 is added to the SPM wake mask. The
+  PCM timer becomes a 60 s safety net (`lid_poll_ms`). An EINT wake with
+  the lid still shut counts as a glitch and the loop sleeps on. All of it
+  is restored after the loop. Lid open at entry, or the WDT left running
+  (`wdt_pause=0`, 31 s), keeps the 2 s `poll_ms` cycles.
+- Test: 9.5 min asleep in 10 cycles (was ~285), lid open woke it at once
+  (r12 0x40), 0 glitches. Power with EINT armed: not yet measured cleanly.
+- Why: the random hang (above) looks per-cycle, so ~30x fewer wake-ups
+  should mean ~30x fewer hangs per hour asleep. Not yet measured.
+- Keys are only checked once per cycle while armed (lid shut = keyboard
+  unreachable; opening the lid wakes it).
