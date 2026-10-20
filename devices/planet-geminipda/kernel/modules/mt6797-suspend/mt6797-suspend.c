@@ -16,6 +16,13 @@
  *   opening, a non-timer SPM wake reason, a failed cycle, or after max_s.
  *   The reason is left in the last_wake parameter. .prepare refuses while
  *   the display is still on (disp_check).
+ *   Lid EINT (lid_eint, 2026-10-20): when the lid is shut at entry, the
+ *   hall pin GPIO66 is switched to its EINT5 function (vendor DWS: HALL =
+ *   EINT5) and EINT5 is set to fire on "lid open" and unmasked as an SPM
+ *   wake source (R12 bit 6), so opening the lid wakes the SPM at once and
+ *   the PCM timer only needs to be a slow safety net (lid_poll_ms). Nothing
+ *   in Linux owns the EINT block (mainline pinctrl-mt6797 has no EINT) and
+ *   its GIC line (SPI 170) stays disabled; everything is put back after.
  *   Caller's job (userspace hook for now): panel DCS 0x28/0x29, connsys
  *   off, cpu8/9 offline (CPU_ON(8) hangs after SPM sleep).
  *
@@ -104,6 +111,14 @@ MODULE_PARM_DESC(wake_keys, "mode 1: wake on Esc/On or the silver key");
 static bool wake_lid = true;
 module_param(wake_lid, bool, 0644);
 MODULE_PARM_DESC(wake_lid, "mode 1: wake when the lid opens (only if it was closed at entry)");
+
+static bool lid_eint = true;
+module_param(lid_eint, bool, 0644);
+MODULE_PARM_DESC(lid_eint, "mode 1: lid shut at entry -> lid opening wakes the SPM directly (EINT5), cycles of lid_poll_ms");
+
+static uint lid_poll_ms = 60000;
+module_param(lid_poll_ms, uint, 0644);
+MODULE_PARM_DESC(lid_poll_ms, "mode 1, lid EINT armed: SPM sleep per cycle (ms, 100..600000); keys are only checked this often");
 
 static bool touch_rst;
 module_param(touch_rst, bool, 0644);
@@ -279,6 +294,25 @@ MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened,
 #define CLK_CON_VENDOR_INIT	0x0801104C
 #define SPM_SYSCLK_SETTLE	99		/* 32 kHz ticks = 3 ms */
 #define R12_PCM_TIMER		BIT(0)
+#define R12_EINT_EVENT_B	BIT(6)		/* pcm_def_mt6797.h */
+
+/* EINT controller (vendor "mediatek,mt-eic"; same layout as mainline mtk-eint) */
+#define EINT_PHYS		0x1000b000
+#define EINT_STA		0x000
+#define EINT_ACK		0x040
+#define EINT_MASK		0x080
+#define EINT_MASK_SET		0x0c0
+#define EINT_MASK_CLR		0x100
+#define EINT_SENS		0x140		/* 1 = level */
+#define EINT_SENS_SET		0x180
+#define EINT_SENS_CLR		0x1c0
+#define EINT_POL		0x300
+#define EINT_POL_SET		0x340		/* 1 = active high */
+#define EINT_POL_CLR		0x380
+#define EINT_D0EN		0x400		/* route to the AP domain */
+#define LID_EINT		5		/* GPIO66 mode 1 */
+#define GPIO_MODE66		0x380		/* GPIO64..71, 4 bits each */
+#define GPIO_MODE66_SHIFT	8
 
 #define GICD_PHYS		0x19000000
 #define GICD_IPRIORITYR		0x400
@@ -297,7 +331,7 @@ struct pcm_tail {			/* struct pcm_desc from .size on */
 	u32 vec[16];
 } __packed;
 
-static void __iomem *spm, *pwrap, *gpio, *gicd, *wdt, *ovl;
+static void __iomem *spm, *pwrap, *gpio, *gicd, *wdt, *ovl, *eint;
 static struct platform_device *pdev;
 static struct page *page;
 static unsigned int page_order;
@@ -543,6 +577,48 @@ static bool lid_closed(void)
 	return !(readl(gpio + GPIO_DIN(LID_GPIO)) & BIT(LID_GPIO % 32));
 }
 
+/*
+ * Lid EINT, armed only for a suspend that starts with the lid shut. Called
+ * from .enter (cpu0 alone, IRQs off), so plain read-modify-writes are safe.
+ * DIN still reads the lid with the pin in mode 1 (checked 2026-10-20).
+ */
+static struct { u32 mode, d0en; bool pol, sens, masked; } lid_sv;
+
+static void lid_eint_arm(void)
+{
+	u32 m = readl(gpio + GPIO_MODE66), b = BIT(LID_EINT);
+
+	lid_sv.mode = m;
+	lid_sv.d0en = readl(eint + EINT_D0EN);
+	lid_sv.pol = readl(eint + EINT_POL) & b;
+	lid_sv.sens = readl(eint + EINT_SENS) & b;
+	lid_sv.masked = readl(eint + EINT_MASK) & b;
+
+	writel(b, eint + EINT_MASK_SET);
+	m &= ~(0xfU << GPIO_MODE66_SHIFT);
+	writel(m | (1U << GPIO_MODE66_SHIFT), gpio + GPIO_MODE66);
+	writel(b, eint + EINT_SENS_SET);	/* level: stays set while the lid is open */
+	writel(b, eint + EINT_POL_SET);		/* active high = lid open */
+	writel(lid_sv.d0en | b, eint + EINT_D0EN);
+	writel(b, eint + EINT_ACK);
+	writel(b, eint + EINT_MASK_CLR);
+}
+
+static void lid_eint_disarm(void)
+{
+	u32 b = BIT(LID_EINT);
+
+	writel(b, eint + EINT_MASK_SET);
+	writel(b, eint + EINT_ACK);
+	writel(b, lid_sv.pol ? eint + EINT_POL_SET : eint + EINT_POL_CLR);
+	if (!lid_sv.sens)
+		writel(b, eint + EINT_SENS_CLR);
+	writel(lid_sv.d0en, eint + EINT_D0EN);
+	writel(lid_sv.mode, gpio + GPIO_MODE66);
+	if (!lid_sv.masked)
+		writel(b, eint + EINT_MASK_CLR);
+}
+
 /* ------------------------------------------------------------ PMIC LDOs */
 /*
  * Power test (2026-10-17). Stock (mt_spm.c spm_pmic_power_mode SUSPEND)
@@ -709,7 +785,7 @@ struct cyc {
  * One SPM sleep (mt6797-spm-load sleep_work, pdn=1, no ACINACTM). Called
  * from .enter: cpu0 alone, IRQs off.
  */
-static void spm_sleep_once(struct cyc *r)
+static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 {
 	u32 con0, i, swflag, pmr_old;
 	u64 cval;
@@ -730,9 +806,9 @@ static void spm_sleep_once(struct cyc *r)
 	wr(AP_STANDBY_CON, (rd(AP_STANDBY_CON) & ~0x7fU) | (pdn_apsb & 0x7f));
 	for (i = 0; i < 10; i++)
 		wr(MP0_CPU0_WFI_EN + 4 * i, i == 0);
-	wr(PCM_TIMER_VAL, poll_ms * 32768 / 1000);
+	wr(PCM_TIMER_VAL, (u32)div_u64((u64)ms * 32768, 1000));
 	wr(PCM_CON1, (rd(PCM_CON1) & 0xffff) | KEY | PCM_TIMER_EN);
-	wr(SPM_WAKEUP_EVENT_MASK, ~wake_unmask);
+	wr(SPM_WAKEUP_EVENT_MASK, ~wmask);
 	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
 	wr(SPM_SW_INT_CLEAR, 0x3ff);
 	wr(SPM_IRQ_MASK, ISRM_TWAM | ISRM_RET_IRQ_AUX);
@@ -963,8 +1039,9 @@ static int gem_suspend_prepare(void)
 	cr_susp++;
 	cr_n = 0;
 	crumb(CR_PREPARE);
-	if (poll_ms < 100 || poll_ms > 5000 || (io_en != 0x80 && io_en != 0x81)) {
-		pr_err(TAG "bad poll_ms/io_en\n");
+	if (poll_ms < 100 || poll_ms > 5000 || lid_poll_ms < 100 || lid_poll_ms > 600000 ||
+	    (io_en != 0x80 && io_en != 0x81)) {
+		pr_err(TAG "bad poll_ms/lid_poll_ms/io_en\n");
 		return -EINVAL;
 	}
 	bucks_down();
@@ -983,8 +1060,8 @@ static int gem_suspend_enter(suspend_state_t state)
 {
 	struct cyc r, first = {}, last = {};
 	u64 frq = read_sysreg(cntfrq_el0), t0 = read_sysreg(cntvct_el0);
-	u32 n = 0, top = 0, kint = 0, asleep_ms = 0, wdt_mode;
-	bool lid0;
+	u32 n = 0, top = 0, kint = 0, asleep_ms = 0, wdt_mode, cyc_ms = poll_ms, wmask = wake_unmask, glitch = 0;
+	bool lid0, armed = false;
 	int why = 0, ret;
 
 	pr_info(TAG "enter: cpu%d, %u cpus online, PWR_STATUS %08x\n",
@@ -1020,6 +1097,16 @@ static int gem_suspend_enter(suspend_state_t state)
 		ldo_lp_set(true);
 		ldo_lp_log();
 	}
+	/*
+	 * Long cycles only with the WDT stopped: it fires after 31 s
+	 * (wdt_pause=0 hang hunting keeps the poll_ms cycles).
+	 */
+	if (lid_eint && wake_lid && lid0 && (wdt_pause || !(wdt_mode & WDT_MODE_EN))) {
+		lid_eint_arm();
+		armed = true;
+		cyc_ms = lid_poll_ms;
+		wmask |= R12_EINT_EVENT_B;
+	}
 	for (;;) {
 		wdt_feed();
 		cr_n = n;
@@ -1033,7 +1120,7 @@ static int gem_suspend_enter(suspend_state_t state)
 			if (!n)
 				ldo_lp_log();
 		}
-		spm_sleep_once(&r);
+		spm_sleep_once(&r, cyc_ms, wmask);
 		if (ldo_lp_mode == 1)
 			ldo_lp_set(false);
 		if (!n)
@@ -1044,10 +1131,18 @@ static int gem_suspend_enter(suspend_state_t state)
 			why = 4;
 			break;
 		}
-		asleep_ms += r.timer_out * 1000 / 32768;
-		if (r.r12 & ~R12_PCM_TIMER) {
+		asleep_ms += (u32)div_u64((u64)r.timer_out * 1000, 32768);
+		if (r.r12 & ~(R12_PCM_TIMER | (armed ? R12_EINT_EVENT_B : 0))) {
 			why = 3;
 			break;
+		}
+		if (armed && (r.r12 & R12_EINT_EVENT_B)) {
+			if (!lid_closed()) {
+				why = 2;
+				break;
+			}
+			glitch++;	/* still shut: clear it, sleep on */
+			writel(BIT(LID_EINT), eint + EINT_ACK);
 		}
 		if (wake_keys) {
 			ret = pmic_read(MT6351_TOPSTATUS, &top);
@@ -1076,6 +1171,8 @@ static int gem_suspend_enter(suspend_state_t state)
 		mdelay(gap_ms);
 	}
 
+	if (armed)
+		lid_eint_disarm();
 	pmic_misc_restore();
 	ldo_lp_set(false);
 	if (ldo_lp_on)
@@ -1089,10 +1186,11 @@ static int gem_suspend_enter(suspend_state_t state)
 		writel(WDT_MODE_KEY | wdt_mode, wdt + WDT_MODE);
 	crumb(CR_LOOP_EXIT);
 	strscpy(last_wake, why_txt[why], sizeof(last_wake));
-	pr_info(TAG "woke: %s after %u cycles, ~%u s asleep / %llu s in enter; lid %s at entry; TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
-		why_txt[why], n, asleep_ms / 1000,
+	pr_info(TAG "woke: %s after %u cycles of %u ms, ~%u s asleep / %llu s in enter; lid %s at entry%s (%u glitches); TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
+		why_txt[why], n, cyc_ms, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
-		lid0 ? "closed" : "open", top, kint, touch_rst ? "; touch held in reset" : "",
+		lid0 ? "closed" : "open", armed ? ", lid EINT" : "", glitch,
+		top, kint, touch_rst ? "; touch held in reset" : "",
 		readl(wdt + WDT_MODE) & 0xff, wdt_pause ? " (paused in loop)" : "");
 	pr_info(TAG "  first: %s psci %d r12 %08x r13 %08x dbg %08x | last: %s psci %d r12 %08x r13 %08x dbg %08x timer_out %u\n",
 		first.refused ? "REFUSED" : first.returned ? "ret" : "NO-RET", first.psci_ret,
@@ -1180,7 +1278,9 @@ static void unmap_all(void)
 		iounmap(wdt);
 	if (ovl)
 		iounmap(ovl);
-	spm = pwrap = gpio = gicd = wdt = ovl = NULL;
+	if (eint)
+		iounmap(eint);
+	spm = pwrap = gpio = gicd = wdt = ovl = eint = NULL;
 }
 
 static int __init gem_suspend_init(void)
@@ -1197,8 +1297,9 @@ static int __init gem_suspend_init(void)
 	gicd = ioremap(GICD_PHYS, 0x1000);
 	wdt = ioremap(WDT_PHYS, 0x100);
 	ovl = ioremap(OVL0_PHYS, 0x100);
+	eint = ioremap(EINT_PHYS, 0x1000);
 	infra = ioremap(INFRA_AO_PHYS, 0x1000);
-	if (!spm || !pwrap || !gpio || !gicd || !wdt || !ovl || !infra) {
+	if (!spm || !pwrap || !gpio || !gicd || !wdt || !ovl || !eint || !infra) {
 		ret = -ENOMEM;
 		goto out_map;
 	}
@@ -1261,8 +1362,8 @@ static int __init gem_suspend_init(void)
 
 	pmic_read(MT6351_TOPSTATUS, &top);
 	suspend_set_ops(&gem_suspend_ops);
-	pr_info(TAG "deep suspend registered (mode %u, poll %u ms, gap %u ms, max_s %u); fw %u words, IM_PTR %08x; TOPSTATUS %04x, lid %s\n",
-		mode, poll_ms, gap_ms, max_s, im_words, im_ptr, top, lid_closed() ? "closed" : "open");
+	pr_info(TAG "deep suspend registered (mode %u, poll %u ms, lid EINT %s %u ms, gap %u ms, max_s %u); fw %u words, IM_PTR %08x; TOPSTATUS %04x, lid %s\n",
+		mode, poll_ms, lid_eint ? "on" : "off", lid_poll_ms, gap_ms, max_s, im_words, im_ptr, top, lid_closed() ? "closed" : "open");
 	return 0;
 
 out_fw:
