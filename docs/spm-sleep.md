@@ -1,5 +1,25 @@
 # SPM sleep on the Gemini (MT6797)
 
+## Current status (2026-10-20)
+- **No sleep longer than 9.5 min has ever woken up**, on any image or module
+  (longest successful: 567 s; then 300 s). Every lid-shut sleep of about
+  10 min or more since the 2026-10-19 Debian image hung (7 of 8), with the
+  2 s polling module (dc1fd99) and with lid EINT (607419c) alike. Short sleeps
+  (seconds to ~5 min) are reliable. A hang needs a ~22 s power-button hold;
+  nothing is logged after "PM: suspend entry".
+- Power: ~208 mA comes only from 30 s test runs (2026-10-18). No long sleep
+  has been measured. Lid-EINT sleeps read ~0.5–1.2 A on the 1 % gauge
+  (unexplained, unconfirmed).
+- Lid EINT wake works mechanically but is **not usable** (see that section).
+- Screen burns: 5 incidents (10-16, 10-17, 10-18, 10-18 night with the panel
+  lit under a suspend, 10-20 after a hang). Strongest lead: stock powers the
+  panel's bias supply off in suspend and we never do
+  (`stock-suspend-mt6797.md`).
+- What stock suspend does that we skip, and the public MT6797 documents:
+  [`stock-suspend-mt6797.md`](stock-suspend-mt6797.md).
+
+## History
+
 Status 2026-10-14: **step 3e closed.** The SPM (System Power Manager) runs the
 vendor suspend firmware from our test module `mt6797-spm-load`, and the CPU
 cluster now powers down and is woken by the SPM the way stock suspend does it.
@@ -95,8 +115,15 @@ returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
   it to 3.0 V and brown out below ~50 %; charge first.
 - After a WDT reset the bootloader once stalled polling SPM registers (ATF
   WDT dump at 0x7FF6A000, PC in LK) and needed a second reset.
-- Way forward: fewer wake cycles (EINT wake for keys/lid, longer or no PCM
-  timer) and observability at the hang (SPM/ATF state), not more A/B runs.
+- Way forward (as written 2026-10-18): fewer wake cycles (EINT wake for
+  keys/lid, longer or no PCM timer) and observability at the hang (SPM/ATF
+  state), not more A/B runs.
+- **Correction 2026-10-20:** the 1-in-500 rate comes only from short runs
+  (30–180 s) with the WDT running. With the WDT paused (everyday setting),
+  sleeps of ~10 min or more hang almost every time, whether the cycles are
+  2 s or 60 s, so the long-sleep hang is not "per cycle" and fewer cycles
+  did not help. The 30 min everyday baseline planned on 10-18 was never run.
+  The two may be separate problems.
 
 ## VPROC2 low voltage in sleep (2026-10-18)
 - The DA9214 BUCKB rail (VPROC2, A72 cluster) stays on at 1.00 V after the
@@ -133,8 +160,21 @@ returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
   is restored after the loop. Lid open at entry, or the WDT left running
   (`wdt_pause=0`, 31 s), keeps the 2 s `poll_ms` cycles.
 - Test: 9.5 min asleep in 10 cycles (was ~285), lid open woke it at once
-  (r12 0x40), 0 glitches. Power with EINT armed: not yet measured cleanly.
-- Why: the random hang (above) looks per-cycle, so ~30x fewer wake-ups
-  should mean ~30x fewer hangs per hour asleep. Not yet measured.
+  (r12 0x40), 0 glitches.
+- Why it was built: the random hang (above) looked per-cycle, so ~30x fewer
+  wake-ups should have meant ~30x fewer hangs.
+- **Result 2026-10-20: not usable.** Six 1–3 min sleeps woke fine. Of five
+  sleeps of ~10 min or more, four hung (60 s cycles: 10:49, 11:49, 12:47;
+  EINT armed with 2 s cycles: 13:02). The plain 2 s module hangs on long
+  sleeps too (10-19 17:18, 10-20 07:54), so EINT is not the cause of the
+  hang, and the fewer-cycles idea did not help. The 1 % gauge read ~0.5–1.2 A
+  over EINT sleeps (vs ~208 mA from old 30 s runs; not cross-checked). One
+  60 s cycle ended "pmic read failed" (12:40:52). Breadcrumbs cannot catch a
+  hang in this mode: the 60 s cycles need the TOPRGU WDT paused, and the
+  power-hold wipes NONRST_REG2.
+- 607419c was installed as the everyday module on 2026-10-20 (11:34) during
+  testing. Planned first step next: back to the last pre-EINT module
+  (fddf570 = dc1fd99 + display check/last_wake 3bc40af), which is what the
+  2026-10-19 Debian image shipped.
 - Keys are only checked once per cycle while armed (lid shut = keyboard
   unreachable; opening the lid wakes it).
