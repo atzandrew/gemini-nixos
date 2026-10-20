@@ -41,6 +41,12 @@
  *   suspend hang (seen with VPROC2 on too) caught by the WDT. Hang
  *   hunting: wdt_pause=0 wdt_int_rst=1 + breadcrumbs in NONRST_REG2
  *   (crumbs, default on; bin/sleep-tests/hunt.sh).
+ *   PCM WDT (pcm_wdt, 2026-10-20, as stock __spm_set_pcm_wdt): each SPM
+ *   sleep also arms the SPM's own watchdog at PCM_TIMER_VAL + pcm_wdt s.
+ *   If the sleep has not ended by then, the SPM asks TOPRGU for a reset
+ *   (REQ_MODE SPM_SCPSYS, reset mode). WDT_MODE EXTEN is cleared for the
+ *   loop so that reset is SoC-only and the breadcrumb survives.
+ *   pcm_wdt_test makes it fire 2 s into each sleep (checks the reset path).
  *
  * Keys: a short press falls between two polls, so the PMIC key interrupts
  *   are enabled for the suspend (INT_CON0 bits 0-3, as stock) and the
@@ -112,7 +118,7 @@ static bool wake_lid = true;
 module_param(wake_lid, bool, 0644);
 MODULE_PARM_DESC(wake_lid, "mode 1: wake when the lid opens (only if it was closed at entry)");
 
-static bool lid_eint = true;
+static bool lid_eint;	/* off 2026-10-20: long sleeps hang, ~0.5-1.2 A armed */
 module_param(lid_eint, bool, 0644);
 MODULE_PARM_DESC(lid_eint, "mode 1: lid shut at entry -> lid opening wakes the SPM directly (EINT5), cycles of lid_poll_ms");
 
@@ -132,6 +138,12 @@ MODULE_PARM_DESC(crumbs, "write a progress breadcrumb to TOPRGU NONRST_REG2 (0x1
 static bool wdt_int_rst;
 module_param(wdt_int_rst, bool, 0644);
 MODULE_PARM_DESC(wdt_int_rst, "mode 1, wdt_pause=0: clear WDT_MODE EXTEN for the loop, so a WDT reset resets the SoC only (no PMIC cold reset; keeps NONRST_REG2, maybe DRAM)");
+static uint pcm_wdt;
+module_param(pcm_wdt, uint, 0644);
+MODULE_PARM_DESC(pcm_wdt, "mode 1: arm the SPM PCM watchdog each sleep, firing this many s after the PCM timer (stock: 30; 0 = off, max 600); a stuck sleep then resets the SoC");
+static bool pcm_wdt_test;
+module_param(pcm_wdt_test, bool, 0644);
+MODULE_PARM_DESC(pcm_wdt_test, "with pcm_wdt: fire the PCM watchdog 2 s into each sleep (forced reset, tests the path; use cycles > 2 s)");
 
 static bool vgpu_low;
 module_param(vgpu_low, bool, 0644);
@@ -211,6 +223,12 @@ MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened,
 #define WDT_MODE_EN		BIT(0)
 #define WDT_MODE_EXTEN		BIT(2)	/* reset also via WDTRSTB -> PMIC cold reset */
 #define WDT_NONRST2		0x24	/* survives WDT resets; unused by LK/preloader (bit15 of NONRST = DL flag) */
+#define WDT_STA			0x0c		/* reset cause: bit31 HW WDT, bit30 SW, bit1 SPM WDT */
+#define WDT_REQ_MODE		0x30
+#define WDT_REQ_MODE_KEY	0x33000000
+#define WDT_REQ_IRQ_EN		0x34
+#define WDT_REQ_IRQ_KEY		0x44000000
+#define WDT_REQ_SPM_SCPSYS	BIT(1)		/* SPM (PCM WDT) reset request: REQ_MODE on, IRQ_EN off = reset */
 #define MT6351_TOPSTATUS	0x220		/* bit1 PWRKEY_DEB, bit2 HOMEKEY_DEB, active low */
 #define KEYS_MASK		(BIT(1) | BIT(2))
 #define GPIO_PHYS		0x10005000
@@ -808,6 +826,14 @@ static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 		wr(MP0_CPU0_WFI_EN + 4 * i, i == 0);
 	wr(PCM_TIMER_VAL, (u32)div_u64((u64)ms * 32768, 1000));
 	wr(PCM_CON1, (rd(PCM_CON1) & 0xffff) | KEY | PCM_TIMER_EN);
+	if (pcm_wdt) {	/* stock __spm_set_pcm_wdt(1): normal (reset) mode, counts from the kick */
+		u32 c1 = rd(PCM_CON1) & 0xffff & ~(PCM_WDT_WAKE_MODE | PCM_WDT_EN);
+
+		wr(PCM_CON1, KEY | c1);
+		wr(PCM_WDT_VAL_OFF, pcm_wdt_test ? 2 * 32768 :
+		   rd(PCM_TIMER_VAL) + min(pcm_wdt, 600U) * 32768);
+		wr(PCM_CON1, KEY | c1 | PCM_WDT_EN);
+	}
 	wr(SPM_WAKEUP_EVENT_MASK, ~wmask);
 	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
 	wr(SPM_SW_INT_CLEAR, 0x3ff);
@@ -864,7 +890,7 @@ out:
 	wr(SPM_WAKEUP_EVENT_MASK, ~0U);
 	wr(SPM_IRQ_STA, rd(SPM_IRQ_STA) & 0x3ff0c);
 	wr(SPM_SW_INT_CLEAR, 0x3ff);
-	wr(PCM_CON1, KEY | (rd(PCM_CON1) & 0xffff & ~PCM_TIMER_EN));
+	wr(PCM_CON1, KEY | (rd(PCM_CON1) & 0xffff & ~(PCM_TIMER_EN | PCM_WDT_EN)));
 	wr(PCM_PWR_IO_EN, 0);
 	pcm_reset();
 	crumb(CR_CYC_DONE);
@@ -1061,6 +1087,7 @@ static int gem_suspend_enter(suspend_state_t state)
 	struct cyc r, first = {}, last = {};
 	u64 frq = read_sysreg(cntfrq_el0), t0 = read_sysreg(cntvct_el0);
 	u32 n = 0, top = 0, kint = 0, asleep_ms = 0, wdt_mode, cyc_ms = poll_ms, wmask = wake_unmask, glitch = 0;
+	u32 loop_mode, req_mode = 0, req_irq = 0;
 	bool lid0, armed = false;
 	int why = 0, ret;
 
@@ -1082,12 +1109,21 @@ static int gem_suspend_enter(suspend_state_t state)
 
 	lid0 = lid_closed();
 	wdt_mode = readl(wdt + WDT_MODE) & 0xff;
-	if (wdt_pause && (wdt_mode & WDT_MODE_EN)) {
+	loop_mode = wdt_mode;
+	if (wdt_pause && (wdt_mode & WDT_MODE_EN))
+		loop_mode &= ~WDT_MODE_EN;
+	else if (wdt_int_rst && (wdt_mode & WDT_MODE_EN))
+		loop_mode &= ~WDT_MODE_EXTEN;
+	if (pcm_wdt) {	/* stock wd_spmwdt_mode_config(WD_REQ_EN, WD_REQ_RST_MODE) */
+		loop_mode &= ~WDT_MODE_EXTEN;	/* SoC-only reset keeps the breadcrumb */
+		req_mode = readl(wdt + WDT_REQ_MODE);
+		req_irq = readl(wdt + WDT_REQ_IRQ_EN);
+		writel(WDT_REQ_IRQ_KEY | (req_irq & 0xffffff & ~WDT_REQ_SPM_SCPSYS), wdt + WDT_REQ_IRQ_EN);
+		writel(WDT_REQ_MODE_KEY | (req_mode & 0xffffff) | WDT_REQ_SPM_SCPSYS, wdt + WDT_REQ_MODE);
+	}
+	if (loop_mode != wdt_mode) {
 		wdt_feed();
-		writel(WDT_MODE_KEY | (wdt_mode & ~WDT_MODE_EN), wdt + WDT_MODE);
-	} else if (wdt_int_rst && (wdt_mode & WDT_MODE_EN)) {
-		wdt_feed();
-		writel(WDT_MODE_KEY | (wdt_mode & ~WDT_MODE_EXTEN), wdt + WDT_MODE);
+		writel(WDT_MODE_KEY | loop_mode, wdt + WDT_MODE);
 	}
 	if (touch_rst)	/* single CPU, IRQs off: plain RMW is safe */
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) & ~BIT(CTP_RST_GPIO % 32),
@@ -1182,16 +1218,21 @@ static int gem_suspend_enter(suspend_state_t state)
 		writel(readl(gpio + GPIO_DOUT(CTP_RST_GPIO)) | BIT(CTP_RST_GPIO % 32),
 		       gpio + GPIO_DOUT(CTP_RST_GPIO));
 	wdt_feed();
-	if ((wdt_pause || wdt_int_rst) && (wdt_mode & WDT_MODE_EN))
+	if (loop_mode != wdt_mode)
 		writel(WDT_MODE_KEY | wdt_mode, wdt + WDT_MODE);
+	if (pcm_wdt) {	/* stock: WD_REQ_DIS after the sleep */
+		writel(WDT_REQ_MODE_KEY | (req_mode & 0xffffff), wdt + WDT_REQ_MODE);
+		writel(WDT_REQ_IRQ_KEY | (req_irq & 0xffffff), wdt + WDT_REQ_IRQ_EN);
+	}
 	crumb(CR_LOOP_EXIT);
 	strscpy(last_wake, why_txt[why], sizeof(last_wake));
-	pr_info(TAG "woke: %s after %u cycles of %u ms, ~%u s asleep / %llu s in enter; lid %s at entry%s (%u glitches); TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s\n",
+	pr_info(TAG "woke: %s after %u cycles of %u ms, ~%u s asleep / %llu s in enter; lid %s at entry%s (%u glitches); TOPSTATUS %04x INT_STATUS0 %04x%s; WDT_MODE %02x%s; PCM WDT %u s%s\n",
 		why_txt[why], n, cyc_ms, asleep_ms / 1000,
 		frq ? div64_u64(read_sysreg(cntvct_el0) - t0, frq) : 0,
 		lid0 ? "closed" : "open", armed ? ", lid EINT" : "", glitch,
 		top, kint, touch_rst ? "; touch held in reset" : "",
-		readl(wdt + WDT_MODE) & 0xff, wdt_pause ? " (paused in loop)" : "");
+		readl(wdt + WDT_MODE) & 0xff, wdt_pause ? " (paused in loop)" : "",
+		pcm_wdt, pcm_wdt && pcm_wdt_test ? " (TEST: fires at 2 s)" : "");
 	pr_info(TAG "  first: %s psci %d r12 %08x r13 %08x dbg %08x | last: %s psci %d r12 %08x r13 %08x dbg %08x timer_out %u\n",
 		first.refused ? "REFUSED" : first.returned ? "ret" : "NO-RET", first.psci_ret,
 		first.r12, first.r13, first.dbg,
@@ -1312,6 +1353,8 @@ static int __init gem_suspend_init(void)
 		else
 			pr_info(TAG "NONRST_REG2 %08x (no breadcrumb)\n", c);
 		writel(0, wdt + WDT_NONRST2);
+		pr_info(TAG "TOPRGU WDT_STA %08x (bit1 = SPM/PCM WDT reset) REQ_MODE %08x REQ_IRQ_EN %08x\n",
+			readl(wdt + WDT_STA), readl(wdt + WDT_REQ_MODE), readl(wdt + WDT_REQ_IRQ_EN));
 	}
 	mode4g = readl(infra + INFRA_MISC) & BIT(13);
 	iounmap(infra);
