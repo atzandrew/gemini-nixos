@@ -209,3 +209,9 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
 - Test 4 (11:09) failure path: `panel_guard_ms=100` → "on" → guard fired, bias off + reset held, `FAILED (-110 at
   init step 0)`, state "failed" held 10 s (bias low, reset 0), no retry; normal "on" recovered (868 ms). No
   atomic-context warnings from the hrtimer path (regmap/gpiod in hardirq OK).
+- **Test 5 (2026-10-21 11:14–11:27) short sleeps:** `panel-sleep.sh 10 30 pcm_wdt=30` (test module b307168 with
+  bias_check). Runs 1–9: bias before sleep `ENP 0 ENN 0`, wake rc 0, panel on 824–852 ms, err 0, 181–185 mA over
+  the ~34 s kernel window (was ~208 mA with the bias on; unconfirmed). User: screen fine after every wake.
+  Run 10: the known random sleep hang (breadcrumb b5010006 = PSCI suspend, cycle 6, ~12 s in); watchdog reset
+  ~90 s after suspend start, no power-hold. The panel was off: bias_check refuses .prepare unless ENP/ENN read 0,
+  and SPM cycles ran. First hang with the panel unbiased.
