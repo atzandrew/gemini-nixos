@@ -13,7 +13,10 @@
 # Files (Gemini): /home/andrew/soak/{soak.sh,armed,soak.log,state,stop}
 #       /etc/systemd/system/gemini-soak.service (bin/sleep-tests/gemini-soak.service)
 # Run (root: sudo -n busybox sh /home/andrew/soak/soak.sh ...):
-#   arm HOURS [SLEEP_S] [LABEL] [MIN_BAT]   arm, add autologin, enable + start the service
+#   arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N]
+#                                           arm, add autologin, enable + start the service;
+#                                           MAX_N = stop after that many sleeps (0 = no limit),
+#                                           counted across hang reboots (a hung sleep counts)
 #   disarm                                  remove autologin, disable the service, max_s=0
 #   run                                     (the service) the series
 #   Stop gracefully: touch /home/andrew/soak/stop (checked between sleeps).
@@ -47,10 +50,10 @@ disarm() {	# $1 = reason
 
 case "${1:-}" in
 arm)
-	[ -n "${2:-}" ] || { echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT]" >&2; exit 2; }
-	mkdir -p $D; rm -f $D/stop
+	[ -n "${2:-}" ] || { echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N]" >&2; exit 2; }
+	mkdir -p $D; rm -f $D/stop; echo 0 > $D/count
 	end=$(( $(date +%s) + ${2} * 3600 ))
-	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\n' $end "${3:-600}" "${4:-soak}" "${5:-30}" > $A
+	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\n' $end "${3:-600}" "${4:-soak}" "${5:-30}" "${6:-0}" > $A
 	autologin_on
 	systemctl daemon-reload; systemctl enable $U >/dev/null 2>&1
 	log "=== armed: $(tr '\n' ' ' < $A)(until $(date -d @$end '+%F %T'))"
@@ -58,7 +61,7 @@ arm)
 	exit 0 ;;
 disarm) disarm "by hand"; systemctl stop --no-block $U; exit 0 ;;
 run) ;;
-*) echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] | disarm | run" >&2; exit 2 ;;
+*) echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N] | disarm | run" >&2; exit 2 ;;
 esac
 
 [ -e $A ] || exit 0
@@ -83,6 +86,8 @@ n=0
 while :; do
 	[ -e $D/stop ] && { rm -f $D/stop; disarm "stop file"; exit 0; }
 	[ $(date +%s) -lt $END ] || { disarm "END reached"; exit 0; }
+	done_n=$(cat $D/count 2>/dev/null || echo 0)
+	[ "${MAX_N:-0}" -eq 0 ] || [ $done_n -lt $MAX_N ] || { disarm "$done_n of $MAX_N sleeps done"; exit 0; }
 	cap=$(cat $BAT/capacity)
 	[ $cap -ge $MIN_BAT ] || { disarm "battery $cap% < $MIN_BAT%"; systemctl poweroff; exit 0; }
 	if [ "$(cat $CHG)" != 0 ]; then log "on external power - waiting"; sleep 60; continue; fi
@@ -93,6 +98,7 @@ while :; do
 	echo $SLEEP_S > $M/max_s
 	out=$($PREP pre 2>&1); rc=$?
 	if [ $rc -ne 0 ]; then log "#$n prep refused: $out"; sleep 30; continue; fi
+	echo $(( $(cat $D/count 2>/dev/null || echo 0) + 1 )) > $D/count
 	c0=$(cat $BAT/charge_counter); t0=$(date +%s)
 	echo "$t0 $n" > $ST; log "#$n sleep ${SLEEP_S} s (bat $cap%)"
 	echo "SOAK $LABEL #$n: suspend now" > /dev/kmsg
