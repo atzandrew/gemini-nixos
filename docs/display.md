@@ -183,3 +183,7 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
 - Test helper: `bin/sleep-tests/panel-cycle.sh state | off | on | cycle [secs] [count]` (prints state, errors,
   init time, GPIO60/251, 0x14000150). gemini-suspend-prep / s2.sh still send DCS 0x28/0x29 themselves; drop that
   once panel_suspend is on by default.
+- Live read-only checks 2026-10-21 (Gemini, 6.6.157, busybox i2cget/devmem/debugfs): LP3101 on i2c-1 (client
+  `1-003e` exists, no driver) VPOS 0x0F, VNEG 0x0F (5.5 V, = vendor `lp3101_poweron`; the old DT comment's 0x0E was
+  wrong), reg 0x03 0x33. 0x14000150 = 1 (reset released). DSI0 START 0x1, INTSTA 0x80000792, MODE 0x1, VM_CMD_CON
+  0x21. GPIO60/251: mux 0 (GPIO), output, high; GPIO180: mux 1 (LCM_RST), line high. All three unclaimed.

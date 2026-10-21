@@ -853,7 +853,7 @@
 	 * TI TPS65132 LCD bias (±5.4 V AVDD/AVEE for the SSD2092 panel).
 	 * VPOS/VNEG output registers are volatile — LK reprograms them over
 	 * I2C on every boot ("SSD2092-----cmd=0/1--i2c write success" in its
-	 * serial log; 0x0E = 5.4 V), so GPIO-only fixed regulators are NOT
+	 * serial log; 0x0F = 5.5 V, read back live 2026-10-21), so GPIO-only fixed regulators are NOT
 	 * enough: after an EN power-cycle the chip comes back unprogrammed
 	 * and the panel booster stays off (proven by DCS read-back,
 	 * boot.md capture 250 — backlit-black root cause).  min==max makes
