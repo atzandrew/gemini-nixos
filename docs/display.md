@@ -202,3 +202,5 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   (0x00 + 13 values, 0x0D + 8; 0x15 + 13, 0x22 + 8). The vendor's own pair (offset 0x00 then 0x15 = 21 = the
   number of values in the first) shows param 1 is a start offset. Table struct is now `d[16]` (compile-time
   limit), send() refuses > 16, probe checks the whole table. If colours are still wrong → command mode (option 2).
+- **Test 2 (2026-10-21 10:57, 6490f26 module): one cycle 10 s off → on in 844 ms, all 188 packets done; on glass
+  (user): colours right, no artifacts, touch works.** Fix A confirmed. Next: 5 → 20 awake cycles, then short sleeps.
