@@ -128,7 +128,8 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
 - **Bias enables**: ENP GPIO60, ENN GPIO251, plain GPIO outputs, active high (live 2026-10-20: both high).
 - **DSI0** (0x1401c000): START 0x00 (bit 0 DSI_START, bit 16 VM_CMD_START), INTSTA 0x0c (bit 1 CMD_DONE, bit 5
   VM_CMD_DONE, bit 31 BUSY), MODE_CTRL 0x14 (MODE 0 = command, 1 = sync-pulse video), CMDQ_SIZE 0x60,
-  PHY_LCCON 0x104, VM_CMD_CON 0x130, VM_CMD data 0x134–0x14b (24 bytes: cmd + up to 23), STATE_DBG1 0x14c,
+  PHY_LCCON 0x104, VM_CMD_CON 0x130, VM_CMD data 0x134–0x143 (**16 bytes only**, vendor `DSI_VM_CMDQ_REGS data[4]`; 0x144 = CKSM_OUT,
+  0x148 = STATE_DBG0), STATE_DBG1 0x14c,
   CMDQ data 0x200.
 
 ### Two ways to send the panel commands
@@ -187,3 +188,17 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   `1-003e` exists, no driver) VPOS 0x0F, VNEG 0x0F (5.5 V, = vendor `lp3101_poweron`; the old DT comment's 0x0E was
   wrong), reg 0x03 0x33. 0x14000150 = 1 (reset released). DSI0 START 0x1, INTSTA 0x80000792, MODE 0x1, VM_CMD_CON
   0x21. GPIO60/251: mux 0 (GPIO), output, high; GPIO180: mux 1 (LCM_RST), line high. All three unclaimed.
+
+### Test 1 (2026-10-21 ~10:44) and the 16-byte fix
+- Boot with boot-panelpm-20261021.img (sha256 e4d532be…) + module: `panel-pm: LK state: LCM_RST_B 0x1, bias VPOS 0xf
+  VNEG 0xf, DSI0 MODE 0x1 START 0x1 VM_CMD_CON 0x21` → ready. User checked a mid-grey screen first: no ghosting.
+- `panel-cycle.sh cycle 10 1`: off OK (reset 0, ENP/ENN low for 10 s), on OK by the driver (all commands
+  VM_CMD_DONE, **861 ms**, not ~3.3 s: several packets per front porch). **On glass: ~70 % of colours hue-shifted
+  ("rainbow"), no flicker, no ghosting**; the user forced a power-off.
+- Cause: the VM_CMD data slot is 16 bytes, not 24 (misread). The two 23-byte gamma packets (0xC3) went out cut
+  short (gamma wrong → hue shift; everything else was ≤ 11 bytes and landed); the extra words hit CKSM_OUT /
+  STATE_DBG0 (read-only status, harmless).
+- Fix (user chose "A" over command mode): each 0xC3 packet split in two with the start offset advanced
+  (0x00 + 13 values, 0x0D + 8; 0x15 + 13, 0x22 + 8). The vendor's own pair (offset 0x00 then 0x15 = 21 = the
+  number of values in the first) shows param 1 is a start offset. Table struct is now `d[16]` (compile-time
+  limit), send() refuses > 16, probe checks the whole table. If colours are still wrong → command mode (option 2).

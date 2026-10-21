@@ -859,7 +859,8 @@ static void geminipda_drm_ovl_l0(struct geminipda_drm_device *sdev, bool on)
  *  2. no automatic retry (FAILED stays dark until "on" is written again)
  *  3. bias values are LK's (read at probe, sanity-checked) and read back after
  *     writing; the bias is never left on after a failed write
- *  4. every command waits for VM_CMD_DONE with a timeout
+ *  4. every command waits for VM_CMD_DONE with a timeout; packets over the
+ *     16-byte VM_CMD slot are refused (whole table checked at probe)
  *  5. guard timer: if "on" has not finished panel_guard_ms after the bias
  *     went on, the timer forces the safe state itself (covers a stuck
  *     thread, not a whole-SoC hang)
@@ -884,7 +885,8 @@ static void geminipda_drm_ovl_l0(struct geminipda_drm_device *sdev, bool on)
 #define VM_CMD_EN_VFP		0x21	/* VM_CMD_EN | TS_VFP_EN, as LK leaves it */
 #define VM_CMD_KEEP		0x3d	/* EN, TIME_SEL, TS_VSA/VBP/VFP_EN */
 #define VM_CMD_LONG_PKT		BIT(1)
-#define DSI_VM_CMD_DATA		0x134	/* 24 bytes: cmd + up to 23 params */
+#define DSI_VM_CMD_DATA		0x134	/* 0x134-0x143 only: 16 bytes (vendor data[4]) */
+#define VM_CMD_MAX_LEN		16	/* 0x144 is DSI_CKSM_OUT: never write past */
 #define MMSYS_LCM_RST_B		0x150	/* bit 0: 1 = reset released */
 #define LCD_BIAS_VPOS		0x00
 #define LCD_BIAS_VNEG		0x01
@@ -969,7 +971,7 @@ static int geminipda_panel_send(struct geminipda_drm_device *sdev,
 
 	if (READ_ONCE(sdev->panel_abort))
 		return -ECANCELED;
-	if (len < 1 || len > 23)
+	if (len < 1 || len > VM_CMD_MAX_LEN)
 		return -EINVAL;
 
 	st = readl(dsi + DSI_INTSTA);
@@ -982,7 +984,7 @@ static int geminipda_panel_send(struct geminipda_drm_device *sdev,
 
 		con |= id << 8 | (u32)d[0] << 16 | (u32)(len == 2 ? d[1] : 0) << 24;
 	} else {
-		u8 buf[24] = { 0 };
+		u8 buf[VM_CMD_MAX_LEN] = { 0 };
 
 		memcpy(buf, d, len);
 		for (i = 0; i < DIV_ROUND_UP(len, 4); i++)
@@ -1168,6 +1170,7 @@ static void geminipda_panel_init(struct geminipda_drm_device *sdev)
 	struct device *dev = sdev->dev.dev;
 	struct device_node *np;
 	u32 rst = 0;
+	unsigned int i;
 	int vpos, vneg;
 
 	sdev->panel_state = PANEL_ON;
@@ -1230,6 +1233,15 @@ static void geminipda_panel_init(struct geminipda_drm_device *sdev)
 	}
 	sdev->bias_vpos = vpos;
 	sdev->bias_vneg = vneg;
+
+	/* every init packet must fit the 16-byte slot: checked before any bias-on */
+	for (i = 0; i < ARRAY_SIZE(ssd2092_init); i++) {
+		if (ssd2092_init[i].len < 1 || ssd2092_init[i].len > VM_CMD_MAX_LEN) {
+			dev_err(dev, "panel-pm: init entry %u has length %u (max %u), unavailable\n",
+				i, ssd2092_init[i].len, VM_CMD_MAX_LEN);
+			goto put_bias;
+		}
+	}
 
 	sdev->panel_ok = true;
 	mutex_lock(&panel_lock);
