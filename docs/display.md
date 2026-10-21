@@ -204,3 +204,8 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   limit), send() refuses > 16, probe checks the whole table. If colours are still wrong → command mode (option 2).
 - **Test 2 (2026-10-21 10:57, 6490f26 module): one cycle 10 s off → on in 844 ms, all 188 packets done; on glass
   (user): colours right, no artifacts, touch works.** Fix A confirmed. Next: 5 → 20 awake cycles, then short sleeps.
+- Test 3 (2026-10-21 10:59–11:06): 5 + 20 awake cycles (10 s off, 5 s gap), all off with reset 0 + ENP/ENN low, all
+  on err=0, 813–898 ms. User: no fog, colours right, touch works.
+- Test 4 (11:09) failure path: `panel_guard_ms=100` → "on" → guard fired, bias off + reset held, `FAILED (-110 at
+  init step 0)`, state "failed" held 10 s (bias low, reset 0), no retry; normal "on" recovered (868 ms). No
+  atomic-context warnings from the hrtimer path (regmap/gpiod in hardirq OK).
