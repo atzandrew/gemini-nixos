@@ -221,3 +221,5 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   rc 0, panel on 813–845 ms, err 0. A Esc/On key (21 s), B silver key (27 s), C lid shut → opened
   (`last_wake=lid opened`, 28 s), D from the lock screen → back on the lock screen (28 s). User: screen back each time.
   Not covered: Plasma/logind starting the suspend (needs sleep.target unmasked).
+- Test 7 (11:41) reboot with the panel off (bias low, reset held): LK re-initialised it, driver "ready" with the
+  usual LK state; defaults back (installed module without bias_check, panel_suspend=0, suspend masked).
