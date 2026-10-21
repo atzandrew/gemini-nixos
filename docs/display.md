@@ -226,3 +226,4 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
 - **Test 8 (2026-10-21 11:43–12:37) soak:** `panel-cycle.sh cycle 10 200`: 200/200 off with reset 0 + ENP/ENN low,
   200/200 on err=0 (≤ 892 ms, typ. ~850), no kernel warnings. Plasma idle-blanked the screen mid-run: the driver kept
   the backlight off (CRTC off) and lit it at the next panel-on after a key press, as designed.
+- 12:45 mid-grey check after all tests (user): clean, no ghosting. **Awake + short-sleep acceptance done.**
