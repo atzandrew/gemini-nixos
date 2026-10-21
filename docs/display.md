@@ -227,3 +227,7 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   200/200 on err=0 (≤ 892 ms, typ. ~850), no kernel warnings. Plasma idle-blanked the screen mid-run: the driver kept
   the backlight off (CRTC off) and lit it at the next panel-on after a key press, as designed.
 - 12:45 mid-grey check after all tests (user): clean, no ghosting. **Awake + short-sleep acceptance done.**
+- **Test 9 (2026-10-21 13:06) Plasma lid suspend, shipped config** (panel_suspend=1 via modprobe.d, installed
+  b307168, pcm_wdt=30, suspend unmasked): lid shut → prep → panel off, bias `ENP 0 ENN 0` → lid opened after ~25 s
+  → panel on 829 ms, err 0. Picture back ~4 s after opening: prep post turns DPMS on last (after touch + radios).
+  On the charger the prep refuses ("on external power") and Plasma retries every 10 s with the screen lit (old rule).
