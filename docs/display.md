@@ -215,3 +215,9 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   Run 10: the known random sleep hang (breadcrumb b5010006 = PSCI suspend, cycle 6, ~12 s in); watchdog reset
   ~90 s after suspend start, no power-hold. The panel was off: bias_check refuses .prepare unless ENP/ENN read 0,
   and SPM cycles ran. First hang with the panel unbiased.
+- **Test 6 (2026-10-21 11:34–11:39) wake paths**, everyday-style suspend via `bin/sleep-tests/wake-test.sh`
+  (gemini-suspend-prep pre → echo mem → post; sleep.target stays masked; test module b307168 max_s=0
+  wake_keys=1 wake_lid=1 pcm_wdt=30; panel_suspend=1 at runtime). All four: bias `ENP 0 ENN 0` before sleep,
+  rc 0, panel on 813–845 ms, err 0. A Esc/On key (21 s), B silver key (27 s), C lid shut → opened
+  (`last_wake=lid opened`, 28 s), D from the lock screen → back on the lock screen (28 s). User: screen back each time.
+  Not covered: Plasma/logind starting the suspend (needs sleep.target unmasked).
