@@ -90,3 +90,77 @@ Sources: `gemian/gemini-linux-kernel-3.18` (`drivers/misc/mediatek/video/mt6797/
 - Is the LK fb on OVL0 L0, and is `vram` ≥ 2 × 9.40 MB (1088 × 2160 × 4)? `MTK_FB_PAGES = 3` in the vendor kernel suggests LK reserves ~3 pages.
 - Does OVL apply ADDR writes immediately or at frame start? (Decides whether the IRQ-time write needs to land inside the blank.)
 - Refresh rate: 60 Hz expected (LK `fps` field in the atag).
+
+## Panel off/on (stock sequence) — research 2026-10-21 (read-only, nothing tested yet)
+
+Goal: the panel is truly off (bias off, reset held) for the whole of every sleep, as stock does, so the LCD is never
+left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian/gemini-linux-kernel-3.18 8cfe659
+(`drivers/misc/mediatek/lcm/aeon_ssd2092_fhd_dsi_solomon/`, `gpio/lp3101.c`, `video/mt6797/dispsys/ddp_dsi.c`,
+`videox/primary_display.c`, `arch/arm64/boot/dts/aeon6797_6m_n.dts`).
+
+### Facts
+- **Panel**: SSD2092 (cmdline LCM `aeon_ssd2092_fhd_dsi_solomon`, ID 0x01572098). AGENTS.md rule 5 still says NT36672;
+  that driver also exists in the vendor tree but is not the fitted panel. SSD2092 is a TDDI: touch is the same chip.
+- **Stock suspend** (`primary_display_suspend`): `dpmgr_path_stop` (DSI → command mode, wait INTSTA bit 31 BUSY clear;
+  OVL/RDMA stopped) → `lcm_suspend` → `dpmgr_path_power_off` (DSI clock lane LP, lanes to ULPS, clocks/PHY off).
+- **Stock `lcm_suspend`**: DCS 0x28, 50 ms, DCS 0x10, 120 ms, +10 ms, RESET low, ENN (GPIO251) low, ENP (GPIO60) low.
+- **Stock resume** (`primary_display_resume`): DSI power on + path reset/config (DSI still in command mode) →
+  `lcm_resume` → `dpmgr_path_start` (DSI → video mode, HS clock, START).
+- **Stock `lcm_resume`** = `lcm_poweron` + `lcm_init`:
+  RESET low, ENP high, ENN high, 20 ms, `lp3101_poweron()`, RESET high, 10 ms, low, 10 ms, high, 20 ms, then the init
+  table. **The table is 186 commands** (the "369" in the handover counted the commented-out copy above it too); the
+  last two are 0x11 + 120 ms and 0x29 + 50 ms. Longest packet: cmd + 22 bytes.
+- **Init table in the repo**: `kernel/delta/drivers/gpu/drm/tiny/geminipda-ssd2092-init.h`, generated from the vendor
+  file. The older mainline port `drm/panel/panel-solomon-ssd2092.c` (written for the banned mediatek-drm stack) has the
+  same 186 commands byte for byte, plus three **non-stock** extras at the end (0x51 0xFF, 0x53 0x24, 0x55 0x00, a July
+  CABC workaround). Don't send those. No LK source or dump to compare against; LK builds the same lcm file
+  (`#ifdef BUILD_LK` branches), so the table is the same.
+- **Packet types** (vendor `DSI_set_cmdq_V2`, and the July lesson in panel-solomon-ssd2092.c): cmd < 0xB0 → DCS
+  (0x05 no param / 0x15 one param / 0x39 long); cmd ≥ 0xB0 → **generic** (0x13 / 0x23 / 0x29 long). Sending the
+  0xB0+ registers as DCS leaves the booster off (black screen).
+- **LCD bias (LP3101, TPS65132-class)**: I2C1 (`i2c@11008000`), addr 0x3E, already in our DT as `bias@3e`
+  (`ti,tps65132`, no driver bound — banned). `lp3101_poweron()` = write reg 0x00 = 0x0F, reg 0x01 = 0x0F
+  (VPOS/VNEG, 4.0 V + 0.1 V·n → 5.5 V). Our DT comment claims LK writes 0x0E (5.4 V): **read 0x00/0x01 live before
+  writing anything** and use what LK left. Registers are volatile across an EN power cycle (DT comment, boot.md
+  capture 250), so they are rewritten on every resume, as stock does. Also on I2C1: FUSB301A @0x25 (driver bound).
+- **Reset**: GPIO180 in its LCM_RST function; stock drives it with **MMSYS_CONFIG + 0x150 bit 0**
+  (0x14000150, `MMSYS_LCM_RST_B`; 1 = released). Not a GPIO write; the pin mux stays as LK left it.
+- **Bias enables**: ENP GPIO60, ENN GPIO251, plain GPIO outputs, active high (live 2026-10-20: both high).
+- **DSI0** (0x1401c000): START 0x00 (bit 0 DSI_START, bit 16 VM_CMD_START), INTSTA 0x0c (bit 1 CMD_DONE, bit 5
+  VM_CMD_DONE, bit 31 BUSY), MODE_CTRL 0x14 (MODE 0 = command, 1 = sync-pulse video), CMDQ_SIZE 0x60,
+  PHY_LCCON 0x104, VM_CMD_CON 0x130, VM_CMD data 0x134–0x14b (24 bytes: cmd + up to 23), STATE_DBG1 0x14c,
+  CMDQ data 0x200.
+
+### Two ways to send the panel commands
+1. **Video mode, VM_CMD** (what our 0x28/0x29 tests used). Vendor `DSI_set_cmdq_V2` video branch, per command:
+   VM_CMD_CON = VM_CMD_EN | LONG_PKT(len>2) | TS_VFP_EN (bit 5, already set) | ID<<8 | (short: d0<<16 | d1<<24;
+   long: wc=len<<16), long payload byte-wise into 0x134+ (byte 0 = cmd); START bit 16 0→1; wait INTSTA bit 5; clear it.
+   The video stream and RDMA/OVL keep running, so nothing else in the pipeline has to restart. **Not stock**: stock
+   never sends the panel off/on sequence with video running, and the panel would see video frames while in reset and
+   during init.
+2. **Command mode, CMDQ** (stock). MODE_CTRL = 0, wait BUSY clear, send through CMDQ (0x200 + CMDQ_SIZE + START,
+   wait CMD_DONE), then back to video: MODE_CTRL = 1, START 0→1. This also needs the RDMA0 (and mutex) stop/reset/start
+   that `dpmgr_path_stop/start` does, or the restarted frame can come out shifted. More register writes outside the
+   panel, so more to test.
+- **Recommendation**: panel side exactly stock in both cases. DSI side: start with (1) for the awake tests (proven
+  path, smallest change), and move to (2) plus ULPS once the panel sequence is proven, if the user wants the full
+  stock behaviour. The burn fix is the bias/reset part, which both give.
+
+### Where the code goes
+- **geminipda-drm**, not mt6797-suspend or a userspace script. It already owns the screen state (CRTC
+  enable/disable, backlight, OVL L0, RDMA0 maps). Add `dev_pm_ops` suspend/resume (`drm_mode_config_helper_suspend/
+  resume`) so every system suspend runs the panel off from the kernel, before the SPM code, and resume runs the full
+  stock init. A hang mid-sleep then leaves the panel unbiased. Panel off on DPMS blank (stock does this on every screen
+  off) as a second step behind a module parameter.
+- New DT links from the geminipda-drm node: `&dsi0` (regs, of_iomap like RDMA/OVL), `&mmsys` (syscon, reg 0x150),
+  `&lcd_bias` (I2C client: the core already instantiates `bias@3e` with no driver, `of_find_i2c_device_by_node`),
+  ENP/ENN GPIOs requested with **GPIOD_ASIS** (no change at probe).
+- Order on resume: panel init in DRM resume (kernel), touch re-init after (today: the userspace rebind stopgap in
+  gemini-suspend-prep / s2.sh; later ssd2092 touch PM ops). The prep's DCS 0x28/0x29 can go once the driver does it.
+- Rule 5: this is targeted panel writes with LK's DSI setup kept, not mediatek-drm/tps65132 (still banned). Needs
+  the AGENTS.md text updated (panel name, the panel-off exception) when the code lands.
+
+### Read-only checks still to do on the Gemini (it was offline 2026-10-21)
+- `i2cget -y -f <i2c1 bus> 0x3e 0x00` / `0x01` / `0x03` → LK's bias values (0x0E or 0x0F?).
+- 0x14000150 = 1? GPIO180 mode = LCM_RST? GPIO60/251 high? DSI0 MODE_CTRL 0x1, VM_CMD_CON 0x21, INTSTA.
+- Which `/dev/i2c-N` is i2c@11008000.
