@@ -231,3 +231,5 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   b307168, pcm_wdt=30, suspend unmasked): lid shut → prep → panel off, bias `ENP 0 ENN 0` → lid opened after ~25 s
   → panel on 829 ms, err 0. Picture back ~4 s after opening: prep post turns DPMS on last (after touch + radios).
   On the charger the prep refuses ("on external power") and Plasma retries every 10 s with the screen lit (old rule).
+- Test 10 (13:09) lid flap: short sleep → open → shut again during prep post → second sleep → open. Both sleeps
+  bias `ENP 0 ENN 0`, panel on 816 / 858 ms, err 0; user: fine.
