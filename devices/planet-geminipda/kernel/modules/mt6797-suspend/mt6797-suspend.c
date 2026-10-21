@@ -212,6 +212,15 @@ MODULE_PARM_DESC(disp_check, "mode 1: refuse the suspend while OVL0 layer 0 (the
 static bool bias_check = true;
 module_param(bias_check, bool, 0644);
 MODULE_PARM_DESC(bias_check, "mode 1: refuse the suspend while the LCD bias (ENP GPIO60 / ENN GPIO251) is on (default on)");
+
+/*
+ * Hang hunt 2026-10-21: stock suspend never sets SPM_FLAG_DIS_SRCCLKEN_LOW
+ * (only the idle modes do); we have always forced it. Y = leave it out, so
+ * the firmware may drop SRCCLKEN (26 MHz request to the PMIC) as stock does.
+ */
+static bool srcclken_low;
+module_param(srcclken_low, bool, 0644);
+MODULE_PARM_DESC(srcclken_low, "mode 1: do not force SPM_FLAG_DIS_SRCCLKEN_LOW (stock suspend; default N = forced)");
 static char bias_at_sleep[16] = "unknown";
 module_param_string(bias_at_sleep, bias_at_sleep, sizeof(bias_at_sleep), 0444);
 MODULE_PARM_DESC(bias_at_sleep, "LCD bias enables read in the last .prepare: \"ENP x ENN y\"");
@@ -834,7 +843,7 @@ static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 
 	memset(r, 0, sizeof(*r));
 	crumb(CR_SETUP);
-	swflag = (flags | SPM_FLAG_DIS_SRCCLKEN_LOW) & ~SPM_FLAG_DIS_CPU_PDN;
+	swflag = (flags | (srcclken_low ? 0 : SPM_FLAG_DIS_SRCCLKEN_LOW)) & ~SPM_FLAG_DIS_CPU_PDN;
 
 	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL0));
 	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R0);
@@ -1453,8 +1462,9 @@ static int __init gem_suspend_init(void)
 
 	pmic_read(MT6351_TOPSTATUS, &top);
 	suspend_set_ops(&gem_suspend_ops);
-	pr_info(TAG "deep suspend registered (mode %u, poll %u ms, lid EINT %s %u ms, gap %u ms, max_s %u); fw %u words, IM_PTR %08x; TOPSTATUS %04x, lid %s\n",
-		mode, poll_ms, lid_eint ? "on" : "off", lid_poll_ms, gap_ms, max_s, im_words, im_ptr, top, lid_closed() ? "closed" : "open");
+	pr_info(TAG "deep suspend registered (mode %u, poll %u ms, lid EINT %s %u ms, gap %u ms, max_s %u, flags %08x%s); fw %u words, IM_PTR %08x; TOPSTATUS %04x, lid %s\n",
+		mode, poll_ms, lid_eint ? "on" : "off", lid_poll_ms, gap_ms, max_s, flags,
+		srcclken_low ? " srcclken_low" : "", im_words, im_ptr, top, lid_closed() ? "closed" : "open");
 	return 0;
 
 out_fw:
