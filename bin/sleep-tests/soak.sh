@@ -20,6 +20,8 @@
 #   disarm                                  remove autologin, disable the service, max_s=0
 #   run                                     (the service) the series
 #   Stop gracefully: touch /home/andrew/soak/stop (checked between sleeps).
+#   Test module: MOD=/path/x.ko MODARGS="a=1 b=2" soak.sh arm ... loads it at every start (after
+#   each hang reboot too) with the modprobe.d options + MODARGS; disarm goes back to the installed one.
 set -u
 D=/home/andrew/soak; O=$D/soak.log; A=$D/armed; ST=$D/state
 G=/etc/greetd/config.toml; U=gemini-soak.service
@@ -41,6 +43,8 @@ autologin_on() {
 }
 
 disarm() {	# $1 = reason
+	MOD=; [ -e $A ] && . $A
+	if [ -n "${MOD:-}" ]; then rmmod mt6797_suspend; modprobe mt6797_suspend; fi
 	rm -f $A $ST
 	autologin_off
 	systemctl disable $U >/dev/null 2>&1
@@ -53,7 +57,7 @@ arm)
 	[ -n "${2:-}" ] || { echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N]" >&2; exit 2; }
 	mkdir -p $D; rm -f $D/stop; echo 0 > $D/count
 	end=$(( $(date +%s) + ${2} * 3600 ))
-	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\n' $end "${3:-600}" "${4:-soak}" "${5:-30}" "${6:-0}" > $A
+	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\nMOD=%s\nMODARGS="%s"\n' $end "${3:-600}" "${4:-soak}" "${5:-30}" "${6:-0}" "${MOD:-}" "${MODARGS:-}" > $A
 	autologin_on
 	systemctl daemon-reload; systemctl enable $U >/dev/null 2>&1
 	log "=== armed: $(tr '\n' ' ' < $A)(until $(date -d @$end '+%F %T'))"
@@ -75,6 +79,13 @@ if [ -e $ST ]; then
 	rm -f $ST
 else
 	log "boot/start [$LABEL]; ${crumb:-no breadcrumb}"
+fi
+
+if [ -n "${MOD:-}" ]; then	# test module instead of the installed one
+	opts=$(sed -n 's/^options mt6797[-_]suspend //p' /etc/modprobe.d/*.conf | tr '\n' ' ')
+	rmmod mt6797_suspend
+	if ! insmod $MOD $opts $MODARGS; then disarm "insmod $MOD failed"; exit 1; fi
+	log "test module $MOD (md5 $(md5sum < $MOD | cut -c1-8)): $opts$MODARGS"
 fi
 
 # Wait for the Plasma session (autologin) and let it settle (Wi-Fi up for SSH).
