@@ -13,7 +13,7 @@ log() { echo "$(date +%T) $*"; }
 [ -e $P/panel ] || { echo "no $P/panel (old module?)"; exit 1; }
 gpios() {
 	d=/sys/kernel/debug/gpio
-	if [ -r $d ]; then grep -E "gpio-(60|251) " $d | tr -s ' ' | tr '\n' ';'
+	if [ -r $d ]; then grep -E "\|(enp|enn) " $d | tr -s " " | tr "\n" ";"
 	else printf 'no debugfs gpio;'; fi
 }
 show() {
