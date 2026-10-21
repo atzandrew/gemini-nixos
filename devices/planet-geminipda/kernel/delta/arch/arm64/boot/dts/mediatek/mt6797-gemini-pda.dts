@@ -104,6 +104,18 @@
 		 */
 		mediatek,rdma = <&disp_rdma0>;
 		mediatek,ovl = <&disp_ovl0>;
+		/*
+		 * panel-pm (2026-10-21): stock panel off/on for suspend. DSI0 for the
+		 * video-mode command slot, MMSYS 0x150 for the LCM reset, the LP3101
+		 * bias chip (no driver binds it) and its two enables. Probe only reads;
+		 * the GPIOs are taken as-is. Never reference panel_pins here (it would
+		 * drive reset and ENP low).
+		 */
+		mediatek,dsi = <&dsi0>;
+		mediatek,mmsys = <&mmsys>;
+		mediatek,lcd-bias = <&lcd_bias>;
+		enp-gpios = <&pio 60 GPIO_ACTIVE_HIGH>;
+		enn-gpios = <&pio 251 GPIO_ACTIVE_HIGH>;
 	};
 
 	reserved-memory {
@@ -849,7 +861,7 @@
 	 * when the panel enables the supplies.
 	 * ENP (AVDD): GPIO60, ENN (AVEE): GPIO251, both active-high.
 	 */
-	bias@3e {
+	lcd_bias: bias@3e {
 		compatible = "ti,tps65132";
 		reg = <0x3e>;
 

@@ -119,9 +119,12 @@
  *    SPM DRAM self-refresh (claude/idle-power.md, SPM step 3).  remove /
  *    shutdown turn L0 back on.
  *
- * CORE RULE 5: this driver never initialises the panel.  LK does that.
- * The shadow blit only writes the already-initialised scanout region, so
- * there is no path from here to the "uninitialised panel" flicker.  The
+ * CORE RULE 5: LK initialises the panel at boot.  The one exception is
+ * panel-pm (2026-10-21, user-approved): the stock vendor off/on sequence
+ * for suspend, re-sending the vendor init table through LK's running DSI
+ * setup, with fail-to-off safeguards (see the comment above
+ * geminipda_panel_off()).  It is inert unless the DT links it and
+ * panel_suspend or the "panel" parameter asks for it.  The
  * banned mediatek-drm/mtk-mmsys/DSI-PHY stack (which WOULD re-drive the
  * panel) stays excluded — see devices/planet-geminipda/kernel/default.nix.
  */
@@ -140,6 +143,12 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
+#include <linux/mutex.h>
+#include <linux/regmap.h>
 #include <asm/unaligned.h>
 
 #include <drm/drm_atomic.h>
@@ -314,6 +323,18 @@ struct geminipda_drm_device {
 	bool ovl_l3_cleared;	/* SRC_CON bit 3 cleared by us: restore on exit */
 	bool ovl_l0_ours;	/* probe: L0 on and showing fb_base -> blank_l0 may use it */
 	bool ovl_l0_off;	/* SRC_CON bit 0 cleared by blank_l0 */
+	bool crtc_on;		/* CRTC enabled (backlight wanted) */
+	/* Panel off/on, see "panel-pm" above geminipda_panel_off(). */
+	bool panel_ok;		/* probe found everything: panel-pm usable */
+	int panel_state;	/* PANEL_ON / PANEL_OFF / PANEL_FAILED */
+	bool panel_abort;	/* set by the guard timer */
+	bool panel_resume_on;	/* suspend switched it off: switch on in resume */
+	void __iomem *dsi;
+	struct regmap *mmsys;
+	struct i2c_client *bias;
+	struct gpio_desc *enp, *enn;
+	u8 bias_vpos, bias_vneg;	/* LK's values, read at probe */
+	struct hrtimer panel_guard;
 };
 
 static struct geminipda_drm_device *
@@ -819,18 +840,441 @@ static void geminipda_drm_ovl_l0(struct geminipda_drm_device *sdev, bool on)
 	sdev->ovl_l0_off = !on;
 }
 
+/*
+ * Panel off/on ("panel-pm", 2026-10-21; research: docs/display.md "Panel
+ * off/on (stock sequence)").  Stock powers the SSD2092 down on every
+ * suspend and re-initialises it on resume; until now this driver left it
+ * biased and unrefreshed through every sleep (6 screen burns).  Panel side
+ * exactly as the vendor 3.18 lcm driver (aeon_ssd2092_fhd_dsi_solomon.c):
+ *   off: DCS 0x28, 50 ms, DCS 0x10, 120 ms, 10 ms, RESET low, ENN low, ENP low
+ *   on:  RESET low, ENP high, ENN high, 20 ms, bias regs over I2C (lp3101),
+ *        RESET 1, 10 ms, 0, 10 ms, 1, 20 ms, init table (186 commands)
+ * DSI side: commands go out through the video-mode command slot (VM_CMD,
+ * vendor DSI_set_cmdq_V2 video branch, the path bin/sleep-tests/dcs.sh
+ * proved for 0x28/0x29); LK's DSI/RDMA/OVL setup keeps running.  Stock
+ * instead stops video around the sequence (command mode) — not done here.
+ *
+ * Safeguards (stock has none of these):
+ *  1. any error ends in the safe state (reset held, ENN/ENP low), never half on
+ *  2. no automatic retry (FAILED stays dark until "on" is written again)
+ *  3. bias values are LK's (read at probe, sanity-checked) and read back after
+ *     writing; the bias is never left on after a failed write
+ *  4. every command waits for VM_CMD_DONE with a timeout
+ *  5. guard timer: if "on" has not finished panel_guard_ms after the bias
+ *     went on, the timer forces the safe state itself (covers a stuck
+ *     thread, not a whole-SoC hang)
+ *  6. backlight only after a successful init, and only if the CRTC is on
+ * Probe writes nothing; it only reads and checks.  panel_suspend (default
+ * off until tested) hooks this into system suspend/resume; the "panel"
+ * parameter runs it by hand ("off" / "on").
+ *
+ * CORE RULE 5 exception agreed by the user 2026-10-16/21: targeted panel
+ * writes, LK's DSI setup kept; mediatek-drm/tps65132 stay banned.  The DT
+ * panel@0 node's panel_pins state (reset/ENP low) must never be applied.
+ */
+#include "geminipda-ssd2092-init.h"
+
+#define DSI_START		0x000
+#define DSI_START_RUN		BIT(0)
+#define DSI_START_VM_CMD	BIT(16)
+#define DSI_INTSTA		0x00c	/* raw flags; write 0 to clear */
+#define DSI_INTSTA_VM_CMD_DONE	BIT(5)
+#define DSI_MODE_CTRL		0x014	/* 1 = sync-pulse video (LK) */
+#define DSI_VM_CMD_CON		0x130
+#define VM_CMD_EN_VFP		0x21	/* VM_CMD_EN | TS_VFP_EN, as LK leaves it */
+#define VM_CMD_KEEP		0x3d	/* EN, TIME_SEL, TS_VSA/VBP/VFP_EN */
+#define VM_CMD_LONG_PKT		BIT(1)
+#define DSI_VM_CMD_DATA		0x134	/* 24 bytes: cmd + up to 23 params */
+#define MMSYS_LCM_RST_B		0x150	/* bit 0: 1 = reset released */
+#define LCD_BIAS_VPOS		0x00
+#define LCD_BIAS_VNEG		0x01
+#define LCD_BIAS_MAX		0x14	/* 4.0 V + 0.1 V * n -> 6.0 V; refuse above */
+
+enum { PANEL_ON, PANEL_OFF, PANEL_FAILED };
+static const char * const panel_state_names[] = { "on", "off", "failed" };
+
+static DEFINE_MUTEX(panel_lock);
+static struct geminipda_drm_device *panel_sdev;	/* under panel_lock */
+
+static bool panel_suspend;
+module_param(panel_suspend, bool, 0644);
+MODULE_PARM_DESC(panel_suspend,
+	"Stock panel off in system suspend, full re-init in resume (default off until tested)");
+
+static unsigned int panel_guard_ms = 6000;
+module_param(panel_guard_ms, uint, 0644);
+MODULE_PARM_DESC(panel_guard_ms,
+	"Force the panel safe-off if \"on\" takes longer than this after bias on (ms)");
+
+static unsigned int stat_panel_on_ms;	/* duration of the last "on" */
+module_param(stat_panel_on_ms, uint, 0444);
+static int stat_panel_err;		/* last error (0 = none) */
+module_param(stat_panel_err, int, 0444);
+static unsigned int stat_panel_err_cmd;	/* init table index that failed */
+module_param(stat_panel_err_cmd, uint, 0444);
+static unsigned int stat_panel_cycles;	/* successful "on"s */
+module_param(stat_panel_cycles, uint, 0444);
+
+/* Panel lit (or panel-pm not in use): the backlight may be on. */
+static bool geminipda_panel_lit(struct geminipda_drm_device *sdev)
+{
+	return !sdev->panel_ok || READ_ONCE(sdev->panel_state) == PANEL_ON;
+}
+
+/* Safe state: reset held, bias off (stock order). Atomic-safe. */
+static void geminipda_panel_hw_off(struct geminipda_drm_device *sdev)
+{
+	regmap_update_bits(sdev->mmsys, MMSYS_LCM_RST_B, BIT(0), 0);
+	gpiod_set_value(sdev->enn, 0);
+	gpiod_set_value(sdev->enp, 0);
+}
+
+static enum hrtimer_restart geminipda_panel_guard_fn(struct hrtimer *t)
+{
+	struct geminipda_drm_device *sdev =
+		container_of(t, struct geminipda_drm_device, panel_guard);
+
+	WRITE_ONCE(sdev->panel_abort, true);
+	geminipda_panel_hw_off(sdev);
+	return HRTIMER_NORESTART;
+}
+
+static void geminipda_panel_reset(struct geminipda_drm_device *sdev, bool release)
+{
+	regmap_update_bits(sdev->mmsys, MMSYS_LCM_RST_B, BIT(0), release ? 1 : 0);
+}
+
+/* LK's DSI0 state: running, sync-pulse video, VM_CMD slot enabled. */
+static bool geminipda_panel_dsi_ready(struct geminipda_drm_device *sdev)
+{
+	return readl(sdev->dsi + DSI_MODE_CTRL) == 1 &&
+	       (readl(sdev->dsi + DSI_START) & DSI_START_RUN) &&
+	       (readl(sdev->dsi + DSI_VM_CMD_CON) & VM_CMD_EN_VFP) == VM_CMD_EN_VFP;
+}
+
+/*
+ * One packet through the video-mode command slot (vendor ddp_dsi.c
+ * DSI_set_cmdq_V2, video branch).  d[0] < 0xB0: DCS 0x05/0x15/0x39;
+ * d[0] >= 0xB0: generic 0x13/0x23/0x29 (by length 1 / 2 / > 2).  The
+ * packet goes out in the next vertical front porch.
+ */
+static int geminipda_panel_send(struct geminipda_drm_device *sdev,
+				const u8 *d, unsigned int len)
+{
+	void __iomem *dsi = sdev->dsi;
+	bool generic = d[0] >= 0xb0;
+	u32 con, st, start;
+	unsigned int i;
+	int ret;
+
+	if (READ_ONCE(sdev->panel_abort))
+		return -ECANCELED;
+	if (len < 1 || len > 23)
+		return -EINVAL;
+
+	st = readl(dsi + DSI_INTSTA);
+	if (st & DSI_INTSTA_VM_CMD_DONE)
+		writel(st & ~DSI_INTSTA_VM_CMD_DONE, dsi + DSI_INTSTA);
+
+	con = readl(dsi + DSI_VM_CMD_CON) & VM_CMD_KEEP;
+	if (len <= 2) {
+		u32 id = generic ? (len == 1 ? 0x13 : 0x23) : (len == 1 ? 0x05 : 0x15);
+
+		con |= id << 8 | (u32)d[0] << 16 | (u32)(len == 2 ? d[1] : 0) << 24;
+	} else {
+		u8 buf[24] = { 0 };
+
+		memcpy(buf, d, len);
+		for (i = 0; i < DIV_ROUND_UP(len, 4); i++)
+			writel(get_unaligned_le32(buf + 4 * i),
+			       dsi + DSI_VM_CMD_DATA + 4 * i);
+		/* word count = len (CM_DATA_0), high byte (CM_DATA_1) = 0 */
+		con |= VM_CMD_LONG_PKT | (generic ? 0x29 : 0x39) << 8 | len << 16;
+	}
+	writel(con, dsi + DSI_VM_CMD_CON);
+
+	start = readl(dsi + DSI_START);
+	writel(start & ~DSI_START_VM_CMD, dsi + DSI_START);
+	writel(start | DSI_START_VM_CMD, dsi + DSI_START);
+
+	ret = readl_poll_timeout(dsi + DSI_INTSTA, st,
+				 st & DSI_INTSTA_VM_CMD_DONE, 100, 100000);
+	if (ret)
+		return -ETIMEDOUT;
+	writel(st & ~DSI_INTSTA_VM_CMD_DONE, dsi + DSI_INTSTA);
+	return 0;
+}
+
+static int geminipda_panel_send1(struct geminipda_drm_device *sdev, u8 cmd)
+{
+	return geminipda_panel_send(sdev, &cmd, 1);
+}
+
+/* Stock lcm_suspend. Always ends in the safe state. Under panel_lock. */
+static int geminipda_panel_off(struct geminipda_drm_device *sdev)
+{
+	struct device *dev = sdev->dev.dev;
+	int ret = 0;
+
+	if (sdev->panel_state != PANEL_ON)
+		return 0;	/* OFF/FAILED: already in the safe state */
+
+	geminipda_drm_set_backlight(false);
+	WRITE_ONCE(sdev->panel_abort, false);
+	if (geminipda_panel_dsi_ready(sdev)) {
+		ret = geminipda_panel_send1(sdev, 0x28);
+		msleep(50);
+		if (!ret)
+			ret = geminipda_panel_send1(sdev, 0x10);
+		msleep(120 + 10);
+	} else {
+		ret = -EIO;
+	}
+	geminipda_panel_hw_off(sdev);
+	WRITE_ONCE(sdev->panel_state, PANEL_OFF);
+	if (ret)	/* the panel is unbiased and in reset either way */
+		dev_warn(dev, "panel off: DCS 0x28/0x10 not confirmed (%d), bias off anyway\n", ret);
+	else
+		dev_info(dev, "panel off\n");
+	return 0;
+}
+
+/* Stock lcm_resume, with the safeguards above. Under panel_lock. */
+static int geminipda_panel_on(struct geminipda_drm_device *sdev)
+{
+	struct device *dev = sdev->dev.dev;
+	ktime_t t0 = ktime_get();
+	unsigned int i = 0;
+	int ret, v;
+
+	if (sdev->panel_state == PANEL_ON)
+		return 0;
+	if (!geminipda_panel_dsi_ready(sdev)) {
+		dev_err(dev, "panel on refused: DSI0 not in LK's video mode (MODE %#x START %#x VM_CMD_CON %#x)\n",
+			readl(sdev->dsi + DSI_MODE_CTRL), readl(sdev->dsi + DSI_START),
+			readl(sdev->dsi + DSI_VM_CMD_CON));
+		ret = -EIO;
+		goto fail;
+	}
+
+	WRITE_ONCE(sdev->panel_abort, false);
+	geminipda_panel_reset(sdev, false);
+	gpiod_set_value(sdev->enp, 1);
+	gpiod_set_value(sdev->enn, 1);
+	hrtimer_start(&sdev->panel_guard, ms_to_ktime(panel_guard_ms), HRTIMER_MODE_REL);
+	msleep(20);
+
+	/* lp3101_poweron(): VPOS/VNEG, LK's values, read back */
+	ret = i2c_smbus_write_byte_data(sdev->bias, LCD_BIAS_VPOS, sdev->bias_vpos);
+	if (!ret)
+		ret = i2c_smbus_write_byte_data(sdev->bias, LCD_BIAS_VNEG, sdev->bias_vneg);
+	if (ret)
+		goto fail;
+	v = i2c_smbus_read_byte_data(sdev->bias, LCD_BIAS_VPOS);
+	ret = i2c_smbus_read_byte_data(sdev->bias, LCD_BIAS_VNEG);
+	if (v < 0 || ret < 0 || v != sdev->bias_vpos || ret != sdev->bias_vneg) {
+		dev_err(dev, "panel on: bias read-back %d/%d, wanted %#x/%#x\n",
+			v, ret, sdev->bias_vpos, sdev->bias_vneg);
+		ret = -EIO;
+		goto fail;
+	}
+
+	geminipda_panel_reset(sdev, true);
+	msleep(10);
+	geminipda_panel_reset(sdev, false);
+	msleep(10);
+	geminipda_panel_reset(sdev, true);
+	msleep(20);
+
+	for (i = 0; i < ARRAY_SIZE(ssd2092_init); i++) {
+		ret = geminipda_panel_send(sdev, ssd2092_init[i].d, ssd2092_init[i].len);
+		if (ret)
+			goto fail;
+		if (ssd2092_init[i].delay_ms)
+			msleep(ssd2092_init[i].delay_ms);
+	}
+
+	hrtimer_cancel(&sdev->panel_guard);
+	if (READ_ONCE(sdev->panel_abort)) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+
+	WRITE_ONCE(sdev->panel_state, PANEL_ON);
+	stat_panel_on_ms = ktime_ms_delta(ktime_get(), t0);
+	stat_panel_err = 0;
+	stat_panel_cycles++;
+	dev_info(dev, "panel on (%u ms)\n", stat_panel_on_ms);
+	if (READ_ONCE(sdev->crtc_on))
+		geminipda_drm_set_backlight(true);
+	return 0;
+
+fail:
+	hrtimer_cancel(&sdev->panel_guard);
+	geminipda_panel_hw_off(sdev);
+	WRITE_ONCE(sdev->panel_state, PANEL_FAILED);
+	if (READ_ONCE(sdev->panel_abort))
+		ret = -ETIMEDOUT;
+	stat_panel_err = ret;
+	stat_panel_err_cmd = i;
+	dev_err(dev, "panel on FAILED (%d at init step %u): left off (reset held, bias off); write \"on\" to retry\n",
+		ret, i);
+	return ret;
+}
+
+/* /sys/module/geminipda_drm/parameters/panel: read state, write off/on */
+static int geminipda_panel_param_set(const char *val, const struct kernel_param *kp)
+{
+	int ret;
+
+	mutex_lock(&panel_lock);
+	if (!panel_sdev || !panel_sdev->panel_ok)
+		ret = -ENODEV;
+	else if (sysfs_streq(val, "off"))
+		ret = geminipda_panel_off(panel_sdev);
+	else if (sysfs_streq(val, "on"))
+		ret = geminipda_panel_on(panel_sdev);
+	else
+		ret = -EINVAL;
+	mutex_unlock(&panel_lock);
+	return ret;
+}
+
+static int geminipda_panel_param_get(char *buf, const struct kernel_param *kp)
+{
+	const char *s = "unavailable";
+
+	mutex_lock(&panel_lock);
+	if (panel_sdev && panel_sdev->panel_ok)
+		s = panel_state_names[panel_sdev->panel_state];
+	mutex_unlock(&panel_lock);
+	return scnprintf(buf, PAGE_SIZE, "%s\n", s);
+}
+
+static const struct kernel_param_ops geminipda_panel_param_ops = {
+	.set = geminipda_panel_param_set,
+	.get = geminipda_panel_param_get,
+};
+module_param_cb(panel, &geminipda_panel_param_ops, NULL, 0644);
+MODULE_PARM_DESC(panel, "Panel power: read on/off/failed/unavailable; write off or on (stock sequence)");
+
+/*
+ * Probe: find the DSI0 registers, MMSYS (reset), the bias chip and the two
+ * bias GPIOs, and check LK left everything as expected.  Reads only; any
+ * surprise leaves panel-pm unavailable and the panel exactly as LK left it.
+ */
+static void geminipda_panel_init(struct geminipda_drm_device *sdev)
+{
+	struct device *dev = sdev->dev.dev;
+	struct device_node *np;
+	u32 rst = 0;
+	int vpos, vneg;
+
+	sdev->panel_state = PANEL_ON;
+	hrtimer_init(&sdev->panel_guard, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	sdev->panel_guard.function = geminipda_panel_guard_fn;
+
+	np = of_parse_phandle(dev->of_node, "mediatek,dsi", 0);
+	if (!np) {
+		dev_info(dev, "panel-pm: no mediatek,dsi in DT, unavailable\n");
+		return;
+	}
+	sdev->dsi = devm_of_iomap(dev, np, 0, NULL);
+	of_node_put(np);
+	if (IS_ERR(sdev->dsi)) {
+		dev_warn(dev, "panel-pm: dsi0 map failed (%ld)\n", PTR_ERR(sdev->dsi));
+		sdev->dsi = NULL;
+		return;
+	}
+
+	sdev->mmsys = syscon_regmap_lookup_by_phandle(dev->of_node, "mediatek,mmsys");
+	if (IS_ERR(sdev->mmsys)) {
+		dev_warn(dev, "panel-pm: mmsys syscon missing (%ld)\n", PTR_ERR(sdev->mmsys));
+		return;
+	}
+
+	np = of_parse_phandle(dev->of_node, "mediatek,lcd-bias", 0);
+	sdev->bias = np ? of_find_i2c_device_by_node(np) : NULL;
+	of_node_put(np);
+	if (!sdev->bias) {
+		dev_warn(dev, "panel-pm: lcd bias I2C client not found\n");
+		return;
+	}
+
+	/* GPIOD_ASIS: nothing is driven here */
+	sdev->enp = devm_gpiod_get_optional(dev, "enp", GPIOD_ASIS);
+	sdev->enn = devm_gpiod_get_optional(dev, "enn", GPIOD_ASIS);
+	if (IS_ERR_OR_NULL(sdev->enp) || IS_ERR_OR_NULL(sdev->enn)) {
+		dev_warn(dev, "panel-pm: enp/enn GPIOs missing\n");
+		goto put_bias;
+	}
+	if (gpiod_cansleep(sdev->enp) || gpiod_cansleep(sdev->enn) ||
+	    gpiod_get_direction(sdev->enp) != 0 || gpiod_get_direction(sdev->enn) != 0 ||
+	    gpiod_get_value(sdev->enp) != 1 || gpiod_get_value(sdev->enn) != 1) {
+		dev_warn(dev, "panel-pm: ENP/ENN not LK's output-high (enp dir %d val %d, enn dir %d val %d)\n",
+			 gpiod_get_direction(sdev->enp), gpiod_get_value(sdev->enp),
+			 gpiod_get_direction(sdev->enn), gpiod_get_value(sdev->enn));
+		goto put_bias;
+	}
+
+	regmap_read(sdev->mmsys, MMSYS_LCM_RST_B, &rst);
+	vpos = i2c_smbus_read_byte_data(sdev->bias, LCD_BIAS_VPOS);
+	vneg = i2c_smbus_read_byte_data(sdev->bias, LCD_BIAS_VNEG);
+	dev_info(dev, "panel-pm: LK state: LCM_RST_B %#x, bias VPOS %#x VNEG %#x, DSI0 MODE %#x START %#x VM_CMD_CON %#x\n",
+		 rst, vpos, vneg, readl(sdev->dsi + DSI_MODE_CTRL),
+		 readl(sdev->dsi + DSI_START), readl(sdev->dsi + DSI_VM_CMD_CON));
+	if (!(rst & BIT(0)) || vpos <= 0 || vpos > LCD_BIAS_MAX ||
+	    vneg <= 0 || vneg > LCD_BIAS_MAX || !geminipda_panel_dsi_ready(sdev)) {
+		dev_warn(dev, "panel-pm: LK state not as expected, unavailable\n");
+		goto put_bias;
+	}
+	sdev->bias_vpos = vpos;
+	sdev->bias_vneg = vneg;
+
+	sdev->panel_ok = true;
+	mutex_lock(&panel_lock);
+	panel_sdev = sdev;
+	mutex_unlock(&panel_lock);
+	dev_info(dev, "panel-pm: ready (panel_suspend=%d)\n", panel_suspend);
+	return;
+
+put_bias:
+	put_device(&sdev->bias->dev);
+	sdev->bias = NULL;
+}
+
+static void geminipda_panel_fini(struct geminipda_drm_device *sdev)
+{
+	mutex_lock(&panel_lock);
+	if (panel_sdev == sdev)
+		panel_sdev = NULL;
+	mutex_unlock(&panel_lock);
+	hrtimer_cancel(&sdev->panel_guard);
+	if (sdev->panel_ok && sdev->panel_state != PANEL_ON)
+		dev_warn(sdev->dev.dev, "panel-pm: leaving with the panel off (LK re-inits it at the next boot)\n");
+	if (sdev->bias)
+		put_device(&sdev->bias->dev);
+	sdev->bias = NULL;
+	sdev->panel_ok = false;
+}
+
 static void geminipda_drm_crtc_helper_atomic_enable(struct drm_crtc *crtc,
 						    struct drm_atomic_state *state)
 {
-	geminipda_drm_ovl_l0(geminipda_drm_device_of_dev(crtc->dev), true);
+	struct geminipda_drm_device *sdev = geminipda_drm_device_of_dev(crtc->dev);
+
+	geminipda_drm_ovl_l0(sdev, true);
 	drm_crtc_vblank_on(crtc);
-	/* always unblank: the param may have changed while off */
-	geminipda_drm_set_backlight(true);
+	WRITE_ONCE(sdev->crtc_on, true);
+	/* always unblank (the param may have changed while off), unless panel-pm has the panel off */
+	if (geminipda_panel_lit(sdev))
+		geminipda_drm_set_backlight(true);
 }
 
 static void geminipda_drm_crtc_helper_atomic_disable(struct drm_crtc *crtc,
 						     struct drm_atomic_state *state)
 {
+	WRITE_ONCE(geminipda_drm_device_of_dev(crtc->dev)->crtc_on, false);
 	drm_crtc_vblank_off(crtc);
 	if (READ_ONCE(blank_backlight))
 		geminipda_drm_set_backlight(false);
@@ -1362,6 +1806,7 @@ geminipda_drm_device_create(struct drm_driver *drv, struct platform_device *pdev
 	/* Hardware vblank from RDMA0 if the DT wires it (falls back above). */
 	geminipda_drm_ovl_init(sdev, fb_base, fb_size);
 	geminipda_drm_hw_vblank_init(sdev);
+	geminipda_panel_init(sdev);
 	WRITE_ONCE(sdev->drm_ready, true);
 
 	drm_mode_config_reset(dev);
@@ -1389,7 +1834,8 @@ static void geminipda_drm_lastclose(struct drm_device *dev)
 	if (!drm_dev_enter(dev, &idx))
 		return;
 	geminipda_drm_ovl_l0(sdev, true);
-	geminipda_drm_set_backlight(true);
+	if (geminipda_panel_lit(sdev))
+		geminipda_drm_set_backlight(true);
 	drm_dev_exit(idx);
 }
 
@@ -1419,8 +1865,10 @@ static int geminipda_drm_probe(struct platform_device *pdev)
 	dev = &sdev->dev;
 
 	ret = drm_dev_register(dev, 0);
-	if (ret)
+	if (ret) {
+		geminipda_panel_fini(sdev);
 		return ret;
+	}
 
 	drm_fbdev_generic_setup(dev, 0);
 
@@ -1434,6 +1882,7 @@ static int geminipda_drm_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
+	geminipda_panel_fini(sdev);
 	geminipda_drm_hw_vblank_fini(sdev);
 	geminipda_drm_ovl_fini(sdev);
 	sdev->vblank_on = false;
@@ -1447,11 +1896,49 @@ static void geminipda_drm_shutdown(struct platform_device *pdev)
 	struct geminipda_drm_device *sdev = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&sdev->dev);
+	geminipda_panel_fini(sdev);
 	geminipda_drm_hw_vblank_fini(sdev);
 	geminipda_drm_ovl_fini(sdev);
 	sdev->vblank_on = false;
 	hrtimer_cancel(&sdev->vblank_timer);
 }
+
+/*
+ * panel-pm in system suspend (panel_suspend=1): stock lcm_suspend before
+ * the SoC sleeps, so the panel is unbiased for the whole sleep (and through
+ * a hang); full re-init on resume, only if it was on before.  Never fails
+ * suspend/resume: off always ends in the safe state, a failed on stays dark.
+ */
+static int geminipda_drm_pm_suspend(struct device *dev)
+{
+	struct geminipda_drm_device *sdev = dev_get_drvdata(dev);
+
+	mutex_lock(&panel_lock);
+	sdev->panel_resume_on = false;
+	if (READ_ONCE(panel_suspend) && sdev->panel_ok &&
+	    sdev->panel_state == PANEL_ON) {
+		geminipda_panel_off(sdev);
+		sdev->panel_resume_on = true;
+	}
+	mutex_unlock(&panel_lock);
+	return 0;
+}
+
+static int geminipda_drm_pm_resume(struct device *dev)
+{
+	struct geminipda_drm_device *sdev = dev_get_drvdata(dev);
+
+	mutex_lock(&panel_lock);
+	if (sdev->panel_resume_on) {
+		sdev->panel_resume_on = false;
+		geminipda_panel_on(sdev);
+	}
+	mutex_unlock(&panel_lock);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(geminipda_drm_pm_ops,
+				geminipda_drm_pm_suspend, geminipda_drm_pm_resume);
 
 static const struct of_device_id geminipda_drm_of_match[] = {
 	{ .compatible = "planet,geminipda-drm" },
@@ -1463,6 +1950,7 @@ static struct platform_driver geminipda_drm_platform_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
 		.of_match_table = geminipda_drm_of_match,
+		.pm = pm_sleep_ptr(&geminipda_drm_pm_ops),
 	},
 	.probe = geminipda_drm_probe,
 	.remove = geminipda_drm_remove,

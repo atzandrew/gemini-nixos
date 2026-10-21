@@ -164,3 +164,22 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
 - `i2cget -y -f <i2c1 bus> 0x3e 0x00` / `0x01` / `0x03` → LK's bias values (0x0E or 0x0F?).
 - 0x14000150 = 1? GPIO180 mode = LCM_RST? GPIO60/251 high? DSI0 MODE_CTRL 0x1, VM_CMD_CON 0x21, INTSTA.
 - Which `/dev/i2c-N` is i2c@11008000.
+
+### Implementation: panel-pm in geminipda-drm (2026-10-21, built, NOT yet run on the device)
+- Choice (user, 2026-10-21): option 1 (video mode, VM_CMD), panel side exactly stock, safeguards 1–6:
+  fail-to-off; no automatic retry; LK's bias values read at probe + read back after writing; every command waits
+  for VM_CMD_DONE (100 ms timeout); guard hrtimer (`panel_guard_ms`, 6000) forces reset + bias off if "on" stalls;
+  backlight only after a good init and only with the CRTC on. Status read-back (0x0A = 0x9C) left out (needs
+  command mode); add it if the tests show anything odd.
+- Probe only reads. `panel-pm: LK state: …` in dmesg logs LCM_RST_B, bias VPOS/VNEG, DSI0 MODE/START/VM_CMD_CON;
+  any surprise → "unavailable", the panel stays as LK left it. Requesting GPIO60/251 sets their mux to GPIO, which
+  is what LK already uses.
+- Params: `panel` (read on/off/failed/unavailable; write off|on), `panel_suspend` (default 0: suspend not hooked
+  until the awake tests pass), `panel_guard_ms`, `stat_panel_on_ms`, `stat_panel_err`, `stat_panel_err_cmd`,
+  `stat_panel_cycles`.
+- VM_CMD sends at most one packet per frame's front porch, so "on" may take up to ~186 × 16.9 ms ≈ 3.3 s
+  (+ ~230 ms of stock delays); `stat_panel_on_ms` measures it. The guard is 6 s for that reason.
+- Needs both the new DTB (boot image) and the new module. Old DT → "no mediatek,dsi in DT, unavailable".
+- Test helper: `bin/sleep-tests/panel-cycle.sh state | off | on | cycle [secs] [count]` (prints state, errors,
+  init time, GPIO60/251, 0x14000150). gemini-suspend-prep / s2.sh still send DCS 0x28/0x29 themselves; drop that
+  once panel_suspend is on by default.
