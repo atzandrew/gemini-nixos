@@ -201,9 +201,24 @@ module_param(disp_check, bool, 0644);
 MODULE_PARM_DESC(disp_check, "mode 1: refuse the suspend while OVL0 layer 0 (the display) is on");
 
 /* Why the last suspend ended, for logs and userspace hooks. */
+/*
+ * LCD bias check (2026-10-21): never sleep with the panel biased (6 screen
+ * burns; CLAUDE.md "Never").  geminipda-drm panel_suspend=1 powers the panel
+ * off in its device suspend, which runs before .prepare; this reads the two
+ * bias enables at the pad (DIN) and refuses the suspend if either is high.
+ */
+#define LCD_ENP_GPIO		60
+#define LCD_ENN_GPIO		251
+static bool bias_check = true;
+module_param(bias_check, bool, 0644);
+MODULE_PARM_DESC(bias_check, "mode 1: refuse the suspend while the LCD bias (ENP GPIO60 / ENN GPIO251) is on (default on)");
+static char bias_at_sleep[16] = "unknown";
+module_param_string(bias_at_sleep, bias_at_sleep, sizeof(bias_at_sleep), 0444);
+MODULE_PARM_DESC(bias_at_sleep, "LCD bias enables read in the last .prepare: \"ENP x ENN y\"");
+
 static char last_wake[24] = "none";
 module_param_string(last_wake, last_wake, sizeof(last_wake), 0444);
-MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened, SPM wake reason, cycle failed, pmic read failed, display on");
+MODULE_PARM_DESC(last_wake, "why the last suspend ended: max_s, key, lid opened, SPM wake reason, cycle failed, pmic read failed, display on, bias on");
 
 /* ---------------------------------------------------------------- registers */
 #define SPM_PHYS		0x10006000
@@ -1077,6 +1092,18 @@ static int gem_suspend_prepare(void)
 			readl(ovl + OVL_SRC_CON));
 		strscpy(last_wake, "display on", sizeof(last_wake));
 		return -EBUSY;
+	}
+	{
+		unsigned int enp = !!(readl(gpio + GPIO_DIN(LCD_ENP_GPIO)) & BIT(LCD_ENP_GPIO % 32));
+		unsigned int enn = !!(readl(gpio + GPIO_DIN(LCD_ENN_GPIO)) & BIT(LCD_ENN_GPIO % 32));
+
+		snprintf(bias_at_sleep, sizeof(bias_at_sleep), "ENP %u ENN %u", enp, enn);
+		pr_info(TAG "LCD bias before sleep: %s\n", bias_at_sleep);
+		if (bias_check && (enp || enn)) {
+			pr_warn(TAG "LCD bias still on - refusing (geminipda_drm panel_suspend=1?)\n");
+			strscpy(last_wake, "bias on", sizeof(last_wake));
+			return -EBUSY;
+		}
 	}
 	cr_susp++;
 	cr_n = 0;
