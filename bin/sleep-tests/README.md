@@ -27,3 +27,6 @@ Logs land next to the scripts (`*.log`); they are results, not tracked here.
   genpd (d2f4783), kept for reference.
 - `pmw.sh ADDR VALUE`: PMIC write through the SPM DVFS pwrap port; `vcore.sh`: Vcore reg readback.
 - `e26.sh` / `e27.sh`: awake GPIO load tests (speaker amps ~60 mA, USB1 VBUS trio ~11 mA).
+- `soak.sh` + `gemini-soak.service`: unattended overnight sleep series (hangs per hour). Survives
+  the PCM-WDT reboots: while armed, greetd autologins to Plasma and the service carries on. Install
+  in /home/andrew/soak/ + /etc/systemd/system/; `soak.sh arm HOURS [SLEEP_S] [LABEL]`, `disarm`.

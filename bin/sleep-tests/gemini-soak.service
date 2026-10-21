@@ -1,0 +1,14 @@
+# Unattended sleep series for the SPM hang hunt (bin/sleep-tests/soak.sh).
+# Inert unless armed (soak.sh arm creates /home/andrew/soak/armed and enables
+# this unit; disarm disables it). Install: copy to /etc/systemd/system/.
+[Unit]
+Description=Gemini sleep soak test (SPM hang hunt)
+ConditionPathExists=/home/andrew/soak/armed
+After=greetd.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /home/andrew/soak/soak.sh run
+
+[Install]
+WantedBy=multi-user.target
