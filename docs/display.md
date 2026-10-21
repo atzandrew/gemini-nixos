@@ -223,3 +223,6 @@ left biased and unrefreshed (6 burns so far). Sources: vendor 3.18 kernel gemian
   Not covered: Plasma/logind starting the suspend (needs sleep.target unmasked).
 - Test 7 (11:41) reboot with the panel off (bias low, reset held): LK re-initialised it, driver "ready" with the
   usual LK state; defaults back (installed module without bias_check, panel_suspend=0, suspend masked).
+- **Test 8 (2026-10-21 11:43–12:37) soak:** `panel-cycle.sh cycle 10 200`: 200/200 off with reset 0 + ENP/ENN low,
+  200/200 on err=0 (≤ 892 ms, typ. ~850), no kernel warnings. Plasma idle-blanked the screen mid-run: the driver kept
+  the backlight off (CRTC off) and lit it at the next panel-on after a key press, as designed.
