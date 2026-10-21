@@ -158,10 +158,21 @@ the LK logo (~15 s WDT loop) before any kernel output (discovered
    pin + date every claim about it).
 4. **Small, dated deltas beat big rewrites.** Append to the tables and
    logs; don't restructure docs casually.
-5. **NEVER abuse the LCD panel/matrix (CORE RULE).** The unit's NT36672
-   TDDI is initialized ONLY by LK; a badly-initialized panel shows the
-   "uninitialised" flicker and can BURN the LCD matrix (permanent damage
-   — observed 2026-09-04). For THIS repo:
+5. **NEVER abuse the LCD panel/matrix (CORE RULE).** The panel is a
+   Solomon SSD2092 TDDI (cmdline LCM `aeon_ssd2092_fhd_dsi_solomon`; earlier
+   notes said NT36672). LK initialises it at boot; a badly-initialized panel
+   shows the "uninitialised" flicker and can BURN the LCD matrix (permanent
+   damage — observed 2026-09-04). A panel left biased and unrefreshed in
+   sleep burns it too (6 times, 2026-10). For THIS repo:
+   - **One approved exception (user, 2026-10-21): geminipda-drm "panel-pm"**
+     — the stock vendor off/on sequence for system suspend (bias off in
+     sleep, full vendor init on resume) through LK's running DSI setup, with
+     fail-to-off safeguards. Tested 2026-10-21 (docs/display.md "Panel
+     off/on"). Any change to it, its init table or the DSI writes needs the
+     user present for the first test, one OK per panel write, and a stop at
+     the first flicker or colour fault.
+   - Never sleep with the LCD bias on (GPIO60 ENP / GPIO251 ENN high);
+     mt6797-suspend `bias_check` enforces it.
    - The kernel must stay the **fbcon/exclude-display build** — the
      borrowed #329 payload is exactly that. When the in-repo kernel
      derivation (`devices/planet-geminipda/kernel/`) is finally used,

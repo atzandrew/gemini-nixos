@@ -848,7 +848,7 @@ static void geminipda_drm_ovl_l0(struct geminipda_drm_device *sdev, bool on)
  * exactly as the vendor 3.18 lcm driver (aeon_ssd2092_fhd_dsi_solomon.c):
  *   off: DCS 0x28, 50 ms, DCS 0x10, 120 ms, 10 ms, RESET low, ENN low, ENP low
  *   on:  RESET low, ENP high, ENN high, 20 ms, bias regs over I2C (lp3101),
- *        RESET 1, 10 ms, 0, 10 ms, 1, 20 ms, init table (186 commands)
+ *        RESET 1, 10 ms, 0, 10 ms, 1, 20 ms, init table (186 vendor commands = 188 packets: 0xC3 split)
  * DSI side: commands go out through the video-mode command slot (VM_CMD,
  * vendor DSI_set_cmdq_V2 video branch, the path bin/sleep-tests/dcs.sh
  * proved for 0x28/0x29); LK's DSI/RDMA/OVL setup keeps running.  Stock
