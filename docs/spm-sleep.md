@@ -208,3 +208,24 @@ returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
   2026-10-19 Debian image shipped.
 - Keys are only checked once per cycle while armed (lid shut = keyboard
   unreachable; opening the lid wakes it).
+
+## Sleep power: DSI streaming in suspend (2026-10-22)
+Question: does the display pipeline that keeps streaming in suspend (geminipda-drm only adopts LK's
+pipeline; MM/DIS domain bit 3 stays on) cost much? Test: stop DSI0 video streaming for the sleep, the
+stock `ddp_dsi_stop` way (MODE_CTRL 0, wait INTSTA BUSY clear, PHY_LCCON LC_HS_TX_EN 0), restart with
+MODE_CTRL 1 + HS clock + START 0->1, all only while panel-pm has the panel off (bias low, reset held).
+Tools: `bin/sleep-tests/dsi-stream.sh`, `s2.sh` env `DSI_STOP=1` / `MOD=`. User present (rule 5).
+- Awake cycle (panel off, stop, 10 s, start, panel on 862 ms): picture correct, no shift. RDMA/OVL/mutex
+  need no reset for a plain stop/restart. While stopped, Plasma commits log "vblank wait timed out"
+  (the vblank IRQ is RDMA0's, which stalls with the stream); a driver version must handle that.
+- 300 s SPM sleeps, installed module dd3cbe9 (pcm_wdt=30, bias_check), lid open, Wi-Fi/BT/connsys off:
+
+| run | DSI in sleep | mA (kernel window) | screen after |
+|---|---|---|---|
+| A 10:08 | streaming (shipped) | 184.1 over 332 s | normal |
+| B 10:16 | stopped, HS clock LP | 178.9 over 331 s | normal (panel on 874 ms) |
+
+- Result: ~5 mA (3%), near the run-to-run spread (175-184 mA). The stream itself (DSI PHY HS + RDMA
+  DRAM reads) is not where the ~175 mA goes. Still unmeasured: the MM/DIS domain + MMPLL/clocks being
+  off (needs a real display driver, plan step 2); this result does not justify step 2 on its own.
+  Next: the AUDIO domain (step 3) and the stock steps we skip.
