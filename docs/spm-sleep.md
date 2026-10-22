@@ -255,3 +255,7 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
   the mt6797-mt6351 machine driver. Not worth it for sleep power (0 mA); maybe for awake idle later.
 - Conclusion with the DSI result: display stream ~5 mA, the rest of these ~0. The ~180 mA is not in these
   SoC-side levers. Next: the off-SoC split (awake A/B, group-then-split) and whether SRCCLKEN/26M really drops.
+- SRCCLKEN check (read-only, vendor pcm_def_mt6797.h): R13 in sleep = 0x00060000 = only bit 17 WAKE_EVENT_STA +
+  bit 18 EMI_IDLE. No 26M requests (MD1/MD2/MD32/CONN/LTE SRCCLKENA bits 2/5/6/14/29 = 0), no CONN_DDR_EN (4) or
+  CONN_STATE (13); with dbg 0x10ff (26M step runs) the SoC looks like it reaches its 26M-off state. So the
+  ~180 mA is most likely off-SoC → the off-SoC split is the next step.
