@@ -320,5 +320,6 @@ the reload above hung on its 3rd sleep.
    after it.
 2. Stock steps we skip ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)): thermal chunks, the pwrap
    SUSPEND table (`dvs=1`, de1fa94, untested), PMIC preparation, CIRQ/IRQ masking, DRAM self-refresh.
-3. connsys: gemini-suspend-prep power-cycles connsys around every sleep and logs "live client resync FAIL".
-   Not examined.
+3. connsys: gemini-suspend-prep power-cycles connsys around every sleep. The resync result logged just
+   before each sleep does not predict a hang (journal 2026-10-21/22, 102 sleeps: after "resync FAIL" 6 / 50
+   hung, after a good resync 4 / 52). The power cycle itself happens on every sleep, so it is not ruled out.
