@@ -1,7 +1,7 @@
 # SPM sleep on the Gemini (MT6797)
 
-## Current status (2026-10-21)
-- **Suspend is on again** for everyday use (lid, power key, lock screen).
+## Current status (2026-10-22)
+- **Suspend is on** for everyday use (lid, power key, lock screen).
   The panel is really powered off in every suspend (geminipda-drm
   `panel_suspend=1`, stock vendor off/on sequence; see
   [`display.md`](display.md) "Panel off/on"). `mt6797-suspend` `bias_check`
@@ -11,44 +11,42 @@
   is not enough: 6 screen burns (image retention), the last after ~2 h of
   12–30 min test sleeps on 2026-10-20. Stock always turns the bias off in
   suspend (`stock-suspend-mt6797.md`).
-- Installed module: b307168 (= d8e34ce + `bias_check`), with `pcm_wdt=30`
-  from `/etc/modprobe.d/gemini-suspend.conf`. A hang now means: panel already
-  off, PCM watchdog resets the SoC ~30 s later, the Gemini reboots by itself to
-  the greetd login.
-- **The hang is still there**: random in time asleep, about one per 20–25 min.
-  Not tied to the number of SPM cycles. Five 30 min runs on 2026-10-20 (module
-  d8e34ce, lid open, display-off, bias on):
+- **The random sleep hang is fixed** (dd3cbe9, `srcclken_low` default Y).
+  Cause: we forced `SPM_FLAG_DIS_SRCCLKEN_LOW` (bit 15) in every suspend;
+  stock suspend never sets it (only the idle modes do). With it forced, about
+  one hang per 20–25 min asleep, random in time, always at breadcrumb step
+  "PSCI suspend", ending in a PCM watchdog reset. Without it:
 
-  | Cycle | Hang at cycle | Time to hang |
-  |---|---|---|
-  | 2 s | 322 | ~12 min |
-  | 5 s | 267 | ~24 min |
-  | 2 s | — | woke after 30 min (899 cycles, 223 mA) |
-  | 2 s | 482 | ~18 min |
-  | 0.5 s | 2256 | ~27 min |
+  | Run | Sleeps | Asleep | Hangs (old rate predicts) | Power |
+  |---|---|---|---|---|
+  | 2026-10-21 afternoon | 12 × 600 s | 2 h | 0 (5–6) | 178–181 mA |
+  | 2026-10-21/22 overnight | 34 × 600 s | 5.7 h | 0 (~15) | 173–181 mA |
 
-  2026-10-21, panel off in sleep (b307168): one hang after ~6 min total in
-  30 s sleeps (the 10th of 10 short sleeps), breadcrumb `b5010006`.
-  Every hang is at breadcrumb step "PSCI suspend", i.e. inside the SPM sleep.
-  Panel-off did not change it. Fewer or longer cycles (lid EINT, long PCM
-  timer) will not fix it.
-- **PCM watchdog** (`pcm_wdt=N`, as stock `__spm_set_pcm_wdt`): each sleep
-  arms the SPM watchdog at PCM timer + N s; a stuck sleep resets the SoC
-  (TOPRGU REQ_MODE SPM, EXTEN cleared → SoC-only reset) and the breadcrumb
-  survives in NONRST_REG2 (printed and cleared at module load). Verified with
-  a forced case (`pcm_wdt_test`) and 5 real hangs.
-- The SoC reset wipes the SPM (all PCM registers at reset defaults), so there
-  is no post-mortem state. `pcm_wdt_wake` (watchdog wakes instead of
-  resetting) did **not** rescue a hang. The PCM firmware or the CPU/ATF side
-  is wedged, not just missing a wake event.
-- Power: 181–185 mA over 30 s sleeps with the panel off (213–223 mA with the
-  bias on); no long sleep measured yet.
+  Power is the same either way, so SRCCLKEN (26 MHz request) is probably
+  still held high by something else (likely connsys). `srcclken_low=0`
+  brings the old behaviour back, for tests only.
+- What the hang hunt ruled out (2026-10-21): sleep length (hangs at 11 s and
+  at 21 min), number of SPM cycles (100 ms ticks: 2885 cycles in 15 min,
+  clean), the pwrap DVFS command table (the firmware sends no pwrap commands
+  in suspend). Flag lineup vs stock and the full log:
+  `notes/next-session-hang-prompt.md` (Dragon). Do not clear bit 9
+  (`DIS_VPROC_VSRAM_DVS`): hard crash + PMIC power cycle (2026-10-14).
+- Installed module: dd3cbe9 (`bias_check`, `srcclken_low` default Y), with
+  `pcm_wdt=30` from `/etc/modprobe.d/gemini-suspend.conf`. The PCM watchdog
+  stays on as a safety net: a stuck sleep resets the SoC ~30 s later and the
+  breadcrumb survives in NONRST_REG2 (printed and cleared at module load).
+- Power domains still on in sleep (`SPM_PWR_STATUS` 0x2b00005c): display
+  MM/DIS (bit 3) and AUDIO (bit 24); ISP, VDEC, MFG, MJC, VENC are off. The
+  display pipeline stays on because geminipda-drm only adopts LK's setup.
+- Soak runner for unattended series: `bin/sleep-tests/soak.sh` (+
+  `gemini-soak.service`), survives hang reboots. Use MIN_BAT ≥ 40: at 28 %
+  the battery browned out during the next boot (2026-10-22).
 - On external power `gemini-suspend-prep` refuses suspend; Plasma then retries
   every 10 s and the screen stays lit under a shut lid. Open.
 - Lid EINT wake works mechanically but is **not usable** (see that section).
-- Next: overnight runs to measure hangs per hour, then try the stock steps we
-  skip one at a time (thermal chunking, PMIC PG force-on, pwrap SUSPEND table,
-  CIRQ/sysclk): [`stock-suspend-mt6797.md`](stock-suspend-mt6797.md).
+- Next: lower sleep power (~175 mA): stop DSI streaming / display pipeline in
+  suspend, the audio domain, then the stock steps we skip
+  ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)).
 
 ## History
 

@@ -57,7 +57,7 @@ arm)
 	[ -n "${2:-}" ] || { echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N]" >&2; exit 2; }
 	mkdir -p $D; rm -f $D/stop; echo 0 > $D/count
 	end=$(( $(date +%s) + ${2} * 3600 ))
-	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\nMOD=%s\nMODARGS="%s"\n' $end "${3:-600}" "${4:-soak}" "${5:-30}" "${6:-0}" "${MOD:-}" "${MODARGS:-}" > $A
+	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\nMOD=%s\nMODARGS="%s"\n' $end "${3:-600}" "${4:-soak}" "${5:-40}" "${6:-0}" "${MOD:-}" "${MODARGS:-}" > $A
 	autologin_on
 	systemctl daemon-reload; systemctl enable $U >/dev/null 2>&1
 	log "=== armed: $(tr '\n' ' ' < $A)(until $(date -d @$end '+%F %T'))"
