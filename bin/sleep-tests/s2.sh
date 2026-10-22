@@ -4,6 +4,9 @@
 # before; DCS 0x29 + everything back after. .enter sleeps POLL ms per SPM cycle and leaves on
 # Esc/On or silver key, lid opening, or MAX s. EXTRA = more module args (e.g. touch_rst=1).
 # Run: sudo -n -b busybox sh /home/andrew/connsys/s2.sh [MAX] [POLL] [GAP] [EXTRA] [LOG]
+# Env: MOD=/path/mt6797-suspend.ko (default ~/mt6797-suspend.ko; insmod: no modprobe.d, so give pcm_wdt=30 in EXTRA).
+#      DSI_STOP=1: after DCS 0x28, panel-pm off + stop DSI0 streaming (~/panel/dsi-stream.sh); restart + panel-pm on
+#      after the sleep (sleep power step 1, 2026-10-22).
 MAX=${1:-60}; POLL=${2:-2000}; GAP=${3:-200}; EXTRA=${4:-}
 D=/home/andrew/connsys; O=${5:-$D/s2.log}
 : > $O
@@ -21,7 +24,9 @@ dpms() { timeout 10 runuser -u andrew -- env XDG_RUNTIME_DIR=/run/user/1001 WAYL
 l0() { busybox devmem 0x1400b02c 32; }
 # "s2.sh panel-on [..] [LOG]": DCS 0x29 + DPMS on only (ends a PANEL_KEEP_OFF series).
 if [ "$1" = panel-on ]; then [ "$(rd 0x14)" = 0x00000001 ] || { log "DSI not in video mode - abort"; exit 1; }; dcs 0x29; dpms on; log "panel on"; exit 0; fi
+DS=/home/andrew/panel/dsi-stream.sh; PP=/sys/module/geminipda_drm/parameters/panel; DSTOPPED=0
 restore() {
+	if [ "$DSTOPPED" = 1 ]; then sh $DS start >> $O 2>&1; echo on > $PP; log "panel-pm on: $(cat $PP) on_ms=$(cat ${PP%/panel}/stat_panel_on_ms)"; fi
 	# PANEL_KEEP_OFF=1 (env): leave the panel display-off + DPMS off after the run, so a series
 	# does not flash the static lock screen between suspends (screen burns 2026-10-17/18).
 	if [ "$PANEL_KEEP_OFF" = 1 ]; then log "panel kept off"; else dcs 0x29; fi
@@ -34,7 +39,7 @@ restore() {
 }
 [ "$(rd 0x14)" = 0x00000001 ] && [ $(( $(rd 0x130) & 0xff )) -eq $((0x21)) ] || { log "DSI not in expected state - abort"; exit 1; }
 lsmod | grep -q mt6797_suspend && rmmod mt6797-suspend
-insmod /home/andrew/mt6797-suspend.ko mode=1 max_s=$MAX poll_ms=$POLL gap_ms=$GAP $EXTRA || { log "insmod failed"; exit 1; }
+insmod ${MOD:-/home/andrew/mt6797-suspend.ko} mode=1 max_s=$MAX poll_ms=$POLL gap_ms=$GAP $EXTRA || { log "insmod failed"; exit 1; }
 log "mod text=$(cat /sys/module/mt6797_suspend/sections/.text) nmods=$(wc -l < /proc/modules)"	# hang hunt: layout per run
 echo deep > /sys/power/mem_sleep
 log "module ok; mem_sleep=$(cat /sys/power/mem_sleep); waiting for unplug"
@@ -48,6 +53,8 @@ sleep 2; log "connoff r13=$(busybox devmem 0x10006134 32)"
 for c in 9 8; do echo 0 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done
 dpms off; sleep 2
 dcs 0x28 || { restore; exit 1; }
+if [ "$DSI_STOP" = 1 ]; then echo off > $PP; DSTOPPED=1; log "panel-pm off: $(cat $PP)"
+	sh $DS stop >> $O 2>&1 || { log "dsi stop failed"; restore; exit 1; }; fi
 sleep 1
 [ "$(l0)" = 0x00000000 ] || { log "L0 on right before suspend - abort"; restore; exit 1; }
 P=/sys/class/power_supply/mt6351-battery; c0=$(cat $P/charge_counter); t0=$(date +%s.%N)
