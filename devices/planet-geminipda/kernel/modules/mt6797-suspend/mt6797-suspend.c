@@ -172,6 +172,17 @@ static uint pmic_misc;
 module_param(pmic_misc, uint, 0644);
 MODULE_PARM_DESC(pmic_misc, "mode 1: stock suspend-entry PMIC bits for the loop, bitmask: 1 OSC_SEL_HW_MODE, 2 VGPU buck low-IQ (power test)");
 
+/*
+ * DRAM self-refresh hunt (2026-10-22, docs/spm-sleep.md "Vcore DVS table"): stock
+ * spm_go_to_sleep clears SPM_FLAG_DIS_VCORE_DVS and the PCM firmware then drives the
+ * PMIC through the SUSPEND pwrap table (vendor 3.18 mt_spm_pmic_wrap.c MT6797 set +
+ * spm_suspend_pre_process). DDREN never ran with bit 3 set; this loads that table.
+ */
+static uint dvs;
+module_param(dvs, uint, 0644);
+static u32 dvs_active;	/* dvs value in use for this suspend (0 = dummy table) */
+MODULE_PARM_DESC(dvs, "mode 1: 1 = stock MT6797 SUSPEND pwrap table in the SPM DVFS slots + clear SPM_FLAG_DIS_VCORE_DVS (bit 3); 2 = also clear DIS_VPROC_VSRAM_DVS (bit 9). Vcore/VSRAM PMIC regs restored after each suspend (DRAM self-refresh test)");
+
 /* stage-6 settings (docs/spm-sleep.md "Recommended settings") */
 static uint flags = 0x5fc102ff;
 module_param(flags, uint, 0644);
@@ -846,6 +857,10 @@ static void spm_sleep_once(struct cyc *r, u32 ms, u32 wmask)
 	memset(r, 0, sizeof(*r));
 	crumb(CR_SETUP);
 	swflag = (flags | (srcclken_low ? 0 : SPM_FLAG_DIS_SRCCLKEN_LOW)) & ~SPM_FLAG_DIS_CPU_PDN;
+	if (dvs_active & 1)
+		swflag &= ~BIT(3);	/* SPM_FLAG_DIS_VCORE_DVS */
+	if (dvs_active & 2)
+		swflag &= ~BIT(9);	/* SPM_FLAG_DIS_VPROC_VSRAM_DVS */
 
 	wr(PCM_REG_DATA_INI, rd(SPM_POWER_ON_VAL0));
 	wr(PCM_PWR_IO_EN, PCM_RF_SYNC_R0);
@@ -944,7 +959,47 @@ static struct {
 	u8 prio;
 	u32 apsb, irqm, tval, wdtv, bsi[3], wmask, cwe, wfi[10], flag, rsv0, dbg;
 	u32 src, src2, clkcon, settle, mp1, mp2, ini, vec[16], pw[32];
+	u32 pm[5];		/* dvs: PMIC 0x060a 0x060c 0x044a 0x045c 0x06a8 */
 } sv;
+
+static const u16 dvs_reg[5] = { 0x060a, 0x060c, 0x044a, 0x045c, 0x06a8 };
+
+/*
+ * Stock MT6797 PMIC_WRAP_PHASE_SUSPEND table (IDX_SP_*), 6.25 mV steps from 0.6 V.
+ * Slot 0 (HPM) uses the live VOSEL_ON so a wake returns to today's Vcore.
+ * Returns -EIO if a PMIC read fails (then the dummy table is used).
+ */
+static int dvs_table(void)
+{
+	u32 adr[16], dat[16], i;
+
+	for (i = 0; i < 5; i++)
+		if (pmic_read(dvs_reg[i], &sv.pm[i]))
+			return -EIO;
+	adr[0] = 0x060a; dat[0] = sv.pm[0];			/* VCORE_HPM (live, 0x40 = 1.0 V) */
+	adr[1] = 0x060a; dat[1] = 0x3e;				/* TRANS1 0.98333 V */
+	adr[2] = 0x060a; dat[2] = 0x3b;				/* TRANS2 0.96666 V */
+	adr[3] = 0x060a; dat[3] = 0x38;				/* TRANS3 0.94999 V */
+	adr[4] = 0x060a; dat[4] = 0x36;				/* TRANS4 0.93333 V */
+	adr[5] = 0x060a; dat[5] = 0x33;				/* TRANS5 0.91666 V */
+	adr[6] = 0x060a; dat[6] = 0x30;				/* LPM 0.9 V */
+	adr[7] = 0x060c; dat[7] = 0x00;				/* VOSEL_SLEEP 0.6 V */
+	adr[8] = 0x044a; dat[8] = sv.pm[2] | (3 << 8);		/* VSLEEP_SEL 0.6 V */
+	adr[9] = 0x060a; dat[9] = 0x1c;				/* DPIDLE_SODI 0.775 V */
+	adr[10] = 0x06a8; dat[10] = 0x40;			/* VSRAM_CORE 1.0 V */
+	adr[11] = 0x06a8; dat[11] = 0x50;			/* VSRAM_CORE 1.1 V */
+	adr[12] = 0x045c; dat[12] = sv.pm[3] | BIT(1);		/* VCORE low-IQ on */
+	adr[13] = 0x045c; dat[13] = sv.pm[3] & ~BIT(1);		/* VCORE low-IQ off */
+	adr[14] = 0x060c; dat[14] = 0x10;			/* VOSEL_SLEEP 0.7 V */
+	adr[15] = 0x044a; dat[15] = sv.pm[2] & ~(3 << 8);	/* VSLEEP_SEL 0.7 V */
+	for (i = 0; i < 16; i++) {
+		writel(adr[i], pwrap + PWRAP_DVFS_ADR0 + 8 * i);
+		writel(dat[i], pwrap + PWRAP_DVFS_ADR0 + 8 * i + 4);
+	}
+	pr_info(TAG "dvs=%u: stock SUSPEND pwrap table; pmic 060a %04x 060c %04x 044a %04x 045c %04x 06a8 %04x\n",
+		dvs, sv.pm[0], sv.pm[1], sv.pm[2], sv.pm[3], sv.pm[4]);
+	return 0;
+}
 
 static int spm_prepare(void)
 {
@@ -997,7 +1052,10 @@ static int spm_prepare(void)
 		sv.vec[i] = rd(PCM_EVENT_VECTOR0 + 4 * i);
 	for (i = 0; i < 32; i++)
 		sv.pw[i] = readl(pwrap + PWRAP_DVFS_ADR0 + 4 * i);
-	for (i = 0; i < 16; i++) {	/* SPM PMIC commands -> read-only HWCID */
+	dvs_active = 0;
+	if (dvs && dvs_table() == 0)
+		dvs_active = dvs;
+	else for (i = 0; i < 16; i++) {	/* SPM PMIC commands -> read-only HWCID */
 		writel(0x0200, pwrap + PWRAP_DVFS_ADR0 + 8 * i);
 		writel(0, pwrap + PWRAP_DVFS_ADR0 + 8 * i + 4);
 	}
@@ -1053,6 +1111,21 @@ static void spm_finish(void)
 		wr(SPM_BSI_D0_SR + 4 * i, sv.bsi[i]);
 	for (i = 0; i < 32; i++)
 		writel(sv.pw[i], pwrap + PWRAP_DVFS_ADR0 + 4 * i);
+	if (dvs_active) {	/* PMIC back to the pre-suspend values (VSRAM before Vcore) */
+		u32 now[5];
+
+		for (i = 0; i < 5; i++)
+			if (pmic_read(dvs_reg[i], &now[i]))
+				now[i] = ~0U;
+		pr_info(TAG "dvs: pmic after sleep 060a %04x 060c %04x 044a %04x 045c %04x 06a8 %04x\n",
+			now[0], now[1], now[2], now[3], now[4]);
+		pmic_write(0x06a8, sv.pm[4]);
+		udelay(200);
+		for (i = 0; i < 4; i++)
+			pmic_write(dvs_reg[i], sv.pm[i]);
+		udelay(200);
+		dvs_active = 0;
+	}
 	sv.active = false;
 }
 
