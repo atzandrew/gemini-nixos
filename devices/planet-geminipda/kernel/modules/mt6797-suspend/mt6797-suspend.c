@@ -214,13 +214,15 @@ module_param(bias_check, bool, 0644);
 MODULE_PARM_DESC(bias_check, "mode 1: refuse the suspend while the LCD bias (ENP GPIO60 / ENN GPIO251) is on (default on)");
 
 /*
- * Hang hunt 2026-10-21: stock suspend never sets SPM_FLAG_DIS_SRCCLKEN_LOW
- * (only the idle modes do); we have always forced it. Y = leave it out, so
- * the firmware may drop SRCCLKEN (26 MHz request to the PMIC) as stock does.
+ * Hang hunt 2026-10-21/22: stock suspend never sets SPM_FLAG_DIS_SRCCLKEN_LOW
+ * (only the idle modes do). Forcing it (our old default) caused the random
+ * sleep hang (~1 per 20-25 min asleep, PSCI suspend -> PCM WDT reset). Left
+ * out: 46 x 10 min, 0 hangs, same ~175 mA (docs/spm-sleep.md).
+ * Y = leave it out, as stock; N = force it (old behaviour, for tests only).
  */
-static bool srcclken_low;
+static bool srcclken_low = true;
 module_param(srcclken_low, bool, 0644);
-MODULE_PARM_DESC(srcclken_low, "mode 1: do not force SPM_FLAG_DIS_SRCCLKEN_LOW (stock suspend; default N = forced)");
+MODULE_PARM_DESC(srcclken_low, "mode 1: do not force SPM_FLAG_DIS_SRCCLKEN_LOW (stock suspend; default Y; N = old forced, hangs)");
 static char bias_at_sleep[16] = "unknown";
 module_param_string(bias_at_sleep, bias_at_sleep, sizeof(bias_at_sleep), 0444);
 MODULE_PARM_DESC(bias_at_sleep, "LCD bias enables read in the last .prepare: \"ENP x ENN y\"");
