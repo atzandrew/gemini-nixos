@@ -4,7 +4,7 @@
 `conn_pwr_off`, cef35fd). With connsys powered off, PCM_REG13 bits 13/14/27 clear and the SPM
 firmware runs the **26M-off step for the first time** (SW_DEBUG bits 0/1, SPM sleep ~347 mA vs
 ~390–400 mA). DDREN still not run. The re-power-on timeout is fixed (13af906, see below). Connsys still
-never *sleeps* while a function is on. Running log: `~/Build/notes/connsys-sleep.md` on Dragon.
+never *sleeps* while a function is on.
 
 Why it matters: connsys holds PCM_REG13 (0x10006134) bit 14 CONN_SRCCLKENA high, which blocks the
 SPM's 26 MHz-off and DDREN (DRAM self-refresh) steps (see `docs/spm-sleep.md`) and keeps the

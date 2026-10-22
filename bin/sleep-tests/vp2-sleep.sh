@@ -1,7 +1,7 @@
 #!/bin/sh
 # Suspend A/B/A for VPROC2 settings with the rail kept ON (no rail-off hang risk):
 # three s2.sh suspends of MAX s; B runs with da9214-test.ko loaded with ARGS_B
-# (e.g. "vproc2_mv=600 phases=1"), unloaded (= restored) after. notes/vproc-research.md.
+# (e.g. "vproc2_mv=600 phases=1"), unloaded (= restored) after.
 # Run: sudo -n -b busybox sh /home/andrew/connsys/vp2-sleep.sh NAME MAX "ARGS_B"
 N=$1; MAX=$2; AB=$3
 D=/home/andrew/connsys; O=$D/vp2s-$N.log; K=/home/andrew/da9214-test.ko

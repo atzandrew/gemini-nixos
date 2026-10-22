@@ -1,5 +1,5 @@
 #!/bin/sh
-# Awake A/B/A power test for VPROC2 settings (da9214-test.ko, notes/vproc-research.md).
+# Awake A/B/A power test for VPROC2 settings (da9214-test.ko).
 # No suspend. USB unplugged, DPMS off, Wi-Fi/BT off, cpu1-7 offline (cpu8/9 already torn
 # down); each phase loads da9214-test.ko with its args ("" = stock 1.00 V / 2 phases),
 # settles SETTLE s and measures the gauge for MEAS s. Everything back after.

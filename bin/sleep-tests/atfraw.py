@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Read the ATF log buffer (0x7FF40000, 256 KB) / leftover text + WDT dump (0x7FF6A000) via /dev/mem mmap.
-# Run on the Gemini as root: sudo -n busybox sh -c "python3 -I /home/andrew/connsys/atfraw.py [TAIL]"  (notes/vproc-research.md)
+# Run on the Gemini as root: sudo -n busybox sh -c "python3 -I /home/andrew/connsys/atfraw.py [TAIL]"
 import mmap, os, re
 fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
 m = mmap.mmap(fd, 0x40000, mmap.MAP_SHARED, mmap.PROT_READ, offset=0x7ff40000)

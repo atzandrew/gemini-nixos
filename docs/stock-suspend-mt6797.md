@@ -86,5 +86,3 @@ tested yet. Status and the hang data: [`spm-sleep.md`](spm-sleep.md).
 - Other trees: planet-community/android_kernel_planetcom_mt6797 (Planet);
   android.googlesource.com kernel/mediatek `android-mtk-3.18` (spm_v1/v2,
   mt8173).
-- Local copies on Dragon: `~/Build/notes/vendor-ref/` (`datasheet/`,
-  `k318-full/`).

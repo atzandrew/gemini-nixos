@@ -6,7 +6,7 @@
 #       the Gemini reboots, greetd logs andrew into Plasma (autologin block, only
 #       while armed), gemini-soak.service starts this script again, which logs
 #       the hang + breadcrumb and carries on. Result: hangs per hour asleep.
-# Why:  docs/spm-sleep.md "Current status", plan Stage 2 (notes/plan-sleep-2026-10-20.md).
+# Why:  docs/spm-sleep.md "Current status".
 # Safety: the kernel powers the panel off in every suspend (geminipda_drm
 #       panel_suspend) and bias_check refuses sleep with the LCD bias on; this
 #       script checks both are active before every sleep and stops otherwise.

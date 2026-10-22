@@ -2,7 +2,7 @@
 
 Source of truth for the scripts run on the Gemini during the SPM sleep, connsys and power work
 (2026-10-13 → 10-16). Results and the meaning of each experiment (E2–E29) are in the
-run logs (Dragon `~/Build/notes/connsys-sleep.md`, `spm-3e.md`) and `docs/spm-sleep.md`.
+results in `docs/spm-sleep.md` and `docs/connsys-sleep.md`.
 
 ## Deploy to the Gemini
 The scripts hard-code `/home/andrew/connsys/` (and `/home/andrew/panel/dcs.sh`), and the

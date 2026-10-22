@@ -11,44 +11,31 @@
   is not enough: 6 screen burns (image retention), the last after ~2 h of
   12–30 min test sleeps on 2026-10-20. Stock always turns the bias off in
   suspend (`stock-suspend-mt6797.md`).
-- **NOT fixed in real use (2026-10-22):** see "CORRECTION 2026-10-22 afternoon" and "Hang: independent
-  check + boot-address tests" at the end. What follows is the 2026-10-22 morning claim, kept for history:
-  the random sleep hang "is fixed" (dd3cbe9, `srcclken_low` default Y).
-  Cause: we forced `SPM_FLAG_DIS_SRCCLKEN_LOW` (bit 15) in every suspend;
-  stock suspend never sets it (only the idle modes do). With it forced, about
-  one hang per 20–25 min asleep, random in time, always at breadcrumb step
-  "PSCI suspend", ending in a PCM watchdog reset. Without it:
-
-  | Run | Sleeps | Asleep | Hangs (old rate predicts) | Power |
-  |---|---|---|---|---|
-  | 2026-10-21 afternoon | 12 × 600 s | 2 h | 0 (5–6) | 178–181 mA |
-  | 2026-10-21/22 overnight | 34 × 600 s | 5.7 h | 0 (~15) | 173–181 mA |
-
-  Power is the same either way, so SRCCLKEN (26 MHz request) is probably
-  still held high by something else (likely connsys). `srcclken_low=0`
-  brings the old behaviour back, for tests only.
-- What the hang hunt ruled out (2026-10-21): sleep length (hangs at 11 s and
-  at 21 min), number of SPM cycles (100 ms ticks: 2885 cycles in 15 min,
-  clean), the pwrap DVFS command table (the firmware sends no pwrap commands
-  in suspend). Flag lineup vs stock and the full log:
-  `notes/next-session-hang-prompt.md` (Dragon). Do not clear bit 9
-  (`DIS_VPROC_VSRAM_DVS`): hard crash + PMIC power cycle (2026-10-14).
-- Installed module: dd3cbe9 (`bias_check`, `srcclken_low` default Y), with
+- **Open: random sleep hang.** In everyday use (module loaded at boot) about
+  1 in 2–3 five-minute sleeps hangs, always at breadcrumb step "PSCI suspend"
+  (inside the CPU_SUSPEND call to ATF), 0.5–4 min in. The PCM watchdog resets
+  the SoC ~30 s later; unsaved work is lost. Cause unknown; see "Sleep hang
+  investigation (2026-10-22)" at the end for what has been ruled out and the
+  open leads.
+- Do not clear bit 9 (`DIS_VPROC_VSRAM_DVS`): hard crash + PMIC power cycle
+  (2026-10-14).
+- Module options in use: `bias_check` and `srcclken_low` (both default on),
   `pcm_wdt=30` from `/etc/modprobe.d/gemini-suspend.conf`. The PCM watchdog
-  stays on as a safety net: a stuck sleep resets the SoC ~30 s later and the
+  is the safety net: a stuck sleep resets the SoC ~30 s later and the
   breadcrumb survives in NONRST_REG2 (printed and cleared at module load).
-- Power domains still on in sleep (`SPM_PWR_STATUS` 0x2b00005c): display
-  MM/DIS (bit 3) and AUDIO (bit 24); ISP, VDEC, MFG, MJC, VENC are off. The
-  display pipeline stays on because geminipda-drm only adopts LK's setup.
+- Sleep power: ~170 mA (gauge). Measured levers are in the "Sleep power" and
+  "Off-SoC split" sections. Power domains still on in sleep
+  (`SPM_PWR_STATUS` 0x2b00005c): display MM/DIS (bit 3) and AUDIO (bit 24);
+  ISP, VDEC, MFG, MJC, VENC are off. The display pipeline stays on because
+  geminipda-drm only adopts LK's setup.
 - Soak runner for unattended series: `bin/sleep-tests/soak.sh` (+
   `gemini-soak.service`), survives hang reboots. Use MIN_BAT ≥ 40: at 28 %
   the battery browned out during the next boot (2026-10-22).
 - On external power `gemini-suspend-prep` refuses suspend; Plasma then retries
   every 10 s and the screen stays lit under a shut lid. Open.
 - Lid EINT wake works mechanically but is **not usable** (see that section).
-- Next: lower sleep power (~175 mA): stop DSI streaming / display pipeline in
-  suspend, the audio domain, then the stock steps we skip
-  ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)).
+- Next: the hang (leads at the end of this file), then the stock steps we
+  skip ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)).
 
 ## History
 
@@ -56,8 +43,7 @@ Status 2026-10-14: **step 3e closed.** The SPM (System Power Manager) runs the
 vendor suspend firmware from our test module `mt6797-spm-load`, and the CPU
 cluster now powers down and is woken by the SPM the way stock suspend does it.
 DRAM self-refresh and 26 MHz off are **not** reached; they are blocked on
-connsys (Wi-Fi/BT) never sleeping. Detailed run log: `~/Build/notes/spm-3e.md`
-on Dragon.
+connsys (Wi-Fi/BT) never sleeping.
 
 ## What works
 - Module `devices/planet-geminipda/kernel/modules/mt6797-spm-load`, `stage=6`:
@@ -120,8 +106,7 @@ is static load (panel, GPU rail, connsys rails, Vcore, PLLs).
 
 ## Intermittent hang in SPM sleep (2026-10-17/18)
 System suspend (`mt6797-suspend`, 2 s PCM-timer cycles) occasionally never
-returns from PSCI CPU_SUSPEND. Run log: `~/Build/notes/vproc-research.md`
-("Hang hunt", "h9") on Dragon.
+returns from PSCI CPU_SUSPEND.
 - Rate: about one per 30-40 runs of 30 s, i.e. roughly 1 in 500 SPM cycles,
   at a random cycle (seen at cycles 0, 4, 5, 13). Everyday suspend wakes
   1800 times an hour, so a suspend of an hour or more is likely to hit it.
@@ -278,50 +263,62 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
   the hci0 opcode errors at conn power-on are the same as after E30). VCN28 is HW mode (off in sleep with no 26M
   request); VCN33 is disabled by Linux with connsys off.
 
-## CORRECTION 2026-10-22 afternoon: the random hang is NOT fixed
-- The "fix" (dd3cbe9, srcclken_low) was validated only with the module **re-insmod'ed after boot** (soak/s2 `MOD=`):
-  b15night 34x600 s clean, morning s2/pwr-series clean. The installed module loads **at boot**
-  (/etc/modules-load.d/gemini-suspend.conf) and was never tested that way before being called fixed.
-- Boot-loaded, srcclken_low=Y, 300 s soak sleeps 2026-10-22: **5 hangs in 13 sleeps** (all at PSCI suspend,
-  1-3.5 min in; pcm_wdt reset). Old and new gemini-suspend-prep both hang; USB pins on or off both hang.
-  Oct 21 14:11/14:16 hangs were boot-loaded too. Late-loaded: 0 hangs in ~65.
-- Boot load always puts the IM buffer at 0x81c02000 (phys 0x41c02000, 8 KB above the connsys EMI window);
-  late load = random address. 74bb2c3 integrity check: buffer intact after boot, connsys off/on, and one sleep
-  → corruption theory unlikely. Cause unknown. Whether srcclken_low matters at all is unknown.
-- Pre-registered test (run in long downtime only): module loaded late by a real boot service (no MOD=), reboot,
-  plain everyday sleeps 300 s. PASS = 10 in a row clean (p < 1 % by chance at the boot-load rate); FAIL = any hang.
-  A pass = "workaround verified, cause unknown".
+## Sleep hang investigation (2026-10-21/22)
+**Status: not fixed; cause unknown.** All hangs stop at breadcrumb step "PSCI suspend" and end in a PCM
+watchdog reset.
 
-## Hang: independent check + boot-address tests (2026-10-22 evening)
-Checked the afternoon CORRECTION against raw data (soak.log, journal IM_PTR per load, both .ko binaries):
-- Counts hold: boot-loaded 5 hangs / 13 sleeps (usb-B1 0/2, usb-A 2/2, usb-B2 1/2, oldprep-A 2/6, imchk 0/1).
-  Late-loaded with the fix: ~57 sleeps (b15short 1 + b15 12 + b15night 34 + morning s2/pwr-series 9 + 1), 0 hangs,
-  not ~65. **Caveat found later: the 9 morning ones used s2.sh, which does not run gemini-suspend-prep** (other
-  path), so the late/boot comparison was never one variable.
-- "Every hang since Oct 21 had IM_PTR 0x81c02000": wrong as worded: 2026-10-21 11:25 (panel-sleep run 10) hung
-  with a late load at c2844000 (old build, bit 15 forced). True only for hangs with srcclken_low=Y.
-- Boot copy 79b9403e vs test copy 309efb33: code differs only in 4 loads of `srcclken_low` (it moved
-  .bss -> .data) + its default byte + help text. Same behaviour with `srcclken_low=1`. Confirmed.
-- IM check (74bb2c3) is sound (cache invalidated, DRAM vs pristine copy) but only ever ran around clean sleeps:
-  "no corruption seen", not "ruled out".
+### srcclken_low (bit 15), 2026-10-21
+We forced `SPM_FLAG_DIS_SRCCLKEN_LOW` (bit 15) in every suspend; stock suspend never sets it (only the idle
+modes do). With it forced, sleeps hung about once per 20–25 min asleep, also when the module was reloaded
+after boot. dd3cbe9 stopped forcing it (`srcclken_low`, default on). Afterwards, sleeps with the module
+**reloaded after boot** by the test scripts (soak.sh/s2.sh `MOD=`) stopped hanging:
 
-Tests (all through soak.sh = gemini-suspend-prep + echo mem, 300 s sleeps, pass/fail written down first):
-| test | module | buffer | result |
+| Run | Sleeps | Asleep | Hangs (old rate predicts) | Power |
+|---|---|---|---|---|
+| 2026-10-21 afternoon | 12 × 600 s | 2 h | 0 (5–6) | 178–181 mA |
+| 2026-10-21/22 overnight | 34 × 600 s | 5.7 h | 0 (~15) | 173–181 mA |
+
+This was first reported as the fix. It is not: everyday use loads the module **at boot**
+(`/etc/modules-load.d/gemini-suspend.conf`), which these runs never tested.
+
+### Boot-loaded module, 2026-10-22
+- Boot-loaded, srcclken_low on, 300 s sleeps through soak.sh (= gemini-suspend-prep + `echo mem`, the
+  everyday path): **5 hangs in 13 sleeps** (1–3.5 min in). The old and new gemini-suspend-prep both hang;
+  USB pins on or off both hang.
+- Reloaded after boot with srcclken_low on: 0 hangs in ~57 sleeps. 9 of those went through s2.sh, which skips
+  gemini-suspend-prep, so this comparison changed more than one thing.
+- The 2026-10-21 11:25 hang was a reloaded module (old build, bit 15 forced) at a random buffer address.
+- The test copy and the installed copy of the module differ only in where `srcclken_low` is stored, its
+  default and its help text (binary diff).
+- A firmware-buffer integrity check (74bb2c3) found the buffer intact around clean sleeps; it never ran
+  around a hanging one, so corruption is not seen, but also not excluded.
+
+### Buffer-address tests, 2026-10-22
+At boot the SPM firmware buffer always lands at phys 0x41c02000, 8 KB past the connsys window
+(0x41a00000–0x41bfffff). Two tests, pass/fail fixed in advance, both through soak.sh, 300 s sleeps:
+
+| Test | Load | Buffer | Result |
 |---|---|---|---|
-| late load forced onto the boot page (`im_pfn=0x41c02`, branch test/im-pfn cb5c4ed+, = dd3cbe9 + placement) | soak `MOD=`, reloaded | 0x41c02000 | **hung on sleep 3** (cycle 57, PSCI suspend) |
-| boot-loaded, buffer kept out of 0x41a00000-0x41ffffff (branch fix/im-avoid-connsys ade29a2, = dd3cbe9 + exclusion) | boot (modules-load.d) | 0x43000000 | **hung on sleep 2** (cycle 53, PSCI suspend) |
+| reload forced onto the boot page (test-only allocation option, dd3cbe9 + placement) | reloaded | 0x41c02000 | hung on sleep 3 |
+| buffer kept out of 0x41a00000–0x41ffffff (dd3cbe9 + exclusion) | at boot | 0x43000000 | hung on sleep 2 |
 
-- ⇒ **The buffer address is not the cause.** Boot-loaded hangs with the buffer elsewhere; a late load hung too.
-  "Late load never hangs" is weaker than it looked (the big clean late-load runs were b15/b15night on Oct 21;
-  today's late load through soak hung 1 of 3). No hypothesis fits all runs yet.
-- ~~Next: pcm_wdt_wake~~ WRONG (my mistake, corrected same evening): already tried 2026-10-20 (Dragon
-  notes/plan-sleep-2026-10-20.md runs 3-4): an SPM wake does NOT rescue the hang, the SoC reset wipes the SPM,
-  and the ATF log is re-initialised at boot. No post-mortem path exists today.
-- History that fits today's data better than the address idea (Dragon notes/vproc-research.md, 2026-10-18 h4-h7):
-  hangs followed loading ANY extra kernel module, even stock crc-ccitt (5 hangs / ~17 suspends after a load vs
-  0 / 24 without); the buffer address was already ruled out then. Not followed up since.
-- Untested lead at the exact hang step (all hangs stop at breadcrumb "PSCI suspend"): our kernel issues
-  CPU_SUSPEND as SMC64 0xC4000001; stock and our DT use SMC32 0x84000001, and cjdell found ATF hangs on SMC64
-  CPU_ON for the A72s (vproc-research.md). Needs a kernel change + flash.
-- Gemini state: installed module = ade29a2 build (md5 5cc302c0, branch fix/im-avoid-connsys; same hang rate as
-  main as far as we know). soak.sh: MOD_IM option (61152cd, dd92431), charger checked before MIN_BAT (ffaf25f).
+**The buffer address is not the cause.** "A reloaded module does not hang" is also weaker than it looked:
+the reload above hung on its 3rd sleep.
+
+### What does not help find it
+- The SPM's watchdog wake mode (`pcm_wdt_wake`, tried 2026-10-20): an SPM wake does not rescue the hang.
+- The SoC reset wipes all SPM registers, and the ATF log (0x7FF40000) is re-initialised at boot, so there is
+  no post-mortem state. The ATF WDT-dump area (0x7FF6A000) survives resets but our hangs leave nothing there.
+
+### Open leads (none proven)
+1. **SMC64 vs SMC32 CPU_SUSPEND.** Our kernel issues CPU_SUSPEND as SMC64 0xC4000001; stock and our DT use
+   SMC32 0x84000001, and cjdell found ATF hangs on SMC64 CPU_ON for the A72s. It sits exactly at the hang
+   step. Needs a kernel change + flash.
+2. **Module loads.** 2026-10-18: hangs followed loading any extra kernel module after mt6797-suspend, even
+   stock `crc-ccitt` (5 hangs in ~17 suspends after a load vs 0 in 24 without). Fits the boot case (Wi-Fi/BT
+   modules load ~4 s after mt6797-suspend), but not the 2026-10-22 reload that hung with no module loaded
+   after it.
+3. Stock steps we skip ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)): thermal chunks, the pwrap
+   SUSPEND table (`dvs=1`, de1fa94, untested), PMIC preparation, CIRQ/IRQ masking, DRAM self-refresh.
+4. connsys: gemini-suspend-prep power-cycles connsys around every sleep and logs "live client resync FAIL".
+   Not examined.

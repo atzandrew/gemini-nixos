@@ -1,5 +1,5 @@
 #!/bin/sh
-# Awake A/B/A power test of the polled input drivers (2026-10-18, notes/vproc-research.md
+# Awake A/B/A power test of the polled input drivers (2026-10-18
 # "Review of upstream (cjdell) workarounds"). No suspend. USB unplugged, DPMS off, Wi-Fi/BT
 # off, cpu1-7 offline (cpu8/9 left as they are). Each phase = "LABEL:shell command" run
 # after resetting to the as-is state; settles SETTLE s, then measures the gauge for MEAS s and

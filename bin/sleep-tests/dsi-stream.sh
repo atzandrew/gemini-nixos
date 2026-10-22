@@ -9,7 +9,7 @@
 #       stopped or started with the panel powered. The panel itself is switched with the
 #       "panel" parameter (panel-cycle.sh), which needs DSI streaming (VM_CMD), so: off -> stop ...
 #       start -> on.
-# Why:  sleep power step 1 (notes/next-session-sleep-power-prompt.md): does stopping the video
+# Why:  sleep power (docs/spm-sleep.md "Sleep power: DSI streaming"): does stopping the video
 #       stream in suspend save power? USER PRESENT (AGENTS.md rule 5): one OK per DSI write step.
 # usage (root): dsi-stream.sh state | stop | start
 #               dsi-stream.sh cycle [SECONDS]   awake test: panel off, stop, wait, start, panel on
