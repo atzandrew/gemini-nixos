@@ -11,7 +11,9 @@
   is not enough: 6 screen burns (image retention), the last after ~2 h of
   12–30 min test sleeps on 2026-10-20. Stock always turns the bias off in
   suspend (`stock-suspend-mt6797.md`).
-- **The random sleep hang is fixed** (dd3cbe9, `srcclken_low` default Y).
+- **NOT fixed in real use (2026-10-22):** see "CORRECTION 2026-10-22 afternoon" and "Hang: independent
+  check + boot-address tests" at the end. What follows is the 2026-10-22 morning claim, kept for history:
+  the random sleep hang "is fixed" (dd3cbe9, `srcclken_low` default Y).
   Cause: we forced `SPM_FLAG_DIS_SRCCLKEN_LOW` (bit 15) in every suspend;
   stock suspend never sets it (only the idle modes do). With it forced, about
   one hang per 20–25 min asleep, random in time, always at breadcrumb step
@@ -289,3 +291,31 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
 - Pre-registered test (run in long downtime only): module loaded late by a real boot service (no MOD=), reboot,
   plain everyday sleeps 300 s. PASS = 10 in a row clean (p < 1 % by chance at the boot-load rate); FAIL = any hang.
   A pass = "workaround verified, cause unknown".
+
+## Hang: independent check + boot-address tests (2026-10-22 evening)
+Checked the afternoon CORRECTION against raw data (soak.log, journal IM_PTR per load, both .ko binaries):
+- Counts hold: boot-loaded 5 hangs / 13 sleeps (usb-B1 0/2, usb-A 2/2, usb-B2 1/2, oldprep-A 2/6, imchk 0/1).
+  Late-loaded with the fix: ~57 sleeps (b15short 1 + b15 12 + b15night 34 + morning s2/pwr-series 9 + 1), 0 hangs,
+  not ~65. **Caveat found later: the 9 morning ones used s2.sh, which does not run gemini-suspend-prep** (other
+  path), so the late/boot comparison was never one variable.
+- "Every hang since Oct 21 had IM_PTR 0x81c02000": wrong as worded: 2026-10-21 11:25 (panel-sleep run 10) hung
+  with a late load at c2844000 (old build, bit 15 forced). True only for hangs with srcclken_low=Y.
+- Boot copy 79b9403e vs test copy 309efb33: code differs only in 4 loads of `srcclken_low` (it moved
+  .bss -> .data) + its default byte + help text. Same behaviour with `srcclken_low=1`. Confirmed.
+- IM check (74bb2c3) is sound (cache invalidated, DRAM vs pristine copy) but only ever ran around clean sleeps:
+  "no corruption seen", not "ruled out".
+
+Tests (all through soak.sh = gemini-suspend-prep + echo mem, 300 s sleeps, pass/fail written down first):
+| test | module | buffer | result |
+|---|---|---|---|
+| late load forced onto the boot page (`im_pfn=0x41c02`, branch test/im-pfn cb5c4ed+, = dd3cbe9 + placement) | soak `MOD=`, reloaded | 0x41c02000 | **hung on sleep 3** (cycle 57, PSCI suspend) |
+| boot-loaded, buffer kept out of 0x41a00000-0x41ffffff (branch fix/im-avoid-connsys ade29a2, = dd3cbe9 + exclusion) | boot (modules-load.d) | 0x43000000 | **hung on sleep 2** (cycle 53, PSCI suspend) |
+
+- ⇒ **The buffer address is not the cause.** Boot-loaded hangs with the buffer elsewhere; a late load hung too.
+  "Late load never hangs" is weaker than it looked (the big clean late-load runs were b15/b15night on Oct 21;
+  today's late load through soak hung 1 of 3). No hypothesis fits all runs yet.
+- Next (direct look, not another A/B): `pcm_wdt_wake=1` (+ `wdt_pause=0 wdt_int_rst=1` backstop) turns a stuck
+  sleep into a logged wake with an SPM state dump; then pick from the unproven stock-step list
+  (`stock-suspend-mt6797.md`: thermal chunks, pwrap SUSPEND table = `dvs=1` de1fa94 untested, PMIC prep, CIRQ, DRAM).
+- Gemini state: installed module = ade29a2 build (md5 5cc302c0, branch fix/im-avoid-connsys; same hang rate as
+  main as far as we know). soak.sh: MOD_IM option (61152cd, dd92431), charger checked before MIN_BAT (ffaf25f).
