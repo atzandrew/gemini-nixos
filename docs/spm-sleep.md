@@ -259,3 +259,15 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
   bit 18 EMI_IDLE. No 26M requests (MD1/MD2/MD32/CONN/LTE SRCCLKENA bits 2/5/6/14/29 = 0), no CONN_DDR_EN (4) or
   CONN_STATE (13); with dbg 0x10ff (26M step runs) the SoC looks like it reaches its 26M-off state. So the
   ~180 mA is most likely off-SoC → the off-SoC split is the next step.
+
+## Off-SoC split (2026-10-22, E30 + stock GPIO table)
+- E30 (bin/sleep-tests/e30.sh, awake, SPM-run state, 60 s each): A1 302.5 / USB+touch 279.1 / A2 288.0 /
+  USB 267.8 / A3 277.9 / touch 276.4 / A4 277.5 mA (baseline drifting down after boot). USB group
+  (GPIO 94 usb1-drvvbus, 72 sw7226-en, 70 fusb301a-sw-en, 107 otg-drvvbus) low = **~15 mA**; touch
+  SSD2092 held in reset (GPIO68) = ~0. Restore clean.
+- Stock (gemian 3.18 aeon6797_6m_n.dws) defaults all of 94/72/70/107/68 to output LOW; we hog them high.
+- Stock-vs-live GPIO diff (DIR/DOUT/MODE, all 262 pins): besides the USB group, only GPIO58 (AW9523B SHDN,
+  stock drives it low on screen blank), 60 (ENP, off in sleep anyway), 68 (touch reset), 256 (fingerprint
+  reset: stock out-low, ours input) and EINT-mode pins differ. ⇒ no other pin-driven off-SoC loads.
+- Stock touch suspend is empty (POWER_OFF and sleep-in compiled out); it relies on the LCM power-off.
+- Next: connsys rails in the CONN-off state. VCN18 is SW-on (stays on in sleep); stock turns VCN18/28/33 off.
