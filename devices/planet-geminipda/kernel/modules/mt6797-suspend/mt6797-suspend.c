@@ -400,6 +400,60 @@ static unsigned int page_order;
 static dma_addr_t dma;
 static size_t dma_len;
 static bool loaded;
+
+/*
+ * Firmware buffer integrity (2026-10-22): every sleep hang so far had the module
+ * loaded at boot, where the buffer always lands at phys 0x41c02000, 8 KB past the
+ * connsys EMI window (0x41a00000 + 2 MB). Keep a pristine copy and compare it with
+ * what is really in DRAM (cache invalidated first): before and after every
+ * suspend, and on demand (echo 1 > im_check_now).
+ */
+static void *im_copy;
+static bool im_fix;
+module_param(im_fix, bool, 0644);
+MODULE_PARM_DESC(im_fix, "rewrite the SPM firmware buffer from the pristine copy if it was found changed");
+static uint im_bad;
+module_param(im_bad, uint, 0444);
+MODULE_PARM_DESC(im_bad, "number of checks that found the SPM firmware buffer changed");
+
+static void im_verify(const char *when)
+{
+	const u32 *a = im_copy, *b;
+	u32 i, n = 0, words = dma_len / 4;
+
+	if (!im_copy || !page)
+		return;
+	dma_sync_single_for_cpu(&pdev->dev, dma, dma_len, DMA_BIDIRECTIONAL);	/* invalidate */
+	b = page_address(page);
+	for (i = 0; i < words; i++) {
+		if (a[i] == b[i])
+			continue;
+		if (n < 8)
+			pr_warn(TAG "IM check (%s): word %u (+0x%x) %08x -> %08x\n",
+				when, i, i * 4, a[i], b[i]);
+		n++;
+	}
+	if (!n) {
+		pr_info(TAG "IM check (%s): %u words OK at %pa\n", when, words, &dma);
+		return;
+	}
+	im_bad++;
+	pr_warn(TAG "IM check (%s): %u of %u words CHANGED at %pa%s\n", when, n, words, &dma,
+		im_fix ? " - rewritten" : "");
+	if (im_fix) {
+		memcpy(page_address(page), im_copy, dma_len);
+		dma_sync_single_for_device(&pdev->dev, dma, dma_len, DMA_BIDIRECTIONAL);
+	}
+}
+
+static int im_check_now_set(const char *val, const struct kernel_param *kp)
+{
+	im_verify("manual");
+	return 0;
+}
+static const struct kernel_param_ops im_check_now_ops = { .set = im_check_now_set };
+module_param_cb(im_check_now, &im_check_now_ops, NULL, 0200);
+MODULE_PARM_DESC(im_check_now, "write anything: compare the SPM firmware buffer with the pristine copy now");
 static u32 saved_con0, saved_con1, saved_ptr, saved_len;
 static struct pcm_tail tail;
 static u32 im_ptr, im_words;
@@ -1189,6 +1243,7 @@ static int gem_suspend_prepare(void)
 			return -EBUSY;
 		}
 	}
+	im_verify("prepare");
 	cr_susp++;
 	cr_n = 0;
 	crumb(CR_PREPARE);
@@ -1379,6 +1434,7 @@ static void gem_suspend_finish(void)
 	bucks_up();
 	key_ints_restore();
 	spm_finish();
+	im_verify("finish");
 	crumb(CR_FINISH_DONE);
 }
 
@@ -1425,12 +1481,15 @@ static int alloc_buf(struct device *dev, const void *prog, size_t bytes)
 		return ret;
 
 	memcpy(page_address(page), prog, bytes);
+	im_copy = kmemdup(prog, bytes, GFP_KERNEL);
 	dma_len = bytes;
-	dma = dma_map_page(dev, page, 0, bytes, DMA_TO_DEVICE);	/* cleans D-cache */
+	dma = dma_map_page(dev, page, 0, bytes, DMA_BIDIRECTIONAL);	/* cleans D-cache */
 	if (dma_mapping_error(dev, dma) || dma != page_to_phys(page)) {
 		if (!dma_mapping_error(dev, dma))
-			dma_unmap_page(dev, dma, bytes, DMA_TO_DEVICE);
+			dma_unmap_page(dev, dma, bytes, DMA_BIDIRECTIONAL);
 		__free_pages(page, page_order);
+		kfree(im_copy);
+		im_copy = NULL;
 		page = NULL;
 		return -EIO;
 	}
@@ -1567,8 +1626,10 @@ static void __exit gem_suspend_exit(void)
 		wr(PCM_CON0, KEY | (saved_con0 & 0xffff));
 	}
 	if (page) {
-		dma_unmap_page(&pdev->dev, dma, dma_len, DMA_TO_DEVICE);
+		dma_unmap_page(&pdev->dev, dma, dma_len, DMA_BIDIRECTIONAL);
 		__free_pages(page, page_order);
+		kfree(im_copy);
+		im_copy = NULL;
 	}
 	platform_device_unregister(pdev);
 	unmap_all();
