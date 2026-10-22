@@ -271,3 +271,7 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
   reset: stock out-low, ours input) and EINT-mode pins differ. ⇒ no other pin-driven off-SoC loads.
 - Stock touch suspend is empty (POWER_OFF and sleep-in compiled out); it relies on the LCM power-off.
 - Next: connsys rails in the CONN-off state. VCN18 is SW-on (stays on in sleep); stock turns VCN18/28/33 off.
+- E31 (bin/sleep-tests/e31.sh, awake, CONN domain off): VCN18 (0x0a52 da62 → da60; QI_EN cleared, rail really off)
+  A1 288.0 / B1 286.0 / A2 286.5 / B2 285.9 / A3 285.8 mA ⇒ **~0–1 mA, not a lever**. Restore clean (Wi-Fi + BT back;
+  the hci0 opcode errors at conn power-on are the same as after E30). VCN28 is HW mode (off in sleep with no 26M
+  request); VCN33 is disabled by Linux with connsys off.
