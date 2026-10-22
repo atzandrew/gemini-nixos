@@ -229,3 +229,29 @@ Tools: `bin/sleep-tests/dsi-stream.sh`, `s2.sh` env `DSI_STOP=1` / `MOD=`. User 
   DRAM reads) is not where the ~175 mA goes. Still unmeasured: the MM/DIS domain + MMPLL/clocks being
   off (needs a real display driver, plan step 2); this result does not justify step 2 on its own.
   Next: the AUDIO domain (step 3) and the stock steps we skip.
+
+## Sleep power: VA10 LP, Vcore 0.85 V, AUDIO domain (2026-10-22, 10:29-11:16)
+`bin/sleep-tests/pwr-series.sh`, 300 s SPM sleeps, installed dd3cbe9 (pcm_wdt=30, bias_check), lid open,
+Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on max_s).
+
+| run | setting | mA |
+|---|---|---|
+| A | baseline | 183.0 / 181.5 / 180.3 |
+| L | VA10 HW LP on SRCLKEN0 (`ldo_lp=2 ldo_lp_mode=2`) | 181.6 |
+| V | Vcore HW sleep mode, VOSEL_SLEEP 0x28 = 0.85 V (E19 1b order) | 181.0 |
+| U | AUDIO domain really off (PWR_STATUS 0x2a00005c in .enter) | 181.6 / 180.8 |
+
+- None saves anything measurable. VA10 HW LP no longer hangs (the 2026-10-17 "VA10 hang" was the old random
+  hang, bit 15). Open question: do the SRCLKEN-driven PMIC sleep modes engage at all? If SRCCLKEN stays high
+  (power was identical with/without srcclken_low), both L and V are no-ops by construction.
+- AUDIO domain facts: the AFE probe takes a runtime-PM ref and never drops it (mt6797-afe-pcm.c
+  `pm_runtime_get_sync` in probe), so the domain is on all the time. Unbinding the AFE releases it, but
+  **mtk-scpsys cannot switch the domain off or on: the SRAM_PDN ack (PWR_CON 0x10006314 bits 15:12) needs
+  the `infra_audio_26m` clock** (vendor clk-mt6797-pg.c `PGATE(SCP_SYS_AUDIO, pg_audio, NULL, infra_audio_26m)`),
+  which the AFE has already gated, and our scpsys audio domain has `clk_id CLK_NONE`. "Failed to power off
+  domain audio" (a second unbind completed it because the ack had latched), and "Failed to power on domain
+  audio" on rebind: audio is gone until a reboot. Also missing for a real fix: AFE component
+  `.suspend/.resume = mtk_afe_suspend/resume` + a register backup list (as mt8173), and `snd_soc_pm_ops` in
+  the mt6797-mt6351 machine driver. Not worth it for sleep power (0 mA); maybe for awake idle later.
+- Conclusion with the DSI result: display stream ~5 mA, the rest of these ~0. The ~180 mA is not in these
+  SoC-side levers. Next: the off-SoC split (awake A/B, group-then-split) and whether SRCCLKEN/26M really drops.
