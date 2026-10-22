@@ -275,3 +275,17 @@ Wi-Fi/BT/connsys off, panel off by panel_suspend. All runs clean (rc 0, woke on 
   A1 288.0 / B1 286.0 / A2 286.5 / B2 285.9 / A3 285.8 mA ⇒ **~0–1 mA, not a lever**. Restore clean (Wi-Fi + BT back;
   the hci0 opcode errors at conn power-on are the same as after E30). VCN28 is HW mode (off in sleep with no 26M
   request); VCN33 is disabled by Linux with connsys off.
+
+## CORRECTION 2026-10-22 afternoon: the random hang is NOT fixed
+- The "fix" (dd3cbe9, srcclken_low) was validated only with the module **re-insmod'ed after boot** (soak/s2 `MOD=`):
+  b15night 34x600 s clean, morning s2/pwr-series clean. The installed module loads **at boot**
+  (/etc/modules-load.d/gemini-suspend.conf) and was never tested that way before being called fixed.
+- Boot-loaded, srcclken_low=Y, 300 s soak sleeps 2026-10-22: **5 hangs in 13 sleeps** (all at PSCI suspend,
+  1-3.5 min in; pcm_wdt reset). Old and new gemini-suspend-prep both hang; USB pins on or off both hang.
+  Oct 21 14:11/14:16 hangs were boot-loaded too. Late-loaded: 0 hangs in ~65.
+- Boot load always puts the IM buffer at 0x81c02000 (phys 0x41c02000, 8 KB above the connsys EMI window);
+  late load = random address. 74bb2c3 integrity check: buffer intact after boot, connsys off/on, and one sleep
+  → corruption theory unlikely. Cause unknown. Whether srcclken_low matters at all is unknown.
+- Pre-registered test (run in long downtime only): module loaded late by a real boot service (no MOD=), reboot,
+  plain everyday sleeps 300 s. PASS = 10 in a row clean (p < 1 % by chance at the boot-load rate); FAIL = any hang.
+  A pass = "workaround verified, cause unknown".
