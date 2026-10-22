@@ -22,6 +22,8 @@
 #   Stop gracefully: touch /home/andrew/soak/stop (checked between sleeps).
 #   Test module: MOD=/path/x.ko MODARGS="a=1 b=2" soak.sh arm ... loads it at every start (after
 #   each hang reboot too) with the modprobe.d options + MODARGS; disarm goes back to the installed one.
+#   MOD_IM=81c02000 (with MOD): require that IM_PTR (the boot-load address) - reload pinned to CPU 0 so
+#   the page just freed is reused, up to 5 tries, else disarm (late-load-at-boot-address test, 2026-10-22).
 set -u
 D=/home/andrew/soak; O=$D/soak.log; A=$D/armed; ST=$D/state
 G=/etc/greetd/config.toml; U=gemini-soak.service
@@ -57,7 +59,7 @@ arm)
 	[ -n "${2:-}" ] || { echo "usage: $0 arm HOURS [SLEEP_S] [LABEL] [MIN_BAT] [MAX_N]" >&2; exit 2; }
 	mkdir -p $D; rm -f $D/stop; echo 0 > $D/count
 	end=$(( $(date +%s) + ${2} * 3600 ))
-	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\nMOD=%s\nMODARGS="%s"\n' $end "${3:-600}" "${4:-soak}" "${5:-40}" "${6:-0}" "${MOD:-}" "${MODARGS:-}" > $A
+	printf 'END=%s\nSLEEP_S=%s\nLABEL=%s\nMIN_BAT=%s\nMAX_N=%s\nMOD=%s\nMODARGS="%s"\nMOD_IM=%s\n' $end "${3:-600}" "${4:-soak}" "${5:-40}" "${6:-0}" "${MOD:-}" "${MODARGS:-}" "${MOD_IM:-}" > $A
 	autologin_on
 	systemctl daemon-reload; systemctl enable $U >/dev/null 2>&1
 	log "=== armed: $(tr '\n' ' ' < $A)(until $(date -d @$end '+%F %T'))"
@@ -83,9 +85,15 @@ fi
 
 if [ -n "${MOD:-}" ]; then	# test module instead of the installed one
 	opts=$(sed -n 's/^options mt6797[-_]suspend //p' /etc/modprobe.d/*.conf | tr '\n' ' ')
-	rmmod mt6797_suspend
-	if ! insmod $MOD $opts $MODARGS; then disarm "insmod $MOD failed"; exit 1; fi
-	log "test module $MOD (md5 $(md5sum < $MOD | cut -c1-8)): $opts$MODARGS"
+	try=0
+	while :; do
+		try=$((try + 1))
+		taskset -c 0 sh -c "rmmod mt6797_suspend; insmod $MOD $opts $MODARGS" || { disarm "insmod $MOD failed"; exit 1; }
+		im=$(dmesg | grep -o IM_PTR [0-9a-f]* | tail -1 | cut -d  -f2)
+		[ -z "${MOD_IM:-}" ] || [ "$im" = "$MOD_IM" ] && break
+		[ $try -lt 5 ] || { disarm "IM_PTR $im, not $MOD_IM after $try tries"; exit 1; }
+	done
+	log "test module $MOD (md5 $(md5sum < $MOD | cut -c1-8)): $opts$MODARGS; IM_PTR $im (try $try)"
 fi
 
 # Wait for the Plasma session (autologin) and let it settle (Wi-Fi up for SSH).
