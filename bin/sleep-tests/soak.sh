@@ -108,8 +108,9 @@ while :; do
 	done_n=$(cat $D/count 2>/dev/null || echo 0)
 	[ "${MAX_N:-0}" -eq 0 ] || [ $done_n -lt $MAX_N ] || { disarm "$done_n of $MAX_N sleeps done"; exit 0; }
 	cap=$(cat $BAT/capacity)
-	[ $cap -ge $MIN_BAT ] || { disarm "battery $cap% < $MIN_BAT%"; systemctl poweroff; exit 0; }
+	# charger first: below MIN_BAT on the charger means wait, never power off (2026-10-22)
 	if [ "$(cat $CHG)" != 0 ]; then log "on external power - waiting"; sleep 60; continue; fi
+	[ $cap -ge $MIN_BAT ] || { disarm "battery $cap% < $MIN_BAT%"; systemctl poweroff; exit 0; }
 	[ "$(cat $P/panel_suspend)" = Y ] && [ "$(cat $M/bias_check)" = Y ] ||
 		{ disarm "panel_suspend/bias_check not active"; exit 1; }
 
