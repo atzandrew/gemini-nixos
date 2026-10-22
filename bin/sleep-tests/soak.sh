@@ -89,7 +89,7 @@ if [ -n "${MOD:-}" ]; then	# test module instead of the installed one
 	while :; do
 		try=$((try + 1))
 		taskset -c 0 sh -c "rmmod mt6797_suspend; insmod $MOD $opts $MODARGS" || { disarm "insmod $MOD failed"; exit 1; }
-		im=$(dmesg | grep -o IM_PTR [0-9a-f]* | tail -1 | cut -d  -f2)
+		im=$(dmesg | grep -o "IM_PTR [0-9a-f]*" | tail -1 | cut -d " " -f2)
 		[ -z "${MOD_IM:-}" ] || [ "$im" = "$MOD_IM" ] && break
 		[ $try -lt 5 ] || { disarm "IM_PTR $im, not $MOD_IM after $try tries"; exit 1; }
 	done
