@@ -314,8 +314,14 @@ Tests (all through soak.sh = gemini-suspend-prep + echo mem, 300 s sleeps, pass/
 - ⇒ **The buffer address is not the cause.** Boot-loaded hangs with the buffer elsewhere; a late load hung too.
   "Late load never hangs" is weaker than it looked (the big clean late-load runs were b15/b15night on Oct 21;
   today's late load through soak hung 1 of 3). No hypothesis fits all runs yet.
-- Next (direct look, not another A/B): `pcm_wdt_wake=1` (+ `wdt_pause=0 wdt_int_rst=1` backstop) turns a stuck
-  sleep into a logged wake with an SPM state dump; then pick from the unproven stock-step list
-  (`stock-suspend-mt6797.md`: thermal chunks, pwrap SUSPEND table = `dvs=1` de1fa94 untested, PMIC prep, CIRQ, DRAM).
+- ~~Next: pcm_wdt_wake~~ WRONG (my mistake, corrected same evening): already tried 2026-10-20 (Dragon
+  notes/plan-sleep-2026-10-20.md runs 3-4): an SPM wake does NOT rescue the hang, the SoC reset wipes the SPM,
+  and the ATF log is re-initialised at boot. No post-mortem path exists today.
+- History that fits today's data better than the address idea (Dragon notes/vproc-research.md, 2026-10-18 h4-h7):
+  hangs followed loading ANY extra kernel module, even stock crc-ccitt (5 hangs / ~17 suspends after a load vs
+  0 / 24 without); the buffer address was already ruled out then. Not followed up since.
+- Untested lead at the exact hang step (all hangs stop at breadcrumb "PSCI suspend"): our kernel issues
+  CPU_SUSPEND as SMC64 0xC4000001; stock and our DT use SMC32 0x84000001, and cjdell found ATF hangs on SMC64
+  CPU_ON for the A72s (vproc-research.md). Needs a kernel change + flash.
 - Gemini state: installed module = ade29a2 build (md5 5cc302c0, branch fix/im-avoid-connsys; same hang rate as
   main as far as we know). soak.sh: MOD_IM option (61152cd, dd92431), charger checked before MIN_BAT (ffaf25f).
