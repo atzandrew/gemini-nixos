@@ -311,14 +311,14 @@ the reload above hung on its 3rd sleep.
   no post-mortem state. The ATF WDT-dump area (0x7FF6A000) survives resets but our hangs leave nothing there.
 
 ### Open leads (none proven)
-1. **SMC64 vs SMC32 CPU_SUSPEND.** Our kernel issues CPU_SUSPEND as SMC64 0xC4000001; stock and our DT use
-   SMC32 0x84000001, and cjdell found ATF hangs on SMC64 CPU_ON for the A72s. It sits exactly at the hang
-   step. Needs a kernel change + flash.
-2. **Module loads.** 2026-10-18: hangs followed loading any extra kernel module after mt6797-suspend, even
+- Already done, not a lead: CPU_SUSPEND has used the DT SMC32 id 0x84000001 since 852afc0 (2026-10-18,
+  boot log "PSCI 0.2 ids from DT: ... cpu_suspend 0x84000001"); mt6797-suspend calls
+  `psci_cpu_suspend_enter()`, so it uses that id. The hangs since then happened on SMC32.
+1. **Module loads.** 2026-10-18: hangs followed loading any extra kernel module after mt6797-suspend, even
    stock `crc-ccitt` (5 hangs in ~17 suspends after a load vs 0 in 24 without). Fits the boot case (Wi-Fi/BT
    modules load ~4 s after mt6797-suspend), but not the 2026-10-22 reload that hung with no module loaded
    after it.
-3. Stock steps we skip ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)): thermal chunks, the pwrap
+2. Stock steps we skip ([`stock-suspend-mt6797.md`](stock-suspend-mt6797.md)): thermal chunks, the pwrap
    SUSPEND table (`dvs=1`, de1fa94, untested), PMIC preparation, CIRQ/IRQ masking, DRAM self-refresh.
-4. connsys: gemini-suspend-prep power-cycles connsys around every sleep and logs "live client resync FAIL".
+3. connsys: gemini-suspend-prep power-cycles connsys around every sleep and logs "live client resync FAIL".
    Not examined.
