@@ -390,3 +390,28 @@ settled), **untested**, **dead end** (a measurement that cannot work).
 ### Side symptoms (not proven related)
 - Wake with `last_wake = 'pmic read failed'` after one cycle (2026-10-20, 10-21, 10-22).
 - After one WDT reset, LK stalled polling SPM registers and needed a second reset (10-18).
+
+## Stock 3.18 suspend reference (2026-10-23)
+Planet's stock Debian TP3 (kernel 3.18.41, May 2019) was flashed for one day to observe the vendor suspend path
+on this unit. Same tee1/ATF, same SPM firmware (`pcm_suspend_v20`, 1822 words). Values below come from the vendor
+kernel's own `[SPM]` log and read-only register reads.
+
+| | Stock 3.18 | `mt6797-suspend` |
+|---|---|---|
+| `pcm_flags` at sleep | 0x150030 (bits 4, 5, 16, 18, 20) | 0x5fc102fe |
+| Wake sources | 0xf47c5e7 (timer, EINT, keypad, CONN2AP, …) | 0x1 (PCM timer only) |
+| Wake period | from the fuel gauge: 64, 122, 224, 664 s … up to 5400 s | 2 s cycles |
+| SW_DEBUG after sleep | 0x1f00: DRAM self-refresh (bits 8/9) and CPU power-down reached; 26 MHz off not | 0x10ff: 26 MHz off reached; DRAM self-refresh never |
+| Thermal chunk registers after sleep | `PASR_DPD_3` 2, `SW_RSV_2` 0xEB0, `BSI_D0_SR` 0x00100000, `SCP_MAILBOX` 1 | all 0 |
+| PMIC-wrapper DVFS table (0x1000D10C…) | filled (MT6351 reg 0x060A, values 0x38, 0x36, 0x33, …) | all 0 |
+
+- Stock reaches DRAM self-refresh in every sleep with Wi-Fi/connsys up (PCM_REG13 0xd106612c), so the older
+  conclusion "DDREN is blocked by connsys" (History, SPM 3e) does not hold; our flags/pwrctrl are the difference.
+- Six stock sleeps (6 s to 224 s, about 8 min in total) all resumed cleanly. No long soak was run on stock.
+- As shipped, stock Debian does not suspend at all: the modem multiplexer (`gsm0710muxd`) holds the `ttyC0`
+  wakelock from boot, and the Wi-Fi driver aborts suspend attempts while connected (`WLAN tx_thread` etc.).
+  `repowerd` only enables autosleep after its own display-off (lid, inactivity).
+- Stock turns the panel bias (GPIO60/251) off at every screen-off (`SSD2092 lcm_suspend`), before suspend.
+- Sleep current on stock as configured (modem firmware still up, 26 MHz on) was roughly 145–185 mA, i.e. not
+  lower than ours; stock is a reference for the method, not for the current.
+- Stock's `suspend_ctrl` (pwrctrl) values are the reference for the next changes to `mt6797-suspend`.
