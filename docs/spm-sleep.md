@@ -15,8 +15,8 @@
   1 in 2–3 five-minute sleeps hangs, always at breadcrumb step "PSCI suspend"
   (inside the CPU_SUSPEND call to ATF), 0.5–4 min in. The PCM watchdog resets
   the SoC ~30 s later; unsaved work is lost. Cause unknown; see "Sleep hang
-  investigation (2026-10-22)" at the end for what has been ruled out and the
-  open leads.
+  investigation (2026-10-22)" and the inventory table "Sleep hang: what has
+  been tried" at the end for what has been ruled out and the open leads.
 - Do not clear bit 9 (`DIS_VPROC_VSRAM_DVS`): hard crash + PMIC power cycle
   (2026-10-14).
 - Module options in use: `bias_check` and `srcclken_low` (both default on),
@@ -130,8 +130,8 @@ returns from PSCI CPU_SUSPEND.
   hang into a SoC-only WDT reset in ~1 min with the breadcrumb kept. The
   battery is worn (2600 of 4220 mAh): a reset's boot current (~2.4 A) can sag
   it to 3.0 V and brown out below ~50 %; charge first.
-- After a WDT reset the bootloader once stalled polling SPM registers (ATF
-  WDT dump at 0x7FF6A000, PC in LK) and needed a second reset.
+- After a WDT reset the bootloader once stalled polling SPM registers (PC in
+  LK, seen in ATF's saved log at 0x7FF6A000) and needed a second reset.
 - Way forward (as written 2026-10-18): fewer wake cycles (EINT wake for
   keys/lid, longer or no PCM timer) and observability at the hang (SPM/ATF
   state), not more A/B runs.
@@ -307,8 +307,10 @@ the reload above hung on its 3rd sleep.
 
 ### What does not help find it
 - The SPM's watchdog wake mode (`pcm_wdt_wake`, tried 2026-10-20): an SPM wake does not rescue the hang.
-- The SoC reset wipes all SPM registers, and the ATF log (0x7FF40000) is re-initialised at boot, so there is
-  no post-mortem state. The ATF WDT-dump area (0x7FF6A000) survives resets but our hangs leave nothing there.
+- The SoC reset wipes all SPM registers, and the live ATF log (0x7FF40000) is re-initialised at boot.
+  Correction 2026-10-23: 0x7FF6A000 is not a WDT dump that survives resets; it is ATF's copy of the previous
+  boot's log, which LK saves to the `expdb` partition (mmcblk0p3) and then clears. Reading `expdb` after a
+  hang does give the hung boot's ATF log (inventory row 16).
 
 ### Open leads (none proven)
 - Already done, not a lead: CPU_SUSPEND has used the DT SMC32 id 0x84000001 since 852afc0 (2026-10-18,
@@ -325,3 +327,66 @@ the reload above hung on its 3rd sleep.
    hung, after a good resync 4 / 52). The per-sleep power cycle is ruled out too (2026-10-22, gemini-debian
    prep flag `conn-hold`: connsys switched off once per boot and left off): 2 hangs in 9 sleeps with connsys
    untouched, both at "PSCI suspend". The Wi-Fi/BT modules still load at boot, so lead 1 is not covered.
+
+## Sleep hang: what has been tried (inventory 2026-10-23)
+One table for the random sleep hang, collected from every run log since 2026-10-14. New proposals should
+name the row they are not a repeat of. Status: **ruled out**, **in use**, **open** (some evidence, not
+settled), **untested**, **dead end** (a measurement that cannot work).
+
+### Facts about the hang
+| # | Fact | Evidence |
+|---|---|---|
+| F1 | Every hang stops at breadcrumb step "PSCI suspend" (inside the CPU_SUSPEND SMC to ATF). An SPM wake does not rescue it; only a reset does. | All hangs 2026-10-17 to 10-23 (NONRST_REG2 crumbs) |
+| F2 | Random in **time asleep**, not per SPM cycle: hangs after 12 / 24 / 18 / 27 min at 2 / 5 / 2 / 0.5 s cycles; 2885 cycles of 100 ms in 15 min clean. | 2026-10-20 runs 1, 2, 4, 5; 2026-10-21 `tick100` |
+| F3 | No length threshold: one 16.5 min sleep clean, hangs at ~21 min and at 11 s. | 2026-10-21 single-sleep series t15 / t20 / t25 |
+| F4 | Real use (module loaded at boot, gemini-suspend-prep, 300 s sleeps): about 1 hang in 2–3 sleeps, 0.5–4 min in. | 2026-10-22: 5 of 13 |
+| F5 | The hung cycle's ATF log (saved by LK to `expdb`, mmcblk0p3) ends after the last resume-path line of the previous cycle: ATF never reached `suspend_finish` for the hung cycle, and wrote no WDT dump. | 2026-10-23 10:38 hang |
+| F6 | Short hunt runs (30–180 s) with the TOPRGU WDT running gave ~1 hang per 500 SPM cycles; this rate does not describe long sleeps (F2). | 2026-10-17/18 h-series; corrected 2026-10-20 |
+
+### Ideas and tests
+| # | Idea | Test | Date | Result | Status |
+|---|---|---|---|---|---|
+| 1 | VPROC2 rail off in sleep causes it | rail on vs off; hangs with the rail on | 10-17/18 | hangs with the rail on too | ruled out |
+| 2 | DA9214 I2C traffic between suspends | h5: 16 runs with an I2C read; h4: module load, no I2C | 10-18 | h5 16/16 clean; h4 hung without I2C | ruled out |
+| 3 | Loading any extra module after mt6797-suspend | h2–h7 (incl. stock `crc-ccitt`) vs plain | 10-18 | 5/27 runs vs 1/28 plain (p ≈ 0.09); a 10-22 reload hung with no module loaded after it | open, weak |
+| 4 | mt6797-suspend `.text` address | h8: log the address per run | 10-18 | hung at the same address as clean runs | ruled out |
+| 5 | connsys state (PCM_REG13) at entry | correlate over the h-series | 10-18 | 2/35 vs 4/20, no correlation | ruled out |
+| 6 | Hang is an artifact of the TOPRGU WDT running in sleep | everyday setting `wdt_pause=1` | 10-19/20 | long sleeps hang with the WDT paused | ruled out |
+| 7 | CPU_SUSPEND as SMC64 instead of stock SMC32 | 852afc0 (DT id 0x84000001), h9 50 × 30 s | 10-18 | 1/42 runs; all later hangs are on SMC32 | ruled out |
+| 8 | Fewer / longer SPM cycles | 0.5 / 2 / 5 s cycles, 60 s lid-EINT cycles, 100 ms ticks | 10-20/21 | same hazard per minute asleep (F2) | ruled out |
+| 9 | Lid EINT as wake source (no timer polling) | `lid_eint=1`, 60 s and 2 s cycles | 10-20 | 4 of 5 sleeps ≥ 10 min hung; 0.5–1.2 A drain | ruled out (not usable) |
+| 10 | Escape a hang with an SPM wake | `pcm_wdt_wake=1` | 10-20 | run 4 hung; the wake did not rescue it | ruled out |
+| 11 | PCM watchdog reset as safety net | `pcm_wdt=30`, forced (`pcm_wdt_test`) + real hangs | 10-20 | resets ~30 s late, breadcrumb survives | in use |
+| 12 | Read SPM state after the reset | dump PCM regs at module load | 10-20 | SoC reset wipes all SPM registers | dead end |
+| 13 | Breadcrumbs in NONRST_REG2 | `crumbs` | 10-17 | gives the step only (always F1) | in use |
+| 14 | Live ATF log 0x7FF40000 after a hang | read at next boot | 10-18 | re-initialised at boot | dead end |
+| 15 | "ATF WDT dump" at 0x7FF6A000 | read after hangs | 10-18 / 10-23 | not a WDT dump: it is the previous boot's ATF log copy, which LK saves to `expdb` and then clears; earlier "survives resets" was a misreading | dead end (replaced by 16) |
+| 16 | Hung boot's ATF log from `expdb` | read-only `dd` of mmcblk0p3 after a hang | 10-23 | works; gives F5 | in use |
+| 17 | ATF progress tag (0xA7F00301 / 0x...0402/0403) | test/atf-tag, slot 0x7FF7F000 | 10-23 | slot is cleared at boot: "empty" after a real hang | dead end |
+| 18 | Same, slot in RAM console SRAM 0x0012D800 | 333afb5; slot survives a reboot (checked) | 10-23 | channel not yet proven with a forced hang; no real hang read yet | open |
+| 19 | Stop forcing `DIS_SRCCLKEN_LOW` (bit 15) | dd3cbe9 `srcclken_low` | 10-21/22 | reloaded module 0 / ~57 sleeps; boot-loaded 5 / 13 | ruled out as the fix; effect unknown |
+| 20 | Boot-loaded vs reloaded module | compare runs; reload onto the boot buffer page | 10-22 | reload hung on sleep 3; "reload never hangs" unreliable | open, weak |
+| 21 | SPM firmware buffer address (0x41c02000, next to connsys window) | reload at that address; boot load at 0x43000000 | 10-22 | both hung | ruled out |
+| 22 | SPM firmware buffer corruption | `im_check` (74bb2c3) | 10-22 | intact around clean sleeps; never ran around a hang | open, unlikely |
+| 23 | gemini-suspend-prep version | old prep 64bd5288 | 10-22 | 2/6 hung | ruled out |
+| 24 | USB pins high/low in sleep | both settings | 10-22 | both hang | ruled out |
+| 25 | Leftovers of earlier tests (touch rebind, VCN18 off/on) | fresh boots | 10-22 | fresh boots hang | ruled out |
+| 26 | connsys resync result before sleep | journal, 102 sleeps | 10-22 | FAIL 6/50 hung, OK 4/52 | ruled out |
+| 27 | connsys power cycle around every sleep | prep flag `conn-hold` (gemini-debian db5cab3) | 10-22 | 2 hangs in 9 held sleeps | ruled out |
+| 28 | Late module load via a boot service | pre-registered | 10-22 | dropped after row 20's reload hang | not run |
+| 29 | SPM firmware sends pwrap commands (empty table → write 0 to MT6351 reg 0) | E18 marker trace | 10-16 | no DVFS commands sent with our flags | ruled out |
+| 30 | Stock pwrap SUSPEND table + clear `DIS_VCORE_DVS` (bit 3) | `dvs=1` (de1fa94) | — | built, never run | untested |
+| 31 | Thermal chunks (SPM_THERMAL_TIMER, flags bit 19) | — | — | hangs at 11 s and 1–4 min, before any 256 s chunk boundary: weakens this lead | untested |
+| 32 | PMIC prep (low-IQ, PG force-on / VIO18 PG monitor off, power mode) | — | — | — | untested |
+| 33 | CIRQ / IRQ masking, sysclk settle, UART sleep handshake | — | — | — | untested |
+| 34 | DRAM self-refresh (DDREN) | — | — | not reached (blocked on connsys) | untested |
+| 35 | Flags closer to stock | bit 9 cleared; full stock 0x00030238; bits 1/2/3/6/7 singly | 10-14/16 | bit 9 → hard crash; full stock set → MCU clock semaphore stuck, self-reset; singles clean in 25-cycle runs (too short for this hang) | open (bits 22–28, 30 never tried singly in long sleeps) |
+| 36 | Sleep without CPU power-down (split CPU/ATF side vs rest of SoC) | — | — | idea, not built | untested |
+| 37 | GPU domains off/on before sleep | E22/E23 | 10-16 | a hang with the GPU untouched; clean after | ruled out |
+| 38 | Vcore sleep voltage (VSLEEP_SEL=3, VOSEL_SLEEP 0.8 V), VA10 HW LP | E19/E20, 10-17 | 10-16/17 | immediate hang in the first cycle: a separate, understood failure | not this hang |
+| 39 | Whole stack vs stock (register state at CPU_SUSPEND entry, SPM firmware + flags + wake mask + pwrctrl, driver PM coverage) | — | — | never compared as a whole | untested |
+| 40 | Does the stock 3.18 system hang on this device? | — | — | never run | untested (next) |
+
+### Side symptoms (not proven related)
+- Wake with `last_wake = 'pmic read failed'` after one cycle (2026-10-20, 10-21, 10-22).
+- After one WDT reset, LK stalled polling SPM registers and needed a second reset (10-18).
