@@ -107,9 +107,9 @@ static bool system_scope;
 module_param_named(system, system_scope, bool, 0444);
 MODULE_PARM_DESC(system, "1 = register as the System battery (default: Device scope)");
 
-static unsigned int fcc_mah = 2600;
+static unsigned int fcc_mah = 4050;
 module_param(fcc_mah, uint, 0444);
-MODULE_PARM_DESC(fcc_mah, "initial full-charge capacity at our charge voltage (mAh, default 2600 = ~3.0 Ah cell estimate x ~85 percent reachable at VREG 4.208 V; learned afterwards)");
+MODULE_PARM_DESC(fcc_mah, "initial full-charge capacity at our charge voltage (mAh, default 4050 = measured on the stock firmware 2026-10-24: ~4.05-4.1 Ah from empty to full at VREG 4.4 V; learned afterwards)");
 
 static unsigned int r_bat_mohm = 280;
 module_param(r_bat_mohm, uint, 0644);
@@ -119,7 +119,7 @@ static unsigned int r_chg_mohm = 500;
 module_param(r_chg_mohm, uint, 0644);
 MODULE_PARM_DESC(r_chg_mohm, "effective resistance while CHARGING (ohmic + polarization), for OCV estimates on the charger (mOhm, default 500; on glass 280 under-corrected by ~15 points)");
 
-static unsigned int full_ocv_mv = 4180;
+static unsigned int full_ocv_mv = 4340;
 module_param(full_ocv_mv, uint, 0444);
 MODULE_PARM_DESC(full_ocv_mv, "resting voltage of a cell charged full at our VREG (mV) = 100 %");
 
@@ -127,7 +127,7 @@ static unsigned int full_ma = 200;
 module_param(full_ma, uint, 0644);
 MODULE_PARM_DESC(full_ma, "Full when VBUS present and cell charge current below this (mA)");
 
-static unsigned int full_mv = 4150;
+static unsigned int full_mv = 4330;
 module_param(full_mv, uint, 0644);
 MODULE_PARM_DESC(full_mv, "...and battery voltage at least this (mV)");
 

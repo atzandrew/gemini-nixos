@@ -778,18 +778,27 @@
 	 * No IRQ: INT pin is on an MTK EINT (B-11); driver patched
 	 * IRQ-optional (patches/v6.6/power/0001).
 	 *
-	 * Charge parameters: conservative values matching the chip's own
-	 * hardware defaults observed live (VREG 4.208V, boost 4.998V /
-	 * 1.4A = REG0A power-on default 0x73) — today's boots charge on
-	 * these defaults anyway; tuning is Phase 7.
+	 * Boost 4.998V / 1.4A = REG0A power-on default 0x73. Charge
+	 * parameters: see the comment inside the node.
 	 */
 	charger: charger@6b {
 		compatible = "ti,bq25896";
 		reg = <0x6b>;
-		ti,charge-current = <2048000>;
-		ti,battery-regulation-voltage = <4208000>;
-		ti,termination-current = <256000>;
+		/*
+		 * Charging follows the stock Planet firmware (measured on the
+		 * stock 3.18 kernel, 2026-10-23/24): charge current 2.944 A (the
+		 * stock value on a 9 V Pump Express charger, ~0.73 C for the
+		 * ~4.05 Ah cell), termination 128 mA, IR compensation 80 mOhm
+		 * clamped at 192 mV, Pump Express up to ~9 V. Stock hard-codes
+		 * VREG 4.416 V; 4.400 V here keeps to the 4.4 V cell rating.
+		 */
+		ti,charge-current = <2944000>;
+		ti,battery-regulation-voltage = <4400000>;
+		ti,termination-current = <128000>;
 		ti,precharge-current = <128000>;
+		ti,ibatcomp-micro-ohms = <80000>;
+		ti,ibatcomp-clamp-microvolt = <192000>;
+		linux,pump-express-vbus-max = <9500000>;
 		ti,minimum-sys-voltage = <3500000>;
 		ti,boost-voltage = <4998000>;
 		ti,boost-max-current = <1400000>;
