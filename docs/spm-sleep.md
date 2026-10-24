@@ -379,7 +379,7 @@ settled), **untested**, **dead end** (a measurement that cannot work).
 | 31 | Thermal chunks (SPM_THERMAL_TIMER, flags bit 19) | — | — | hangs at 11 s and 1–4 min, before any 256 s chunk boundary: weakens this lead | untested |
 | 32 | PMIC prep (low-IQ, PG force-on / VIO18 PG monitor off, power mode) | — | — | — | untested |
 | 33 | CIRQ / IRQ masking, sysclk settle, UART sleep handshake | — | — | — | untested |
-| 34 | DRAM self-refresh (DDREN) | — | — | not reached (blocked on connsys) | untested |
+| 34 | DRAM self-refresh (DDREN) | stock comparison | 2026-10-24 | DDREN (SW_DEBUG 8/9) is the firmware branch taken while the modem keeps 26 MHz/APSRC requested; with the modem off stock runs 0x1cff (26M/APSRC deep path, no DDREN), the same path as ours (0x10ff) | not a gap |
 | 35 | Flags closer to stock | bit 9 cleared; full stock 0x00030238; bits 1/2/3/6/7 singly | 10-14/16 | bit 9 → hard crash; full stock set → MCU clock semaphore stuck, self-reset; singles clean in 25-cycle runs (too short for this hang) | open (bits 22–28, 30 never tried singly in long sleeps) |
 | 36 | Sleep without CPU power-down (split CPU/ATF side vs rest of SoC) | — | — | idea, not built | untested |
 | 37 | GPU domains off/on before sleep | E22/E23 | 10-16 | a hang with the GPU untouched; clean after | ruled out |
@@ -401,12 +401,14 @@ kernel's own `[SPM]` log and read-only register reads.
 | `pcm_flags` at sleep | 0x150030 (bits 4, 5, 16, 18, 20) | 0x5fc102fe |
 | Wake sources | 0xf47c5e7 (timer, EINT, keypad, CONN2AP, …) | 0x1 (PCM timer only) |
 | Wake period | from the fuel gauge: 64, 122, 224, 664 s … up to 5400 s | 2 s cycles |
-| SW_DEBUG after sleep | 0x1f00: DRAM self-refresh (bits 8/9) and CPU power-down reached; 26 MHz off not | 0x10ff: 26 MHz off reached; DRAM self-refresh never |
+| SW_DEBUG after sleep | modem on: 0x1f00 (DDREN branch, no 26M/APSRC); modem off: 0x1cff (26M, INFRA, APSRC, VRF18, NFC clock buffer, CPU power-down) | 0x10ff (26M, INFRA, APSRC, VRF18, CPU power-down) |
 | Thermal chunk registers after sleep | `PASR_DPD_3` 2, `SW_RSV_2` 0xEB0, `BSI_D0_SR` 0x00100000, `SCP_MAILBOX` 1 | all 0 |
 | PMIC-wrapper DVFS table (0x1000D10C…) | filled (MT6351 reg 0x060A, values 0x38, 0x36, 0x33, …) | all 0 |
 
-- Stock reaches DRAM self-refresh in every sleep with Wi-Fi/connsys up (PCM_REG13 0xd106612c), so the older
-  conclusion "DDREN is blocked by connsys" (History, SPM 3e) does not hold; our flags/pwrctrl are the difference.
+- The SW_DEBUG bits show two firmware paths. With the modem running (R13: MD1/MD2 SRCCLKENA, APSRC, DDR_EN
+  requests) the firmware takes the DDREN branch (bits 8/9) and keeps 26 MHz on. With the modem powered off it takes
+  the deep path (26M, APSRC, VRF18; no DDREN) — the same path `mt6797-suspend` already runs. The older reading
+  "DDREN never runs, so DRAM self-refresh is missing" (History, SPM 3e) was a misreading.
 - Six stock sleeps (6 s to 224 s, about 8 min in total) all resumed cleanly. No long soak was run on stock.
 - As shipped, stock Debian does not suspend at all: the modem multiplexer (`gsm0710muxd`) holds the `ttyC0`
   wakelock from boot, and the Wi-Fi driver aborts suspend attempts while connected (`WLAN tx_thread` etc.).
@@ -415,3 +417,9 @@ kernel's own `[SPM]` log and read-only register reads.
 - Sleep current on stock as configured (modem firmware still up, 26 MHz on) was roughly 145–185 mA, i.e. not
   lower than ours; stock is a reference for the method, not for the current.
 - Stock's `suspend_ctrl` (pwrctrl) values are the reference for the next changes to `mt6797-suspend`.
+- Modem powered off (`CCCI_IOC_ENTER_DEEP_FLIGHT`, ioctl 0x430E on `/dev/ccci_ioctl0` and `/dev/ccci3_ioctl0`;
+  MD1 power domain, VMD1 and VMODEM off): three sleeps, one of 757 s, SW_DEBUG 0x1cff, and the gauge's charge counter
+  fell by 6.8 mAh over 814 s including about a minute awake, i.e. roughly 10–30 mA asleep. The stock suspend checker
+  still listed MAINPLL, IMGPLL, SYS_CONN and SYS_DIS as on. With the same SPM path, stock sleeps several times
+  lower than `mt6797-suspend` (~170 mA), so the difference lies outside the SPM sleep state (PMIC sleep settings,
+  off-SoC loads, wake cycling).
