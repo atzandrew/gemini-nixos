@@ -102,7 +102,7 @@ MODULE_PARM_DESC(probe_ms, "mode 0: time spent in .enter (ms)");
 
 static uint poll_ms = 2000;
 module_param(poll_ms, uint, 0644);
-MODULE_PARM_DESC(poll_ms, "mode 1: SPM sleep per cycle (PCM timer, ms, 100..5000)");
+MODULE_PARM_DESC(poll_ms, "mode 1: SPM sleep per cycle (PCM timer, ms, 100..600000); keys and lid are only checked this often");
 
 static uint gap_ms = 200;
 module_param(gap_ms, uint, 0644);
@@ -1247,7 +1247,7 @@ static int gem_suspend_prepare(void)
 	cr_susp++;
 	cr_n = 0;
 	crumb(CR_PREPARE);
-	if (poll_ms < 100 || poll_ms > 5000 || lid_poll_ms < 100 || lid_poll_ms > 600000 ||
+	if (poll_ms < 100 || poll_ms > 600000 || lid_poll_ms < 100 || lid_poll_ms > 600000 ||
 	    (io_en != 0x80 && io_en != 0x81)) {
 		pr_err(TAG "bad poll_ms/lid_poll_ms/io_en\n");
 		return -EINVAL;
